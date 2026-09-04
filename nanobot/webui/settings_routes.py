@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import html
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
 from nanobot.agent.tools.image_generation import request_image_generation_reload
-from nanobot.agent.tools.mcp import request_mcp_reload
 from nanobot.agent.tools.mcp_oauth import MCP_OAUTH_CALLBACK_PATH
 from nanobot.api.runtime import ApiRuntime, api_runtime_paths
 from nanobot.bus.queue import MessageBus
@@ -37,7 +36,6 @@ from nanobot.webui.nanobot_features_api import (
     nanobot_features_payload,
 )
 from nanobot.webui.settings_api import (
-    WebUISettingsError,
     complete_oauth_provider,
     create_model_configuration,
     create_provider_settings,
@@ -71,6 +69,7 @@ _WEBUI_MUTATION_PAYLOAD_ATTR = "_nanobot_webui_mutation_payload"
 _WEBUI_MUTATION_REQUEST_ATTR = "_nanobot_webui_mutation_request"
 _CHANNEL_CONNECT_ACTIONS = frozenset({"start", "poll", "cancel"})
 _MCP_OAUTH_CALLBACK_URL_MAX_BYTES = 8 * 1024
+_MCP_RELOAD_TIMEOUT_SECONDS = 15.0
 _query_first = contracts.query_first
 
 
@@ -91,8 +90,10 @@ def _channel_connect_route(path: str) -> tuple[str, str] | None:
 
 _MCP_PRESET_ACTIONS_BY_PATH = {
     "/api/settings/mcp-presets/enable": "enable",
+    "/api/settings/mcp-presets/disable": "disable",
     "/api/settings/mcp-presets/remove": "remove",
     "/api/settings/mcp-presets/test": "test",
+    "/api/settings/mcp-presets/reconnect": "reconnect",
     "/api/settings/mcp-presets/custom": "custom",
     "/api/settings/mcp-presets/import": "import",
     "/api/settings/mcp-presets/import-cursor": "import-cursor",
@@ -224,6 +225,8 @@ class WebUISettingsRouter:
         runtime_capabilities: dict[str, Any],
         channel_feature_action: Callable[..., Any] | None = None,
         channel_runtime_status: Callable[[], dict[str, Any]] | None = None,
+        mcp_runtime_status: Callable[[], Mapping[str, str]] | None = None,
+        mcp_reload: Callable[[], Awaitable[dict[str, Any]]] | None = None,
         mcp_oauth_redirect_uri: Callable[[WsRequest], str] | None = None,
     ) -> None:
         self.settings = settings
@@ -237,6 +240,8 @@ class WebUISettingsRouter:
         self._runtime_capabilities = runtime_capabilities
         self._channel_feature_action = channel_feature_action
         self._channel_runtime_status = channel_runtime_status
+        self._mcp_runtime_status = mcp_runtime_status
+        self._mcp_reload = mcp_reload
         self._mcp_oauth_redirect_uri = mcp_oauth_redirect_uri
         self._mcp_oauth = McpOAuthManager()
         self._restart_sections: set[str] = set()
@@ -279,9 +284,9 @@ class WebUISettingsRouter:
         if not self._authorized(request):
             return self._unauthorized()
         if route == ("root", "settings"):
-            return self._handle_settings()
+            return await asyncio.to_thread(self._handle_settings)
         if route == ("root", "usage"):
-            return self._handle_settings_usage()
+            return await asyncio.to_thread(self._handle_settings_usage)
 
         domain, action = route
         domain_request = self._domain_request(
@@ -468,7 +473,8 @@ class WebUISettingsRouter:
             approve_code=approve_code,
             deny_code=deny_code,
             mcp_presets_action=mcp_presets_settings_action,
-            reload_mcp=lambda: request_mcp_reload(self.bus),
+            reload_mcp=self._reload_mcp_runtime,
+            mcp_runtime_status=self._mcp_runtime_status,
             check_for_update=check_for_update,
             channel_feature_action=self._channel_feature_action,
             channel_runtime_status=self._channel_runtime_status,
@@ -483,60 +489,38 @@ class WebUISettingsRouter:
             lambda: request_image_generation_reload(self.bus),
         )
 
-    async def _apply_image_generation_runtime_change(
-        self,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        updated, restart_cleared = (
-            await self._apply_image_generation_runtime_change_result(payload)
-        )
-        if restart_cleared:
-            self._restart_sections.discard("image")
-        return updated
+    async def _reload_mcp_runtime(self) -> dict[str, Any]:
+        if self._mcp_reload is None:
+            return {
+                "ok": False,
+                "message": "MCP runtime reload is unavailable. Restart nanobot to apply changes.",
+                "requires_restart": True,
+            }
+        try:
+            return await asyncio.wait_for(
+                self._mcp_reload(),
+                timeout=_MCP_RELOAD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "ok": False,
+                "message": "MCP hot reload timed out. Restart nanobot to pick up changes.",
+                "requires_restart": True,
+            }
+        except Exception as exc:
+            self.logger.exception("MCP hot reload failed")
+            return {
+                "ok": False,
+                "message": "MCP hot reload failed. Restart nanobot to pick up changes.",
+                "requires_restart": True,
+                "error": str(exc),
+            }
 
     def _parse_mcp_settings_query(self, request: WsRequest) -> QueryParams:
         return self._query(request)
 
-    def _parse_provider_settings_query(self, request: WsRequest) -> QueryParams:
-        return self._query(request)
-
-    def _parse_api_service_settings_query(self, request: WsRequest) -> QueryParams:
-        payload = _mutation_payload(request)
-        if payload is not None:
-            api_key = payload.get("api_key")
-            if api_key is not None and not isinstance(api_key, str):
-                raise WebUISettingsError("API service API key must be a string")
-        return self._query(request)
-
     def _api_runtime(self) -> ApiRuntime:
         return ApiRuntime(paths=api_runtime_paths(self.settings.config.path))
-
-    def _api_service_payload(
-        self,
-        *,
-        last_action: str | None = None,
-    ) -> dict[str, Any]:
-        return capability_domain.api_service_payload(
-            self.settings,
-            self._api_runtime(),
-            last_action=last_action,
-        )
-
-    @staticmethod
-    def _masked_secret(value: str) -> str | None:
-        return capability_domain.masked_api_secret(value)
-
-    @staticmethod
-    def _api_runtime_message(message: str) -> str:
-        return capability_domain.api_runtime_message(message)
-
-    def _parse_channel_values(self, request: WsRequest) -> dict[str, Any]:
-        return self._system.parse_channel_values(
-            SettingsRequest(
-                query=self._query(request),
-                payload=_mutation_payload(request),
-            )
-        )
 
     def _save_channel_config_values(
         self,
@@ -576,17 +560,6 @@ class WebUISettingsRouter:
             allow_install=allow_install,
         )
 
-    @staticmethod
-    def _feature_runtime_fallback(
-        payload: dict[str, Any],
-        *,
-        message: str,
-    ) -> dict[str, Any]:
-        return system_domain.SystemSettingsHandler.feature_runtime_fallback(
-            payload,
-            message=message,
-        )
-
     def _allow_feature_package_install(
         self,
         connection: Any,
@@ -617,7 +590,7 @@ class WebUISettingsRouter:
                 name,
                 cfg,
                 redirect_uri,
-                reload_mcp=lambda: request_mcp_reload(self.bus),
+                reload_mcp=self._reload_mcp_runtime,
                 reset_credentials=reset,
             )
         except Exception as exc:

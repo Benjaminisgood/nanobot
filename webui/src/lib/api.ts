@@ -22,7 +22,9 @@ import type {
   ProviderOAuthCompletionResult,
   ProviderOAuthLoginResult,
   ProviderSettingsUpdate,
+  RecoveryState,
   SessionDeleteResult,
+  SessionHandle,
   SessionAutomationsPayload,
   SettingsPayload,
   SettingsUpdate,
@@ -166,6 +168,19 @@ function splitKey(key: string): { channel: string; chatId: string } {
   return { channel: key.slice(0, idx), chatId: key.slice(idx + 1) };
 }
 
+function normalizeSessionHandle(value: unknown): SessionHandle | null {
+  if (!value || typeof value !== "object") return null;
+  const handle = value as Partial<SessionHandle>;
+  const id = typeof handle.id === "string" ? handle.id.trim() : "";
+  const name = typeof handle.name === "string" ? handle.name.trim() : "";
+  if (
+    !/^handle_[a-f0-9]{32}$/i.test(id)
+    || !name
+    || !/^[\p{L}\p{N}_-]+$/u.test(name)
+  ) return null;
+  return { id, name };
+}
+
 export async function listSessions(
   token: string,
   base: string = "",
@@ -178,7 +193,9 @@ export async function listSessions(
     preview?: string;
     model_preset?: string | null;
     run_started_at?: number | null;
+    recovery_state?: RecoveryState | null;
     workspace_scope?: WorkspaceScopePayload | null;
+    handle?: SessionHandle | null;
   };
   const body = await request<{ sessions: Row[] }>(
     `${base}/api/sessions`,
@@ -186,17 +203,22 @@ export async function listSessions(
     undefined,
     API_READ_TIMEOUT_MS,
   );
-  return body.sessions.map((s) => ({
-    key: s.key,
-    ...splitKey(s.key),
-    createdAt: s.created_at,
-    updatedAt: s.updated_at,
-    title: s.title ?? "",
-    preview: s.preview ?? "",
-    modelPreset: s.model_preset ?? null,
-    runStartedAt: s.run_started_at ?? null,
-    workspaceScope: s.workspace_scope ?? null,
-  }));
+  return body.sessions.map((s) => {
+    const handle = normalizeSessionHandle(s.handle);
+    return {
+      key: s.key,
+      ...splitKey(s.key),
+      createdAt: s.created_at,
+      updatedAt: s.updated_at,
+      title: s.title ?? "",
+      preview: s.preview ?? "",
+      modelPreset: s.model_preset ?? null,
+      runStartedAt: s.run_started_at ?? null,
+      recoveryState: s.recovery_state ?? null,
+      workspaceScope: s.workspace_scope ?? null,
+      handle,
+    };
+  });
 }
 
 /** Disk-backed WebUI display thread snapshot (separate from agent session). */
@@ -766,7 +788,7 @@ export async function fetchProviderModels(
 
 export async function runMcpPresetAction(
   transport: WebUIMutationTransport,
-  action: "enable" | "remove" | "test",
+  action: "enable" | "disable" | "remove" | "test" | "reconnect",
   name: string,
   values: Record<string, string> = {},
 ): Promise<McpPresetsPayload> {
@@ -910,8 +932,7 @@ export async function createModelConfiguration(
     transport,
     "settings.model_configuration.create",
     {
-      ...(configuration.name !== undefined ? { name: configuration.name } : {}),
-      label: configuration.label,
+      name: configuration.name,
       provider: configuration.provider,
       model: configuration.model,
       ...modelGenerationSettingsPayload(configuration),
@@ -928,7 +949,7 @@ export async function updateModelConfiguration(
     "settings.model_configuration.update",
     {
       name: configuration.name,
-      ...(configuration.label !== undefined ? { label: configuration.label } : {}),
+      ...(configuration.newName !== undefined ? { new_name: configuration.newName } : {}),
       ...(configuration.provider !== undefined ? { provider: configuration.provider } : {}),
       ...(configuration.model !== undefined ? { model: configuration.model } : {}),
       ...modelGenerationSettingsPayload(configuration),

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-from collections.abc import Callable, Iterable
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -60,6 +61,7 @@ def _default_webui_dist() -> Path | None:
 _SEND_RETRY_DELAYS = (1, 2, 4)
 _RESTART_NOTICE_START_TIMEOUT_S = 30.0
 _RESTART_NOTICE_START_POLL_S = 0.25
+ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE = 1000
 
 _BOOL_CAMEL_ALIASES: dict[str, str] = {
     "send_progress": "sendProgress",
@@ -95,12 +97,18 @@ class ChannelManager:
         cron_service: CronService | None = None,
         local_trigger_store: LocalTriggerStore | None = None,
         webui_runtime_model_name: Callable[[], str | None] | None = None,
+        webui_refresh_runtime_config: Callable[[], None] | None = None,
         webui_cron_pending_job_ids: Callable[[str], set[str]] | None = None,
         webui_local_trigger_pending_ids: Callable[[str], set[str]] | None = None,
         webui_static_dist: bool = True,
         webui_runtime_surface: str = "browser",
         webui_runtime_capabilities: dict[str, Any] | None = None,
+        webui_mcp_runtime_status: Callable[[], Mapping[str, str]] | None = None,
+        webui_mcp_reload: Callable[[], Awaitable[dict[str, Any]]] | None = None,
         webui_skill_state_action: Callable[[set[str]], None] | None = None,
+        webui_recovery_action: (
+            Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None
+        ) = None,
         config_path: Path | None = None,
     ):
         if config_path is None:
@@ -114,12 +122,16 @@ class ChannelManager:
         self._cron_service = cron_service
         self._local_trigger_store = local_trigger_store
         self._webui_runtime_model_name = webui_runtime_model_name
+        self._webui_refresh_runtime_config = webui_refresh_runtime_config
         self._webui_cron_pending_job_ids = webui_cron_pending_job_ids
         self._webui_local_trigger_pending_ids = webui_local_trigger_pending_ids
         self._webui_static_dist = webui_static_dist
         self._webui_runtime_surface = webui_runtime_surface
         self._webui_runtime_capabilities = dict(webui_runtime_capabilities or {})
+        self._webui_mcp_runtime_status = webui_mcp_runtime_status
+        self._webui_mcp_reload = webui_mcp_reload
         self._webui_skill_state_action = webui_skill_state_action
+        self._webui_recovery_action = webui_recovery_action
         self.channels: dict[str, BaseChannel] = {}
         self._channel_owners: dict[str, str] = {}
         self._channel_runtime_specs: dict[str, tuple[str, str]] = {}
@@ -127,7 +139,7 @@ class ChannelManager:
         self._channel_tasks: dict[str, asyncio.Task[None]] = {}
         self._dispatch_task: asyncio.Task[None] | None = None
         self._started = False
-        self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
+        self._origin_reply_fingerprints: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
         self._init_channels()
 
@@ -179,6 +191,7 @@ class ChannelManager:
                 config_path=self._config_path,
                 disabled_skills=set(self.config.agents.defaults.disabled_skills),
                 runtime_model_name=self._webui_runtime_model_name,
+                refresh_runtime_config=self._webui_refresh_runtime_config,
                 runtime_surface=self._webui_runtime_surface,
                 runtime_capabilities_overrides=self._webui_runtime_capabilities,
                 cron_service=self._cron_service,
@@ -187,7 +200,10 @@ class ChannelManager:
                 local_trigger_pending_ids=self._webui_local_trigger_pending_ids,
                 channel_feature_action=self.apply_channel_feature_action,
                 channel_runtime_status=self.get_status,
+                mcp_runtime_status=self._webui_mcp_runtime_status,
+                mcp_reload=self._webui_mcp_reload,
                 skill_state_action=self._webui_skill_state_action,
+                recovery_action=self._webui_recovery_action,
                 logger=logger,
             )
             kwargs["gateway"] = gateway
@@ -606,6 +622,12 @@ class ChannelManager:
         if target is None:
             logger.warning("Restart notice target channel is not enabled: {}", notice.channel)
             return
+        if notice.channel == "websocket":
+            # Reconnect and recovery are already represented by WebSocket
+            # protocol state. A generic restart-complete notice must not
+            # masquerade as a recovery transition and overwrite a real
+            # awaiting-user checkpoint in connected clients.
+            return
 
         while not target.is_running:
             remaining = deadline - loop.time()
@@ -649,6 +671,16 @@ class ChannelManager:
         normalized = " ".join(content.split())
         return hashlib.sha1(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
+    def _remember_origin_reply_fingerprint(
+        self,
+        key: tuple[str, str, str],
+        fingerprint: str,
+    ) -> None:
+        self._origin_reply_fingerprints[key] = fingerprint
+        self._origin_reply_fingerprints.move_to_end(key)
+        while len(self._origin_reply_fingerprints) > ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE:
+            self._origin_reply_fingerprints.popitem(last=False)
+
     def _should_suppress_outbound(self, msg: OutboundMessage) -> bool:
         metadata = msg.metadata or {}
         if isinstance(outbound_event_from_message(msg), ProgressEvent):
@@ -661,13 +693,14 @@ class ChannelManager:
         if isinstance(origin_message_id, str) and origin_message_id:
             key = (msg.channel, msg.chat_id, origin_message_id)
             if self._origin_reply_fingerprints.get(key) == fingerprint:
+                self._origin_reply_fingerprints.move_to_end(key)
                 return True
-            self._origin_reply_fingerprints[key] = fingerprint
+            self._remember_origin_reply_fingerprint(key, fingerprint)
 
         message_id = metadata.get("message_id")
         if isinstance(message_id, str) and message_id:
             key = (msg.channel, msg.chat_id, message_id)
-            self._origin_reply_fingerprints[key] = fingerprint
+            self._remember_origin_reply_fingerprint(key, fingerprint)
 
         return False
 

@@ -152,7 +152,7 @@ If you need a known-good snippet instead of diagnosis, use [`provider-cookbook.m
 | Codex OAuth needs a proxy | Set `providers.openaiCodex.proxy` before running the login command. The proxy applies to login, token refresh, and Codex API requests. |
 | Codex login runs on a remote/headless machine | In the WebUI, open ChatGPT in your local browser; when the localhost callback page cannot load, copy the full `http://localhost:1455/auth/callback?...` URL from the address bar and paste it into the WebUI dialog. From the CLI, open the printed URL locally and paste the same callback URL back into the terminal. |
 | Codex login runs in Docker | Start the container with `docker run -it` so the OAuth flow has an interactive terminal. |
-| Codex says a model is not supported with a ChatGPT account | Use provider `openai_codex` with a Codex model such as `openai-codex/gpt-5.7-sol`. Do not use the direct-API `openai/...` prefix with Codex OAuth. |
+| Codex says a model is not supported with a ChatGPT account | Use provider `openai_codex` with a Codex model such as `openai-codex/gpt-5.6-sol`. Do not use the direct-API `openai/...` prefix with Codex OAuth. |
 | Config says `providers.openai_codex` conflicts with the built-in provider | Under `providers`, keep only the canonical `openaiCodex` settings key and remove a duplicate `openai_codex` key. A model preset's `provider` value remains `openai_codex`. |
 | xAI OAuth needs a proxy | Set `providers.xaiGrok.proxy` before login. It applies to OAuth discovery, token exchange/refresh, and Grok subscription requests. |
 | xAI login runs on a remote/headless machine | In the WebUI, finish sign-in in your local browser; if the loopback redirect cannot reach the server, copy the final URL from the address bar into the WebUI dialog. From the CLI, run `nanobot provider login xai-grok` interactively, open the printed URL elsewhere, and paste the final callback URL or authorization code when prompted. |
@@ -319,7 +319,8 @@ See [`chat-apps.md`](./chat-apps.md) for channel-specific setup.
 |---|---|
 | Conversation context seems wrong | Confirm the active workspace and session. WebUI chats and chat app threads may use different sessions. |
 | Memory does not update immediately | Dream consolidation is periodic; recent turns still live in session history. |
-| Old sessions appear after moving config | Session files are stored under `<workspace>/sessions/`; verify the workspace path. |
+| Sessions disappear after changing `--config` | Sessions follow the config directory at `<config-dir>/sessions/<workspace-id>/`; use the original config path or copy that `sessions/` directory into the new config directory while nanobot is stopped. |
+| Sessions disappear after moving a workspace | Keep the workspace's `.nanobot/workspace-id` file with the move or backup. If it was lost, restore that marker from backup before starting nanobot. |
 | You want one shared session across devices | Set `agents.defaults.unifiedSession` intentionally; otherwise keep separate sessions. |
 
 ## Collect Useful Evidence

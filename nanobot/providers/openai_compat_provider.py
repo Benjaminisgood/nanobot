@@ -26,6 +26,7 @@ from pydantic.alias_generators import to_snake
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
+    LLMUsage,
     ProviderCallContext,
     ProviderConversationState,
     ToolCallRequest,
@@ -35,6 +36,7 @@ from nanobot.providers.base import (
 )
 from nanobot.providers.openai_responses import (
     ResponsesStreamCapture,
+    build_responses_compaction_state,
     build_responses_state,
     consume_sdk_stream,
     convert_tools,
@@ -55,6 +57,8 @@ if TYPE_CHECKING:
 # use, or replaced by tests via ``patch(...)``.  Kept as a plain name so
 # that ``unittest.mock.patch`` can find and replace it.
 AsyncOpenAI: Any = None
+
+_GEMINI_SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 
 
 def _is_hosted_web_search_type(value: object) -> bool:
@@ -111,6 +115,9 @@ _KIMI_ALWAYS_THINKING_MODELS: frozenset[str] = frozenset({
 _KIMI_SERVER_MANAGED_TEMPERATURE_MODELS: frozenset[str] = frozenset({
     "kimi-k2.5",
     "kimi-k2.6",
+})
+_DEEPSEEK_MULTIMODAL_MODELS: frozenset[str] = frozenset({
+    "deepseek-v4-flash-vision-exp",
 })
 _TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 # Thinking-capable MiMo models per Xiaomi docs (see
@@ -447,6 +454,28 @@ def _merge_unique_list(base: object, override: object) -> object:
     return result
 
 
+def _merge_chat_extra_body(
+    kwargs: dict[str, Any],
+    extra_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge configured Chat Completions fields without clobbering tools."""
+    regular_extra = {key: value for key, value in extra_body.items() if key != "tools"}
+    merged = dict(kwargs)
+    if regular_extra:
+        existing = kwargs.get("extra_body", {})
+        merged["extra_body"] = _deep_merge(existing, regular_extra)
+
+    if "tools" in extra_body:
+        current_tools = kwargs.get("tools")
+        configured_tools = extra_body["tools"]
+        if isinstance(current_tools, list) and isinstance(configured_tools, list):
+            merged["tools"] = [*current_tools, *configured_tools]
+        else:
+            merged["tools"] = configured_tools
+
+    return merged
+
+
 def _merge_responses_extra_body(
     body: dict[str, Any],
     extra_body: dict[str, Any],
@@ -490,8 +519,9 @@ class OpenAICompatProvider(LLMProvider):
         api_type: str = "auto",
         extra_query: dict[str, str] | None = None,
         proxy: str | None = None,
+        provider_name: str = "openai",
     ):
-        super().__init__(api_key, api_base)
+        super().__init__(api_key, api_base, provider_name=provider_name)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = spec
@@ -500,9 +530,6 @@ class OpenAICompatProvider(LLMProvider):
         self._extra_query = extra_query or {}
         self._proxy = proxy or None
         self._native_compaction_available = True
-
-        if api_key and spec and spec.env_key:
-            self._setup_env(api_key, api_base)
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
         self._effective_base = effective_base
@@ -596,20 +623,6 @@ class OpenAICompatProvider(LLMProvider):
                 raise RuntimeError("OpenAI client initialization did not produce a client")
             return self._client
 
-    def _setup_env(self, api_key: str, api_base: str | None) -> None:
-        """Set environment variables based on provider spec."""
-        spec = self._spec
-        if not spec or not spec.env_key:
-            return
-        if spec.is_gateway:
-            os.environ[spec.env_key] = api_key
-        else:
-            os.environ.setdefault(spec.env_key, api_key)
-        effective_base = api_base or spec.default_api_base
-        for env_name, env_val in spec.env_extras:
-            resolved = env_val.replace("{api_key}", api_key).replace("{api_base}", effective_base)
-            os.environ.setdefault(env_name, resolved)
-
     @classmethod
     def _apply_cache_control(
         cls,
@@ -671,12 +684,20 @@ class OpenAICompatProvider(LLMProvider):
             dumped = str(content)
         return dumped or "(empty)"
 
-    def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _sanitize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Strip non-standard keys, normalize tool_call IDs."""
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
         pending_tool_ids: dict[str, deque[str]] = {}
-        force_string_content = bool(self._spec and self._spec.name == "deepseek")
+        is_deepseek = bool(self._spec and self._spec.name == "deepseek")
+        model_name = model or self.default_model
+        force_string_content = (
+            is_deepseek and _model_slug(model_name) not in _DEEPSEEK_MULTIMODAL_MODELS
+        )
         normalize_tool_ids = self._should_normalize_tool_call_ids()
         strip_reasoning = bool(
             self._spec
@@ -685,6 +706,8 @@ class OpenAICompatProvider(LLMProvider):
         if strip_reasoning:
             for msg in sanitized:
                 msg.pop("reasoning_content", None)
+        if self._spec and self._spec.name == "gemini":
+            sanitized = self._ensure_gemini_thought_signatures(sanitized)
 
         def map_id(value: Any) -> Any:
             if not isinstance(value, str):
@@ -762,6 +785,81 @@ class OpenAICompatProvider(LLMProvider):
                 clean["content"] = self._coerce_content_to_string(clean.get("content"))
         return self._enforce_role_alternation(sanitized)
 
+    @staticmethod
+    def _gemini_thought_signature(tool_call: dict[str, Any]) -> str | None:
+        """Return Gemini's thought signature attached to a tool call, if any.
+
+        Gemini's OpenAI-compatible endpoint returns tool calls with an
+        ``extra_content`` field: ``{"google": {"thought_signature": "..."}}``.
+        nanobot preserves it through the parse -> serialize round-trip so
+        replayed calls stay valid. Calls produced by other providers (e.g.
+        after a mid-conversation model switch) carry no signature.
+        """
+        extra = tool_call.get("extra_content")
+        if not isinstance(extra, dict):
+            return None
+        google = cast(dict[str, Any], extra).get("google")
+        if not isinstance(google, dict):
+            return None
+        signature = cast(dict[str, Any], google).get("thought_signature")
+        if isinstance(signature, str) and signature:
+            return signature
+        return None
+
+    def _ensure_gemini_thought_signatures(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Keep migrated tool history wire-valid without losing tool context.
+
+        Gemini requires the first call in each function-call step to carry a
+        thought signature. Native parallel calls intentionally leave later
+        calls unsigned, so they must remain in their original order. For a
+        fully unsigned step imported from another provider, Google documents
+        ``skip_thought_signature_validator`` as a last-resort migration value.
+        """
+        kept: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role")
+            calls = msg.get("tool_calls")
+            if role != "assistant" or not isinstance(calls, list) or not calls:
+                kept.append(msg)
+                continue
+
+            call_values = cast(list[object], calls)
+            typed_calls = [
+                cast(dict[str, Any], tool_call)
+                for tool_call in call_values
+                if isinstance(tool_call, dict)
+            ]
+            if not typed_calls:
+                if msg.get("content"):
+                    clean = dict(msg)
+                    clean.pop("tool_calls", None)
+                    kept.append(clean)
+                continue
+
+            clean_calls = typed_calls
+            if self._gemini_thought_signature(typed_calls[0]) is None:
+                first = dict(typed_calls[0])
+                extra_value = first.get("extra_content")
+                extra = dict(cast(dict[str, Any], extra_value)) if isinstance(
+                    extra_value, dict
+                ) else {}
+                google_value = extra.get("google")
+                google = dict(cast(dict[str, Any], google_value)) if isinstance(
+                    google_value, dict
+                ) else {}
+                google["thought_signature"] = _GEMINI_SKIP_THOUGHT_SIGNATURE
+                extra["google"] = google
+                first["extra_content"] = extra
+                clean_calls = [first, *typed_calls[1:]]
+
+            if clean_calls != call_values:
+                msg = dict(msg)
+                msg["tool_calls"] = clean_calls
+            kept.append(msg)
+        return kept
+
     # ------------------------------------------------------------------
     # Build kwargs
     # ------------------------------------------------------------------
@@ -826,7 +924,10 @@ class OpenAICompatProvider(LLMProvider):
 
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages),
+                model_name,
+            ),
         }
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when
@@ -968,14 +1069,11 @@ class OpenAICompatProvider(LLMProvider):
                 if msg.get("role") == "assistant" and "reasoning_content" not in msg:
                     msg["reasoning_content"] = ""
 
-        # Merge user-configured extra_body last so it can override or
-        # extend provider-specific defaults (e.g. chat_template_kwargs,
-        # guided_json, repetition_penalty).  Uses recursive merge so
-        # nested dicts like {"chat_template_kwargs": {"enable_thinking": false}}
-        # do not clobber sibling keys already set by thinking-style logic.
+        # Merge user-configured extra_body last so ordinary fields can override
+        # provider defaults. Keep configured tools at the top level: the SDK
+        # otherwise lets extra_body.tools replace nanobot's generated functions.
         if self._extra_body:
-            existing = kwargs.get("extra_body", {})
-            kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
+            kwargs = _merge_chat_extra_body(kwargs, self._extra_body)
 
         return kwargs
 
@@ -1144,7 +1242,10 @@ class OpenAICompatProvider(LLMProvider):
         """Build a Responses API body for direct OpenAI requests."""
         model_name = model or self.default_model
         model_name = self._request_model_name(model_name)
-        sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
+        sanitized_messages = self._sanitize_messages(
+            self._sanitize_empty_content(messages),
+            model_name,
+        )
         sanitized_state = (
             provider_context.conversation_state
             if provider_context is not None
@@ -1153,10 +1254,12 @@ class OpenAICompatProvider(LLMProvider):
         if sanitized_state is not None:
             sanitized_state = sanitized_state.with_pending_messages(
                 self._sanitize_messages(
-                    self._sanitize_empty_content(sanitized_state.pending_messages)
+                    self._sanitize_empty_content(sanitized_state.pending_messages),
+                    model_name,
                 )
             )
-        preserve_reasoning = bool(self._spec and self._spec.name == "deepseek")
+        is_deepseek = bool(self._spec and self._spec.name == "deepseek")
+        preserve_reasoning = is_deepseek
         instructions, input_items, replayed = prepare_responses_input(
             sanitized_messages,
             state=sanitized_state,
@@ -1192,7 +1295,7 @@ class OpenAICompatProvider(LLMProvider):
 
         if not self._supports_temperature(model_name, reasoning_effort) and not preserve_reasoning:
             body["include"] = ["reasoning.encrypted_content"]
-        if reasoning_effort and reasoning_effort.lower() != "none":
+        if reasoning_effort and (reasoning_effort.lower() != "none" or is_deepseek):
             body["reasoning"] = {"effort": reasoning_effort}
         if replayed and "gpt-5.6" in model_name.lower():
             body.setdefault("reasoning", {})["context"] = "all_turns"
@@ -1328,12 +1431,12 @@ class OpenAICompatProvider(LLMProvider):
         return "".join(parts) or None
 
     @classmethod
-    def _extract_usage(cls, response: Any) -> dict[str, int]:
+    def _extract_usage(cls, response: Any) -> LLMUsage | None:
         """Extract token usage from an OpenAI-compatible response.
 
         Handles both dict-based (raw JSON) and object-based (SDK Pydantic)
-        responses.  Provider-specific ``cached_tokens`` fields are normalised
-        under a single key; see the priority chain inside for details.
+        responses. Provider-specific cache fields are normalized once at
+        this Chat Completions wire boundary.
         """
         # --- resolve usage object ---
         usage_obj = None
@@ -1345,21 +1448,18 @@ class OpenAICompatProvider(LLMProvider):
 
         usage_map = cls._maybe_mapping(usage_obj)
         if usage_map is not None:
-            result = {
-                "prompt_tokens": int(usage_map.get("prompt_tokens") or 0),
-                "completion_tokens": int(usage_map.get("completion_tokens") or 0),
-                "total_tokens": int(usage_map.get("total_tokens") or 0),
-            }
+            input_tokens = int(usage_map.get("prompt_tokens") or 0)
+            output_tokens = int(usage_map.get("completion_tokens") or 0)
         elif usage_obj:
-            result = {
-                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
-            }
+            input_tokens = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+            output_tokens = int(getattr(usage_obj, "completion_tokens", 0) or 0)
         else:
-            return {}
+            return None
 
-        # --- cached_tokens (normalised across providers) ---
+        wire_total = cls._get_nested_int(usage_obj, ("total_tokens",))
+
+        cache_read: int | None = None
+        # --- cached_tokens (normalised across Chat-compatible providers) ---
         # Try nested paths first (dict), fall back to attribute (SDK object).
         # Priority order ensures the most specific field wins.
         for path in (
@@ -1368,17 +1468,28 @@ class OpenAICompatProvider(LLMProvider):
             ("prompt_cache_hit_tokens",),                # DeepSeek/SiliconFlow
         ):
             cached = cls._get_nested_int(usage_map, path)
-            if not cached and usage_obj:
+            if cached is None and usage_obj:
                 cached = cls._get_nested_int(usage_obj, path)
-            if cached:
-                result["cached_tokens"] = cached
+            if cached is not None:
+                cache_read = cached
                 break
 
-        return result
+        cache_write = cls._get_nested_int(
+            usage_obj,
+            ("prompt_tokens_details", "cache_write_tokens"),
+        )
+
+        return LLMUsage.reported(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=wire_total,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+        )
 
     @staticmethod
-    def _get_nested_int(obj: object, path: tuple[str, ...]) -> int:
-        """Drill into *obj* by *path* segments and return an ``int`` value.
+    def _get_nested_int(obj: object, path: tuple[str, ...]) -> int | None:
+        """Return a present usage count while preserving explicit zero.
 
         Supports both dict-key access and attribute access so it works
         uniformly with raw JSON dicts **and** SDK Pydantic models.
@@ -1386,12 +1497,17 @@ class OpenAICompatProvider(LLMProvider):
         current: object = obj
         for segment in path:
             if current is None:
-                return 0
+                return None
             if isinstance(current, dict):
                 current = cast(dict[str, Any], current).get(segment)
             else:
                 current = getattr(current, segment, None)
-        return int(cast(Any, current) or 0) if current is not None else 0
+        if current is None or isinstance(current, bool):
+            return None
+        try:
+            return int(cast(Any, current))
+        except (TypeError, ValueError):
+            return None
 
     def _parse(self, response: Any) -> LLMResponse:
         if isinstance(response, str):
@@ -1545,7 +1661,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
-        usage: dict[str, int] = {}
+        usage: LLMUsage | None = None
 
         def _accum_tc(tc: Any, idx_hint: int) -> None:
             """Accumulate one streaming tool-call delta into *tc_bufs*."""
@@ -1934,6 +2050,18 @@ class OpenAICompatProvider(LLMProvider):
                             output_items=capture.output_items,
                             usage=usage,
                         )
+                        result.provider_compaction_state = (
+                            build_responses_compaction_state(
+                                provider=self._responses_state_provider(),
+                                model=str(body["model"]),
+                                output_items=capture.output_items,
+                            )
+                        )
+                        result.provider_compaction_applied = (
+                            result.provider_compaction_state is not None
+                        )
+                        if result.provider_compaction_applied:
+                            result.provider_compaction_scope = "current_request"
                     return result
                 except Exception as responses_error:
                     if self._spec and self._spec.name == "github_copilot":

@@ -42,6 +42,65 @@ def _make_loop(*, tools_config=None):
     return loop, bus
 
 
+class TestActiveTaskTracking:
+    @pytest.mark.asyncio
+    async def test_completed_task_removes_empty_session_group(self):
+        loop, _bus = _make_loop()
+        release = asyncio.Event()
+        task = asyncio.create_task(release.wait())
+
+        loop._track_active_task("test:c1", task)
+        release.set()
+        await task
+        await asyncio.sleep(0)
+
+        assert "test:c1" not in loop._active_tasks
+
+    @pytest.mark.asyncio
+    async def test_session_group_remains_until_last_task_completes(self):
+        loop, _bus = _make_loop()
+        releases = [asyncio.Event(), asyncio.Event()]
+        tasks = [asyncio.create_task(release.wait()) for release in releases]
+        for task in tasks:
+            loop._track_active_task("test:c1", task)
+
+        releases[0].set()
+        await tasks[0]
+        await asyncio.sleep(0)
+
+        assert loop._active_tasks["test:c1"] == {tasks[1]}
+
+        releases[1].set()
+        await tasks[1]
+        await asyncio.sleep(0)
+
+        assert "test:c1" not in loop._active_tasks
+
+    @pytest.mark.asyncio
+    async def test_old_callback_preserves_replacement_session_group(self):
+        loop, _bus = _make_loop()
+        old_release = asyncio.Event()
+        new_release = asyncio.Event()
+        old_task = asyncio.create_task(old_release.wait())
+        new_task = asyncio.create_task(new_release.wait())
+
+        loop._track_active_task("test:c1", old_task)
+        loop._active_tasks.pop("test:c1")
+        loop._track_active_task("test:c1", new_task)
+
+        old_release.set()
+        await old_task
+        await asyncio.sleep(0)
+
+        assert loop._active_tasks["test:c1"] == {new_task}
+
+        new_release.set()
+        await new_task
+        await asyncio.sleep(0)
+
+        assert "test:c1" not in loop._active_tasks
+
+
 class TestHandleStop:
     @pytest.mark.asyncio
     async def test_stop_no_active_task(self):
@@ -56,7 +115,7 @@ class TestHandleStop:
         assert "No active task" in out.content
 
     @pytest.mark.asyncio
-    async def test_close_mcp_cancels_active_turn_before_resources(self):
+    async def test_aclose_cancels_active_turn_before_resources(self):
         loop, _bus = _make_loop()
         events: list[str] = []
 
@@ -76,14 +135,13 @@ class TestHandleStop:
 
         loop.subagents.close = close_subagents
         loop._exec_session_manager.close_all = AsyncMock()
-        with patch("nanobot.agent.loop.agent_context.close_mcp", AsyncMock()):
-            await loop.close_mcp()
+        await loop.aclose()
 
         assert events == ["turn_cancelled", "resources_closed"]
         assert task.cancelled()
 
     @pytest.mark.asyncio
-    async def test_close_mcp_serializes_duplicate_cleanup(self):
+    async def test_aclose_serializes_duplicate_cleanup(self):
         loop, _bus = _make_loop()
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -100,14 +158,13 @@ class TestHandleStop:
 
         loop.subagents.close = close_subagents
         loop._exec_session_manager.close_all = AsyncMock()
-        with patch("nanobot.agent.loop.agent_context.close_mcp", AsyncMock()):
-            first = asyncio.create_task(loop.close_mcp())
-            await entered.wait()
-            second = asyncio.create_task(loop.close_mcp())
-            await asyncio.sleep(0)
-            assert not second.done()
-            release.set()
-            await asyncio.gather(first, second)
+        first = asyncio.create_task(loop.aclose())
+        await entered.wait()
+        second = asyncio.create_task(loop.aclose())
+        await asyncio.sleep(0)
+        assert not second.done()
+        release.set()
+        await asyncio.gather(first, second)
 
         assert max_concurrent == 1
 
@@ -172,8 +229,7 @@ class TestDispatch:
     @pytest.mark.asyncio
     async def test_run_logs_and_continues_after_leaked_cancelled_error(self, monkeypatch):
         loop, bus = _make_loop()
-        loop._connect_mcp = AsyncMock()
-        loop.close_mcp = AsyncMock()
+        loop.aclose = AsyncMock()
         loop.auto_compact.check_expired = MagicMock()
         warnings: list[str] = []
         calls = 0
@@ -257,7 +313,7 @@ class TestDispatch:
         assert isinstance(second.event, StreamEndEvent)
 
     @pytest.mark.asyncio
-    async def test_processing_lock_serializes(self):
+    async def test_same_session_dispatches_serialize(self):
         from nanobot.bus.events import InboundMessage, OutboundMessage
 
         loop, bus = _make_loop()
@@ -453,7 +509,9 @@ class TestSubagentCancellation:
         mgr._announce_result.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_subagent_announces_error_when_tool_execution_fails(self, monkeypatch, tmp_path):
+    async def test_subagent_announces_success_after_recovering_from_tool_failure(
+        self, monkeypatch, tmp_path
+    ):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
         from nanobot.providers.base import LLMResponse, ToolCallRequest
@@ -461,10 +519,21 @@ class TestSubagentCancellation:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-            content="thinking",
-            tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
-        ))
+        provider.chat_with_retry = AsyncMock(side_effect=[
+            LLMResponse(
+                content="first attempt",
+                tool_calls=[
+                    ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})
+                ],
+            ),
+            LLMResponse(
+                content="retrying",
+                tool_calls=[
+                    ToolCallRequest(id="call_2", name="list_dir", arguments={"path": "."})
+                ],
+            ),
+            LLMResponse(content="recovered after tool failure", tool_calls=[]),
+        ])
         mgr = SubagentManager(
             workspace=tmp_path,
             bus=bus,
@@ -495,11 +564,10 @@ class TestSubagentCancellation:
 
         mgr._announce_result.assert_awaited_once()
         args = mgr._announce_result.await_args.args
-        assert "Completed steps:" in args[3]
-        assert "- list_dir: first result" in args[3]
-        assert "Failure:" in args[3]
-        assert "- list_dir: boom" in args[3]
-        assert args[5] == "error"
+        assert args[3] == "recovered after tool failure"
+        assert args[5] == "ok"
+        assert calls["n"] == 2
+        assert provider.chat_with_retry.await_count == 3
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):

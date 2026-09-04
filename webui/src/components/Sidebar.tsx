@@ -16,7 +16,11 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { ChatList } from "@/components/ChatList";
+import {
+  ChatList,
+  type SidebarDeleteItem,
+  type SidebarPaneGroup,
+} from "@/components/ChatList";
 import { ConnectionBadge } from "@/components/ConnectionBadge";
 import {
   SIDEBAR_SELECTION_ACTION_ITEM_CLASS,
@@ -39,10 +43,20 @@ interface SidebarProps {
   onSelect: (key: string) => void;
   onCloseTemporaryChat?: (key: string) => void;
   onRequestDelete: (key: string, label: string) => void;
+  onRequestDeleteMany?: (items: SidebarDeleteItem[]) => void;
   onTogglePin: (key: string) => void;
   onRequestRename: (key: string, label: string) => void;
+  onRequestRenameTab?: (key: string, label: string) => void;
   onToggleArchive: (key: string) => void;
-  onReorderSessions: (keys: string[]) => void;
+  paneGroups?: Record<string, SidebarPaneGroup>;
+  onSelectPane?: (tabKey: string, paneKey: string) => void;
+  onCreateTab?: (paneKey: string) => void;
+  onDetachPane?: (tabKey: string, paneKey: string) => void;
+  onDissolveTab?: (tabKey: string) => void;
+  onAttachPane?: (
+    paneKey: string,
+    tabKey: string,
+  ) => void;
   onToggleGroup: (groupId: string) => void;
   onRequestRenameProject: (projectKey: string, label: string) => void;
   onNewChatInProject: (projectPath: string, projectName: string) => void;
@@ -60,12 +74,15 @@ interface SidebarProps {
   collapsed?: boolean;
   pinnedKeys?: string[];
   archivedKeys?: string[];
+  pinnedPaneKeys?: string[];
+  archivedPaneKeys?: string[];
   sessionOrder?: string[];
   titleOverrides?: Record<string, string>;
   projectNameOverrides?: Record<string, string>;
   collapsedGroups?: Record<string, boolean>;
   runningChatIds?: string[];
   updatedChatIds?: string[];
+  recoveryChatIds?: string[];
   viewState?: SidebarViewState;
   showArchived?: boolean;
   archivedCount?: number;
@@ -113,13 +130,14 @@ export function Sidebar(props: SidebarProps) {
       )}
     >
       <div
+        data-testid="sidebar-brand-row"
         className={cn(
-          "flex items-center px-3 pb-2.5",
-          props.hostChromeInset ? "pt-[2.85rem]" : "pt-3",
+          "flex items-start px-3 pb-2.5 pt-3",
           collapsed ? "w-14 justify-start" : "justify-between",
         )}
       >
         <button
+          data-testid="sidebar-brand-mark"
           type="button"
           aria-label={collapsed ? toggleLabel : undefined}
           aria-hidden={collapsed ? undefined : true}
@@ -127,7 +145,8 @@ export function Sidebar(props: SidebarProps) {
           onClick={collapsed ? props.onExpand : undefined}
           tabIndex={collapsed ? 0 : -1}
           className={cn(
-            "flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-xl transition-colors",
+            "host-no-drag flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-xl transition-colors",
+            props.hostChromeInset && "mt-5",
             collapsed
               ? "-ml-0.5 hover:bg-sidebar-accent/75"
               : "pointer-events-none -ml-0.5",
@@ -140,13 +159,13 @@ export function Sidebar(props: SidebarProps) {
             draggable={false}
           />
         </button>
-        {!collapsed && !props.hostChromeInset && (
+        {!collapsed && (
           <Button
             variant="ghost"
             size="icon"
             aria-label={t("sidebar.collapse")}
             onClick={props.onCollapse}
-            className="h-7 w-7 rounded-lg text-muted-foreground/85 hover:bg-sidebar-accent/75 hover:text-sidebar-foreground"
+            className="host-no-drag mt-1 h-7 w-7 rounded-lg text-muted-foreground/85 hover:bg-sidebar-accent/75 hover:text-sidebar-foreground"
           >
             <Menu className="h-3.5 w-3.5" />
           </Button>
@@ -230,21 +249,31 @@ export function Sidebar(props: SidebarProps) {
             onSelect={props.onSelect}
             onCloseTemporaryChat={props.onCloseTemporaryChat}
             onRequestDelete={props.onRequestDelete}
+            onRequestDeleteMany={props.onRequestDeleteMany}
             onTogglePin={props.onTogglePin}
             onRequestRename={props.onRequestRename}
+            onRequestRenameTab={props.onRequestRenameTab}
             onToggleArchive={props.onToggleArchive}
-            onReorderSessions={props.onReorderSessions}
+            paneGroups={props.paneGroups}
+            onSelectPane={props.onSelectPane}
+            onCreateTab={props.onCreateTab}
+            onDetachPane={props.onDetachPane}
+            onDissolveTab={props.onDissolveTab}
+            onAttachPane={props.onAttachPane}
             onToggleGroup={props.onToggleGroup}
             onRequestRenameProject={props.onRequestRenameProject}
             onNewChatInProject={props.onNewChatInProject}
             pinnedKeys={props.pinnedKeys}
             archivedKeys={props.archivedKeys}
+            pinnedPaneKeys={props.pinnedPaneKeys}
+            archivedPaneKeys={props.archivedPaneKeys}
             sessionOrder={props.sessionOrder}
             titleOverrides={props.titleOverrides}
             projectNameOverrides={props.projectNameOverrides}
             collapsedGroups={props.collapsedGroups}
             runningChatIds={props.runningChatIds}
             updatedChatIds={props.updatedChatIds}
+            recoveryChatIds={props.recoveryChatIds}
             density={props.viewState?.density}
             showPreviews={props.viewState?.show_previews}
             showTimestamps={props.viewState?.show_timestamps}

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlsplit
@@ -10,13 +14,26 @@ from websockets.datastructures import Headers
 
 from nanobot.config.loader import get_config_path
 from nanobot.webui.http_utils import http_json_response
+from nanobot.webui.mcp_presets_api import custom_mcp_action
 from nanobot.webui.settings_routes import WebUISettingsRouter
 from nanobot.webui.settings_services import WebUISettingsServices
 
 
-def _router(*, authorized: bool = True) -> WebUISettingsRouter:
+def _router(
+    *,
+    authorized: bool = True,
+    config_path: Path | None = None,
+    mcp_runtime_status: Callable[[], Mapping[str, str]] | None = None,
+    mcp_reload: Callable[[], Awaitable[dict[str, object]]] | None = None,
+    rename_model_preset: Callable[[str, str], int] | None = None,
+    refresh_runtime_config: Callable[[], None] | None = None,
+) -> WebUISettingsRouter:
     return WebUISettingsRouter(
-        settings=WebUISettingsServices.create(get_config_path()),
+        settings=WebUISettingsServices.create(
+            config_path or get_config_path(),
+            rename_model_preset=rename_model_preset,
+            refresh_runtime_config=refresh_runtime_config,
+        ),
         bus=SimpleNamespace(),
         logger=SimpleNamespace(exception=lambda *_args: None),
         check_api_token=lambda _request: authorized,
@@ -28,6 +45,8 @@ def _router(*, authorized: bool = True) -> WebUISettingsRouter:
         ),
         runtime_surface="browser",
         runtime_capabilities={},
+        mcp_runtime_status=mcp_runtime_status,
+        mcp_reload=mcp_reload,
         mcp_oauth_redirect_uri=lambda _request: "https://gateway.example/auth/mcp/callback",
     )
 
@@ -38,6 +57,112 @@ def _mutation_request(path: str, payload: dict[str, object]) -> SimpleNamespace:
     request._nanobot_webui_mutation_payload = payload
     request._nanobot_trusted_proxy_authenticated = True
     return request
+
+
+@pytest.mark.asyncio
+async def test_mcp_list_serializes_local_runtime_failure_snapshot(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    custom_mcp_action(
+        "custom",
+        {
+            "name": ["team-docs"],
+            "transport": ["streamableHttp"],
+            "url": ["https://mcp.example.com/mcp"],
+        },
+        config_path=config_path,
+    )
+    snapshot_calls = 0
+
+    def runtime_snapshot() -> Mapping[str, str]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return {"team-docs": "failed"}
+
+    router = _router(
+        config_path=config_path,
+        mcp_runtime_status=runtime_snapshot,
+    )
+    request = SimpleNamespace(
+        path="/api/settings/mcp-presets",
+        headers=Headers(),
+    )
+
+    response = await router.dispatch(None, request, "/api/settings/mcp-presets")
+
+    assert response is not None
+    assert response.status_code == 200
+    payload = json.loads(response.body)
+    row = next(item for item in payload["presets"] if item["name"] == "team-docs")
+    assert row["status"] == "configured"
+    assert row["runtime_status"] == "failed"
+    assert b'"runtime_status": "failed"' in response.body
+    assert snapshot_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_query_runs_off_the_event_loop(monkeypatch) -> None:
+    calling_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def usage_payload(**_kwargs):
+        worker_threads.append(threading.get_ident())
+        return {"days": []}
+
+    monkeypatch.setattr("nanobot.webui.settings_routes.settings_usage_payload", usage_payload)
+    request = SimpleNamespace(path="/api/settings/usage", headers=Headers())
+
+    response = await _router().dispatch(None, request, request.path)
+
+    assert response is not None
+    assert response.status_code == 200
+    assert worker_threads and worker_threads[0] != calling_thread
+
+
+@pytest.mark.asyncio
+async def test_full_settings_query_runs_off_the_event_loop(monkeypatch) -> None:
+    calling_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    router = _router()
+
+    def settings_response():
+        worker_threads.append(threading.get_ident())
+        return http_json_response({"ok": True})
+
+    monkeypatch.setattr(router, "_handle_settings", settings_response)
+    request = SimpleNamespace(path="/api/settings", headers=Headers())
+
+    response = await router.dispatch(None, request, request.path)
+
+    assert response is not None
+    assert response.status_code == 200
+    assert worker_threads and worker_threads[0] != calling_thread
+
+
+@pytest.mark.asyncio
+async def test_mcp_reload_callback_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+
+    async def reload_mcp() -> dict[str, object]:
+        started.set()
+        await asyncio.Event().wait()
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "nanobot.webui.settings_routes._MCP_RELOAD_TIMEOUT_SECONDS",
+        0.01,
+    )
+    router = _router(mcp_reload=reload_mcp)
+
+    result = await router._reload_mcp_runtime()
+
+    assert started.is_set()
+    assert result == {
+        "ok": False,
+        "message": "MCP hot reload timed out. Restart nanobot to pick up changes.",
+        "requires_restart": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -223,6 +348,18 @@ async def test_oauth_completion_reads_websocket_payload(
     ("route_path", "function_name", "payload", "expected_query"),
     [
         (
+            "/api/settings/update",
+            "update_agent_settings",
+            {"model_preset": "Codex"},
+            {"model_preset": ["Codex"]},
+        ),
+        (
+            "/api/settings/model-configurations/create",
+            "create_model_configuration",
+            {"name": "Codex", "model": "openai-codex/gpt-5.6"},
+            {"name": ["Codex"], "model": ["openai-codex/gpt-5.6"]},
+        ),
+        (
             "/api/settings/model-configurations/delete",
             "delete_model_configuration",
             {"name": "spare"},
@@ -240,10 +377,22 @@ async def test_oauth_completion_reads_websocket_payload(
             {"order": ["backup"]},
             {"order": ['["backup"]']},
         ),
+        (
+            "/api/settings/provider/create",
+            "create_provider_settings",
+            {"name": "team", "api_base": "https://llm.example/v1"},
+            {"name": ["team"], "api_base": ["https://llm.example/v1"]},
+        ),
+        (
+            "/api/settings/provider/update",
+            "update_provider_settings",
+            {"provider": "team", "api_base": "https://llm.example/v2"},
+            {"provider": ["team"], "api_base": ["https://llm.example/v2"]},
+        ),
     ],
 )
 @pytest.mark.asyncio
-async def test_model_preset_mutation_routes(
+async def test_runtime_config_mutation_routes_refresh_live_runtime(
     monkeypatch,
     route_path: str,
     function_name: str,
@@ -251,6 +400,7 @@ async def test_model_preset_mutation_routes(
     expected_query: dict[str, list[str]],
 ) -> None:
     captured: dict[str, object] = {}
+    refresh_runtime_config = MagicMock()
 
     def mutate(query, *, config_path=None):
         captured["query"] = query
@@ -259,12 +409,47 @@ async def test_model_preset_mutation_routes(
     monkeypatch.setattr(f"nanobot.webui.settings_routes.{function_name}", mutate)
     request = _mutation_request(route_path, payload)
 
-    response = await _router().dispatch(None, request, route_path)
+    response = await _router(
+        refresh_runtime_config=refresh_runtime_config,
+    ).dispatch(None, request, route_path)
 
     assert response is not None
     assert response.status_code == 200
     assert json.loads(response.body)["routed"] == function_name
     assert captured["query"] == expected_query
+    refresh_runtime_config.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_model_update_route_forwards_session_rename_dependency(monkeypatch) -> None:
+    rename_model_preset = MagicMock(return_value=2)
+    refresh_runtime_config = MagicMock()
+    captured: dict[str, object] = {}
+
+    def update(query, *, config_path=None, rename_model_preset=None):
+        captured.update(query=query, rename_model_preset=rename_model_preset)
+        return {"updated": True}
+
+    monkeypatch.setattr("nanobot.webui.settings_routes.update_model_configuration", update)
+    path = "/api/settings/model-configurations/update"
+    request = _mutation_request(path, {"name": "openai", "new_name": "Codex"})
+
+    response = await _router(
+        rename_model_preset=rename_model_preset,
+        refresh_runtime_config=refresh_runtime_config,
+    ).dispatch(
+        None,
+        request,
+        path,
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    assert captured == {
+        "query": {"name": ["openai"], "new_name": ["Codex"]},
+        "rename_model_preset": rename_model_preset,
+    }
+    refresh_runtime_config.assert_called_once_with()
 
 
 @pytest.mark.asyncio

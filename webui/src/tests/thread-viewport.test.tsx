@@ -123,6 +123,25 @@ function stubResizeObserver() {
   };
 }
 
+function stubElementsFromPoint(resolve: () => Element[]) {
+  const descriptor = Object.getOwnPropertyDescriptor(document, "elementsFromPoint");
+  const mock = vi.fn(resolve);
+  Object.defineProperty(document, "elementsFromPoint", {
+    configurable: true,
+    value: mock,
+  });
+  return {
+    mock,
+    restore: () => {
+      if (descriptor) {
+        Object.defineProperty(document, "elementsFromPoint", descriptor);
+      } else {
+        Reflect.deleteProperty(document, "elementsFromPoint");
+      }
+    },
+  };
+}
+
 function makeLongMessages(count: number): UIMessage[] {
   return Array.from({ length: count }, (_, index) => ({
     id: `m${index}`,
@@ -234,12 +253,16 @@ describe("ThreadViewport", () => {
       />,
     );
 
-    const disclosure = screen.getByRole("button", { name: "Thought" });
+    const disclosure = screen.getByRole("button", { name: "Worked" });
     fireEvent.pointerDown(disclosure, { button: 0 });
     expect(takeUserControl).toHaveBeenCalledTimes(1);
 
     takeUserControl.mockClear();
     fireEvent.keyDown(disclosure, { key: "Enter" });
+    expect(takeUserControl).toHaveBeenCalledTimes(1);
+
+    takeUserControl.mockClear();
+    fireEvent.keyDown(disclosure, { key: " " });
     expect(takeUserControl).toHaveBeenCalledTimes(1);
   });
 
@@ -255,7 +278,9 @@ describe("ThreadViewport", () => {
     const messageRegion = screen.getByTestId("thread-message-region");
     expect(messageRegion).toHaveClass("justify-start");
     expect(messageRegion).not.toHaveClass("justify-end");
-    expect(messageRegion).toHaveClass("pb-4");
+    expect(messageRegion).toHaveClass("thread-message-viewport");
+    expect(messageRegion).toHaveClass("pt-3");
+    expect(messageRegion).toHaveClass("pb-0");
     expect(messageRegion.className).not.toContain("5rem");
   });
 
@@ -312,7 +337,9 @@ describe("ThreadViewport", () => {
     expect(scroller).not.toContainElement(composerDock);
     expect(scroller.parentElement).toContainElement(composerDock);
     expect(composerDock).toHaveClass("relative");
+    expect(composerDock).toHaveClass("thread-composer-dock");
     expect(composerDock).not.toHaveClass("sticky");
+    expect(scroller.querySelector(".thread-message-end-gap")).toBeInTheDocument();
     expect(scroller.lastElementChild).toHaveClass("h-px", "shrink-0");
   });
 
@@ -653,7 +680,7 @@ describe("ThreadViewport", () => {
     }
   });
 
-  it("coalesces streamed layout growth into frame-driven camera targets", async () => {
+  it("settles observed streamed layout growth before paint", async () => {
     const resizeObserver = stubResizeObserver();
     const followTo = vi.spyOn(ThreadCameraController.prototype, "followTo")
       .mockReturnValue("started");
@@ -740,10 +767,7 @@ describe("ThreadViewport", () => {
       });
       act(() => {
         contentObserver!.callback([], contentObserver as unknown as ResizeObserver);
-        contentObserver!.callback([], contentObserver as unknown as ResizeObserver);
       });
-      expect(followTo).not.toHaveBeenCalled();
-      await flushAnimationFrame();
       expect(followTo).toHaveBeenCalledTimes(1);
       expect(followTo).toHaveBeenLastCalledWith(1448);
       followTo.mockClear();
@@ -1476,6 +1500,108 @@ describe("ThreadViewport", () => {
     expect(screen.getAllByText("message 299").length).toBeGreaterThan(0);
   });
 
+  it("prefetches earlier history within half a viewport of the top", () => {
+    const { container } = render(
+      <ThreadViewport
+        messages={makeLongMessages(300)}
+        isStreaming={false}
+        composer={<div />}
+      />,
+    );
+
+    const scroller = getScroller(container);
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 2400 },
+      clientHeight: { configurable: true, value: 600 },
+      scrollTop: { configurable: true, writable: true, value: 301 },
+    });
+
+    act(() => {
+      dispatchUserScroll(scroller);
+    });
+    expect(screen.queryByText("message 139")).not.toBeInTheDocument();
+
+    scroller.scrollTop = 250;
+    act(() => {
+      dispatchUserScroll(scroller);
+    });
+    expect(screen.getByText("message 20")).toBeInTheDocument();
+    expect(screen.queryByText("message 19")).not.toBeInTheDocument();
+  });
+
+  it("keeps the first visible history item fixed while deferred rows materialize", () => {
+    const resizeObserver = stubResizeObserver();
+    let hitTarget: Element | null = null;
+    const hitTest = stubElementsFromPoint(() => hitTarget ? [hitTarget] : []);
+    try {
+      const { container } = render(
+        <ThreadViewport
+          messages={makeLongMessages(300)}
+          isStreaming={false}
+          composer={<div />}
+        />,
+      );
+
+      const scroller = getScroller(container);
+      let scrollHeight = 2_400;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, get: () => scrollHeight },
+        clientHeight: { configurable: true, value: 600 },
+        scrollTop: { configurable: true, writable: true, value: 80 },
+        getBoundingClientRect: {
+          configurable: true,
+          value: () => DOMRect.fromRect({ y: 0, width: 800, height: 600 }),
+        },
+      });
+
+      const anchor = screen.getByText("message 140")
+        .closest<HTMLElement>("[data-thread-display-unit]");
+      expect(anchor).not.toBeNull();
+      hitTarget = anchor;
+      let anchorDocumentTop = 200;
+      Object.defineProperty(anchor, "getBoundingClientRect", {
+        configurable: true,
+        value: () => DOMRect.fromRect({
+          y: anchorDocumentTop - scroller.scrollTop,
+          width: 800,
+          height: 40,
+        }),
+      });
+
+      act(() => {
+        dispatchUserScroll(scroller);
+      });
+      expect(hitTest.mock).toHaveBeenCalled();
+
+      const replacement = anchor.cloneNode(true) as HTMLElement;
+      anchor.replaceWith(replacement);
+      anchorDocumentTop += 180;
+      scrollHeight += 180;
+      Object.defineProperty(replacement, "getBoundingClientRect", {
+        configurable: true,
+        value: () => DOMRect.fromRect({
+          y: anchorDocumentTop - scroller.scrollTop,
+          width: 800,
+          height: 40,
+        }),
+      });
+      const content = screen.getByTestId("thread-message-region").firstElementChild;
+      const observer = resizeObserver.observers.find((candidate) =>
+        content ? candidate.elements.includes(content) : false,
+      );
+      expect(observer).toBeDefined();
+      act(() => {
+        observer?.callback([], observer as unknown as ResizeObserver);
+      });
+
+      expect(scroller.scrollTop).toBe(260);
+      expect(replacement.getBoundingClientRect().top).toBe(120);
+    } finally {
+      hitTest.restore();
+      resizeObserver.restore();
+    }
+  });
+
   it("automatically requests older transcript pages near the top", () => {
     const onLoadOlder = vi.fn();
 
@@ -1959,6 +2085,12 @@ describe("ThreadViewport", () => {
   it("waits for the next conversation's transcript before restoring its bottom", async () => {
     const jumpTo = vi.spyOn(ThreadCameraController.prototype, "jumpTo");
     const followTo = vi.spyOn(ThreadCameraController.prototype, "followTo");
+    const handoffAnimation = {
+      cancel: vi.fn(),
+      oncancel: null,
+      onfinish: null,
+    } as unknown as Animation;
+    const animate = vi.fn(() => handoffAnimation);
     const oldMessages: UIMessage[] = [
       {
         id: "old-user",
@@ -1998,6 +2130,7 @@ describe("ThreadViewport", () => {
       scrollHeight: { configurable: true, value: 2400 },
       clientHeight: { configurable: true, value: 600 },
       scrollTop: { configurable: true, writable: true, value: 300 },
+      animate: { configurable: true, value: animate },
     });
     jumpTo.mockClear();
 
@@ -2013,6 +2146,14 @@ describe("ThreadViewport", () => {
     );
     expect(scroller.scrollTop).toBe(300);
     expect(jumpTo).not.toHaveBeenCalled();
+    expect(animate).toHaveBeenCalledWith(
+      [{ opacity: 1 }, { opacity: 0.82 }],
+      {
+        duration: 80,
+        easing: "cubic-bezier(0.2, 0, 0, 1)",
+        fill: "forwards",
+      },
+    );
 
     Object.defineProperty(scroller, "scrollHeight", {
       configurable: true,
@@ -2033,6 +2174,17 @@ describe("ThreadViewport", () => {
     await flushAnimationFrame();
     expect(jumpTo.mock.calls).toEqual([[2400]]);
     expect(followTo).toHaveBeenCalledWith(2400);
+    expect(handoffAnimation.cancel).toHaveBeenCalled();
+    expect(animate).toHaveBeenCalledWith(
+      [{ opacity: 0.82 }, { opacity: 1 }],
+      {
+        duration: 140,
+        easing: "cubic-bezier(0.2, 0, 0, 1)",
+      },
+    );
+    expect(jumpTo.mock.invocationCallOrder[0]).toBeLessThan(
+      animate.mock.invocationCallOrder[1],
+    );
   });
 
   it("waits for hydrated messages before fulfilling open-chat bottom scroll", async () => {

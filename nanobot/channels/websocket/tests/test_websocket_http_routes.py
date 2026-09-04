@@ -16,12 +16,14 @@ import pytest
 from nanobot.bus.events import OutboundMessage
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.websocket.runtime import WebSocketChannel, WebSocketConfig
+from nanobot.config.loader import load_config, save_config
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 from nanobot.optional_features import InstallResult
 from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.session_handles import SessionHandleResolver
 from nanobot.triggers.local_store import LocalTriggerStore
 from nanobot.webui.gateway_services import GatewayServices, build_gateway_services
 
@@ -29,6 +31,11 @@ from .ws_test_client import InProcessHttpChannel
 from .ws_test_client import http_get as _http_get
 
 _PORT = 29900
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
 
 
 class _MatrixChannel(BaseChannel):
@@ -75,6 +82,8 @@ def _make_handler(
     local_trigger_pending_ids: Any | None = None,
     channel_feature_action: Any | None = None,
     channel_runtime_status: Any | None = None,
+    mcp_reload: Any | None = None,
+    recovery_action: Any | None = None,
 ) -> GatewayServices:
     config = WebSocketConfig.model_validate(cfg) if isinstance(cfg, dict) else cfg
     workspace = workspace_path or Path.cwd()
@@ -94,6 +103,8 @@ def _make_handler(
         local_trigger_pending_ids=local_trigger_pending_ids,
         channel_feature_action=channel_feature_action,
         channel_runtime_status=channel_runtime_status,
+        mcp_reload=mcp_reload,
+        recovery_action=recovery_action,
     )
 
 
@@ -111,6 +122,8 @@ def _ch(
     local_trigger_pending_ids: Any | None = None,
     channel_feature_action: Any | None = None,
     channel_runtime_status: Any | None = None,
+    mcp_reload: Any | None = None,
+    recovery_action: Any | None = None,
     **extra: Any,
 ) -> WebSocketChannel:
     cfg: dict[str, Any] = {
@@ -134,6 +147,8 @@ def _ch(
         local_trigger_pending_ids=local_trigger_pending_ids,
         channel_feature_action=channel_feature_action,
         channel_runtime_status=channel_runtime_status,
+        mcp_reload=mcp_reload,
+        recovery_action=recovery_action,
     )
     return InProcessHttpChannel(cfg, bus, gateway=gateway)
 
@@ -223,6 +238,7 @@ async def test_bootstrap_returns_token_for_localhost(
     try:
         resp = await _http_get("http://127.0.0.1:29901/webui/bootstrap")
         assert resp.status_code == 200
+        assert resp.headers["Cache-Control"] == "no-store"
         body = resp.json()
         assert body["token"].startswith("nbwt_")
         assert channel.gateway.tokens.issued_token_audiences[body["token"]] == "webui"
@@ -273,6 +289,53 @@ async def test_sessions_list_requires_bearer_token(
         # Server stays an opaque source: filesystem paths must not leak to the wire.
         assert all("path" not in s for s in listing.json()["sessions"])
 
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_and_thread_restore_transcript_without_canonical_file(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    sm = SessionManager(tmp_path / "workspace")
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:restored-history"
+    append_transcript_object(
+        key,
+        {"event": "user", "chat_id": "restored-history", "text": "original question"},
+    )
+    append_transcript_object(
+        key,
+        {"event": "message", "chat_id": "restored-history", "text": "original answer"},
+    )
+    assert not sm._get_session_path(key).exists()
+
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, port=port)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        token = channel.gateway.tokens.issue_api_token(300)
+        auth = {"Authorization": f"Bearer {token}"}
+
+        listing = await _http_get(f"http://127.0.0.1:{port}/api/sessions", headers=auth)
+        thread = await _http_get(
+            f"http://127.0.0.1:{port}/api/sessions/"
+            "websocket%3Arestored-history/webui-thread",
+            headers=auth,
+        )
+
+        assert listing.status_code == 200
+        assert [row["key"] for row in listing.json()["sessions"]] == [key]
+        assert listing.json()["sessions"][0]["preview"] == "original question"
+        assert thread.status_code == 200
+        assert [message["content"] for message in thread.json()["messages"]] == [
+            "original question",
+            "original answer",
+        ]
+        assert not sm._get_session_path(key).exists()
     finally:
         await channel.stop()
         await server_task
@@ -579,6 +642,7 @@ async def test_webui_skill_management_routes(
         *,
         enabled: bool,
         disabled_skills: set[str],
+        config_path: Path | None = None,
     ) -> dict[str, Any]:
         assert workspace == tmp_path
         assert name == "custom-skill"
@@ -591,6 +655,7 @@ async def test_webui_skill_management_routes(
         name: str,
         *,
         disabled_skills: set[str],
+        config_path: Path | None = None,
     ) -> dict[str, Any]:
         assert workspace == tmp_path
         assert name == "custom-skill"
@@ -869,10 +934,6 @@ async def test_webui_skill_install_honors_remote_install_opt_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    policy = MagicMock()
-    policy.tools.webui_allow_remote_package_install = True
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: policy)
-
     async def install(
         source: str,
         skill_id: str,
@@ -899,6 +960,9 @@ async def test_webui_skill_install_honors_remote_install_opt_in(
         workspace_path=tmp_path,
         port=_free_port(),
     )
+    policy = load_config(channel.gateway.settings.config.path)
+    policy.tools.webui_allow_remote_package_install = True
+    save_config(policy, channel.gateway.settings.config.path)
     response = await _webui_mutate(
         channel,
         "skill.install",
@@ -1183,39 +1247,6 @@ async def test_pairing_routes_require_token_and_approve_or_deny(
     assert missing_code.status_code == 400
     assert "Missing pairing code" in missing_code.text
 
-
-def test_api_service_settings_read_api_key_from_webui_payload(bus: MagicMock) -> None:
-    channel = _ch(bus)
-    request = _FakeReq(path="/api/settings/api-service/start")
-    setattr(
-        request,
-        "_nanobot_webui_mutation_payload",
-        {"host": "0.0.0.0", "port": 8900, "timeout": 120, "api_key": "secret-token"},
-    )
-
-    query = channel.gateway.http.settings_routes._parse_api_service_settings_query(request)
-
-    assert query == {
-        "host": ["0.0.0.0"],
-        "port": ["8900"],
-        "timeout": ["120"],
-        "api_key": ["secret-token"],
-    }
-
-
-def test_api_service_settings_reject_non_string_api_key(bus: MagicMock) -> None:
-    from nanobot.webui.settings_api import WebUISettingsError
-
-    channel = _ch(bus)
-    request = _FakeReq(path="/api/settings/api-service/start")
-    setattr(
-        request,
-        "_nanobot_webui_mutation_payload",
-        {"host": "127.0.0.1", "api_key": 123},
-    )
-
-    with pytest.raises(WebUISettingsError, match="API key must be a string"):
-        channel.gateway.http.settings_routes._parse_api_service_settings_query(request)
 
 @pytest.mark.asyncio
 async def test_nanobot_feature_remote_install_requires_opt_in(
@@ -2054,14 +2085,15 @@ async def test_mcp_presets_routes_require_token_and_return_payload(
         _custom_action,
     )
 
-    async def _hot_reload(_bus):
+    async def _hot_reload():
         return {"ok": True, "message": "MCP config reloaded.", "requires_restart": False}
 
-    monkeypatch.setattr(
-        "nanobot.webui.settings_routes.request_mcp_reload",
-        _hot_reload,
+    channel = _ch(
+        bus,
+        session_manager=_seed_session(tmp_path),
+        port=29913,
+        mcp_reload=_hot_reload,
     )
-    channel = _ch(bus, session_manager=_seed_session(tmp_path), port=29913)
     server_task = asyncio.create_task(channel.start())
     try:
         deny = await _http_get("http://127.0.0.1:29913/api/settings/mcp-presets")
@@ -2089,6 +2121,14 @@ async def test_mcp_presets_routes_require_token_and_return_payload(
         assert body["last_action"]["message"] == "enable:browserbase MCP config reloaded."
         assert body["hot_reload"]["ok"] is True
         assert body["restart_required_sections"] == []
+
+        disabled = await _webui_mutate(
+            channel,
+            "settings.mcp.disable",
+            {"name": "browserbase"},
+        )
+        assert disabled.status_code == 200
+        assert preset_queries[-1][0] == "disable"
 
         custom = await _webui_mutate(
             channel,
@@ -2144,10 +2184,6 @@ async def test_sessions_list_only_returns_websocket_sessions_by_default(
     }
     sm.save(scoped)
 
-    def fail_metadata_read(_key: str) -> None:
-        raise AssertionError("the session list must use its own index metadata")
-
-    monkeypatch.setattr(sm, "read_session_metadata", fail_metadata_read)
     channel = _ch(bus, session_manager=sm, workspace_path=tmp_path, port=29906)
     server_task = asyncio.create_task(channel.start())
     try:
@@ -2164,6 +2200,16 @@ async def test_sessions_list_only_returns_websocket_sessions_by_default(
         # Slack / Lark rows would be non-resumable from the browser.
         assert keys == {"websocket:alpha", "websocket:beta"}
         rows = {row["key"]: row for row in sessions}
+        handles = {
+            handle.session_key: handle
+            for handle in SessionHandleResolver(sm).list_all()
+        }
+        assert rows["websocket:alpha"]["handle"] == handles[
+            "websocket:alpha"
+        ].public_payload()
+        assert rows["websocket:beta"]["handle"] == handles[
+            "websocket:beta"
+        ].public_payload()
         assert rows["websocket:beta"]["workspace_scope"]["project_path"] == str(
             project.resolve()
         )
@@ -2251,6 +2297,82 @@ async def test_session_delete_removes_file(
     finally:
         await channel.stop()
         await server_task
+
+
+@pytest.mark.asyncio
+async def test_session_delete_removes_transcript_without_canonical_file(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    sm = SessionManager(tmp_path / "workspace")
+    from nanobot.webui.transcript import append_transcript_object
+
+    key = "websocket:transcript-only"
+    append_transcript_object(
+        key,
+        {"event": "user", "chat_id": "transcript-only", "text": "recover me"},
+    )
+    assert not sm._get_session_path(key).exists()
+    webui_path = tmp_path / "webui" / f"{SessionManager.safe_key(key)}.jsonl"
+    assert webui_path.is_file()
+
+    channel = _ch(bus, session_manager=sm, port=_free_port())
+    server_task = asyncio.create_task(channel.start())
+    try:
+        response = await _webui_mutate(
+            channel,
+            "session.delete",
+            {"key": key},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["deleted"] is True
+        assert not webui_path.exists()
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_session_delete_removes_unpersisted_new_chat(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    sm = SessionManager(tmp_path / "sessions")
+    project = tmp_path / "project"
+    project.mkdir()
+    channel = _ch(bus, session_manager=sm, workspace_path=tmp_path, port=_free_port())
+    connection = AsyncMock()
+    connection.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        connection,
+        "webui-client",
+        {
+            "type": "new_chat",
+            "workspace_scope": {
+                "project_path": str(project),
+                "access_mode": "full",
+            },
+        },
+    )
+
+    attached = next(
+        payload
+        for payload in (
+            json.loads(call.args[0]) for call in connection.send.await_args_list
+        )
+        if payload.get("event") == "attached"
+    )
+    key = f"websocket:{attached['chat_id']}"
+
+    assert sm.list_sessions() == []
+    assert channel.gateway.workspaces.scope_for_session_key(key).project_path == project.resolve()
+
+    response = await _webui_mutate(channel, "session.delete", {"key": key})
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+    assert channel.gateway.workspaces.scope_for_session_key(key).project_path == tmp_path.resolve()
 
 
 @pytest.mark.asyncio
@@ -3166,6 +3288,107 @@ async def _webui_mutate(
     )
 
 
+@pytest.mark.asyncio
+async def test_recovery_mutation_uses_authenticated_websocket_action(bus: MagicMock) -> None:
+    recovery_action = AsyncMock(return_value={
+        "status": "resuming",
+        "recovery_id": "recovery-1",
+    })
+    channel = _ch(bus, recovery_action=recovery_action)
+
+    response = await _webui_mutate(
+        channel,
+        "recovery.continue",
+        {"chat_id": "chat-1", "recovery_id": "recovery-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "resuming"
+    recovery_action.assert_awaited_once_with(
+        "continue",
+        {"chat_id": "chat-1", "recovery_id": "recovery-1"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_folder_picker_is_local_authenticated_mutation(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    selected = tmp_path / "project"
+    selected.mkdir()
+    pick_folder = AsyncMock(return_value=str(selected))
+    monkeypatch.setattr(
+        "nanobot.webui.ws_http.native_folder_picker_available",
+        lambda: True,
+    )
+    monkeypatch.setattr("nanobot.webui.ws_http.pick_native_folder", pick_folder)
+    channel = _ch(bus)
+
+    response = await _webui_mutate(channel, "workspace.pick_folder")
+
+    assert response.status_code == 200
+    assert response.json() == {"path": str(selected)}
+    pick_folder.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_workspace_folder_picker_rejects_direct_http(
+    bus: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pick_folder = AsyncMock(return_value="/tmp")
+    monkeypatch.setattr(
+        "nanobot.webui.ws_http.native_folder_picker_available",
+        lambda: True,
+    )
+    monkeypatch.setattr("nanobot.webui.ws_http.pick_native_folder", pick_folder)
+    channel = _ch(bus)
+
+    response = await channel.gateway.http.dispatch(
+        _LOCAL,
+        _FakeReq(
+            {"Host": "127.0.0.1:8765"},
+            path="/api/workspaces/pick-folder",
+        ),
+    )
+
+    assert response is not None
+    assert response.status_code == 405
+    assert b"authenticated WebSocket" in response.body
+    pick_folder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("connection", "host"),
+    [(_REMOTE, "127.0.0.1"), (_LOCAL, "0.0.0.0")],
+)
+async def test_workspace_folder_picker_rejects_nonlocal_surfaces(
+    bus: MagicMock,
+    monkeypatch,
+    connection: _FakeConn,
+    host: str,
+) -> None:
+    pick_folder = AsyncMock(return_value="/tmp")
+    monkeypatch.setattr(
+        "nanobot.webui.ws_http.native_folder_picker_available",
+        lambda: True,
+    )
+    monkeypatch.setattr("nanobot.webui.ws_http.pick_native_folder", pick_folder)
+    channel = _ch(bus, host=host, token="test-token" if host == "0.0.0.0" else "")
+
+    response = await _webui_mutate(
+        channel,
+        "workspace.pick_folder",
+        connection=connection,
+    )
+
+    assert response.status_code == 403
+    pick_folder.assert_not_awaited()
+
+
 def test_local_browser_request_requires_loopback_host_and_forwarded_origin() -> None:
     from nanobot.webui.http_utils import is_local_browser_request
 
@@ -3520,7 +3743,7 @@ def test_authenticated_bootstrap_returns_distinct_api_token(bus: MagicMock) -> N
 def test_bootstrap_prefers_runtime_model_name(bus: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "nanobot.webui.ws_http._default_model_name_from_config",
-        lambda: "from-disk",
+        lambda _config_path=None: "from-disk",
     )
     channel = _ch(bus, host="127.0.0.1", runtime_model_name=lambda: "  live/model  ")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _LOCAL_BROWSER_REQ)
@@ -3532,7 +3755,7 @@ def test_bootstrap_prefers_runtime_model_name(bus: MagicMock, monkeypatch: pytes
 def test_bootstrap_falls_back_when_runtime_returns_empty(bus: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "nanobot.webui.ws_http._default_model_name_from_config",
-        lambda: "from-disk",
+        lambda _config_path=None: "from-disk",
     )
     channel = _ch(bus, host="127.0.0.1", runtime_model_name=lambda: "   ")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _LOCAL_BROWSER_REQ)
@@ -3544,7 +3767,7 @@ def test_bootstrap_falls_back_when_runtime_returns_empty(bus: MagicMock, monkeyp
 def test_bootstrap_falls_back_when_runtime_raises(bus: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "nanobot.webui.ws_http._default_model_name_from_config",
-        lambda: "from-disk",
+        lambda _config_path=None: "from-disk",
     )
 
     def boom():

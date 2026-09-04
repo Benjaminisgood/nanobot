@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tomllib
+from collections import OrderedDict
 from dataclasses import replace
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -32,7 +33,7 @@ from nanobot.channels.contracts import (
     SetupRequirement,
     channel_default_config,
 )
-from nanobot.channels.manager import ChannelManager
+from nanobot.channels.manager import ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE, ChannelManager
 from nanobot.channels.plugin import ChannelPlugin, load_channel_package
 from nanobot.config.loader import load_config, save_config
 from nanobot.config.schema import ChannelsConfig, Config
@@ -3179,7 +3180,7 @@ def test_outbound_duplicate_suppression_is_scoped_to_origin_message() -> None:
     mgr.bus = MessageBus()
     mgr.channels = {}
     mgr._dispatch_task = None
-    mgr._origin_reply_fingerprints = {}
+    mgr._origin_reply_fingerprints = OrderedDict()
 
     first = OutboundMessage(
         channel="feishu",
@@ -3210,6 +3211,39 @@ def test_outbound_duplicate_suppression_is_scoped_to_origin_message() -> None:
     assert mgr._should_suppress_outbound(duplicate) is True
     assert mgr._should_suppress_outbound(separate_turn) is False
     assert mgr._should_suppress_outbound(new_origin_content) is False
+
+
+def test_outbound_duplicate_suppression_cache_is_bounded() -> None:
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr._origin_reply_fingerprints = OrderedDict()
+
+    for index in range(ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE):
+        msg = OutboundMessage(
+            channel="feishu",
+            chat_id="chat123",
+            content="Done",
+            metadata={"message_id": f"msg-{index}"},
+        )
+        assert mgr._should_suppress_outbound(msg) is False
+
+    duplicate = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"origin_message_id": "msg-0"},
+    )
+    newest = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"message_id": f"msg-{ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE}"},
+    )
+
+    assert mgr._should_suppress_outbound(duplicate) is True
+    assert mgr._should_suppress_outbound(newest) is False
+    assert len(mgr._origin_reply_fingerprints) == ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE
+    assert ("feishu", "chat123", "msg-0") in mgr._origin_reply_fingerprints
+    assert ("feishu", "chat123", "msg-1") not in mgr._origin_reply_fingerprints
 
 
 @pytest.mark.asyncio
@@ -3719,6 +3753,27 @@ async def test_notify_restart_done_waits_until_channel_starts():
     assert sent_msg.channel == "feishu"
     assert sent_msg.chat_id == "oc_123"
     assert sent_msg.content.startswith("Restart completed")
+
+
+@pytest.mark.asyncio
+async def test_websocket_restart_notice_does_not_overwrite_recovery_state():
+    """WebSocket attach/recovery events already own reconnect state."""
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    channel = _StartableChannel(fake_config, mgr.bus)
+    channel._running = True
+    mgr.channels = {"websocket": channel}
+    mgr._send_with_retry = AsyncMock()
+
+    notice = RestartNotice(channel="websocket", chat_id="chat", started_at_raw="100.0")
+    await mgr._send_restart_notice_when_started(notice)
+
+    mgr._send_with_retry.assert_not_awaited()
 
 
 @pytest.mark.asyncio

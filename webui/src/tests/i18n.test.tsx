@@ -161,6 +161,7 @@ const LOCALIZED_SETTINGS_COPY_KEYS = [
   "settings.rows.fileEditDisplay",
   "settings.rows.codeWrap",
   "settings.rows.brandLogos",
+  "settings.rows.browserNotifications",
   "settings.rows.currentModel",
   "settings.rows.localServiceAccess",
   "settings.rows.webuiDefaultAccess",
@@ -172,6 +173,7 @@ const LOCALIZED_SETTINGS_COPY_KEYS = [
   "settings.help.fileEditDisplay",
   "settings.help.codeWrap",
   "settings.help.brandLogos",
+  "settings.help.browserNotifications",
   "settings.help.currentModel",
   "settings.help.localServiceAccess",
   "settings.help.webuiDefaultAccess",
@@ -252,6 +254,7 @@ const LOCALIZED_NEW_SURFACE_KEYS = [
   "chat.activity.running",
   "chat.activity.complete",
   "chat.activity.updated",
+  "chat.activity.recovery",
   "chat.pin",
   "chat.unpin",
   "chat.rename",
@@ -269,6 +272,22 @@ const LOCALIZED_NEW_SURFACE_KEYS = [
   "chat.groups.yesterday",
   "chat.groups.earlier",
   "chat.groups.archived",
+  "workbench.tabAria",
+  "workbench.panesInTab",
+  "workbench.collapseTabGroup",
+  "workbench.expandTabGroup",
+  "workbench.dropPane",
+  "workbench.createGroup",
+  "workbench.moveTo",
+  "workbench.renameGroupTitle",
+  "workbench.renameGroupDescription",
+  "workbench.renameGroupPlaceholder",
+  "workbench.dissolveTab",
+  "workbench.deleteConversations",
+  "workbench.paneLimit",
+  "workbench.paneActions",
+  "workbench.detachPane",
+  "workbench.composerAria",
   "thread.promptNavigator.railAria",
   "thread.composer.mentions.cliTitle",
   "thread.composer.mentions.mcpTitle",
@@ -277,6 +296,16 @@ const LOCALIZED_NEW_SURFACE_KEYS = [
   "message.skill",
   "settings.channels.connectionChecks",
   "settings.channels.open",
+  "recovery.actionFailed",
+  "recovery.interrupted",
+  "recovery.completed",
+  "recovery.failed",
+  "recovery.failedHelp",
+  "recovery.resuming",
+  "recovery.review",
+  "recovery.safeResume",
+  "recovery.dismiss",
+  "recovery.continue",
 ];
 const ACCIDENTALLY_SPANISH_SETTINGS_KEYS = [
   "settings.help.provider",
@@ -421,6 +450,17 @@ describe("webui i18n", () => {
 
     localStorage.setItem(LOCALE_STORAGE_KEY, "zh-CN");
     expect(resolveInitialLocale()).toBe("zh-CN");
+  });
+
+  it("lists each language by its native name", async () => {
+    const user = userEvent.setup();
+
+    render(<LanguageSwitcher />);
+    await user.click(screen.getByRole("button", { name: "Change language" }));
+
+    for (const { nativeLabel } of supportedLocales) {
+      expect(screen.getByRole("menuitemradio", { name: nativeLabel })).toBeInTheDocument();
+    }
   });
 
   it("switches UI copy and document locale through the language switcher", async () => {
@@ -580,6 +620,18 @@ describe("webui i18n", () => {
     expect(settings.skills.marketplaceProviderAll).toBe("全部");
     expect(settings.skills.marketplaceSearchPlaceholder).toBe("搜索技能");
     expect(settings.skills.marketplaceTrendingTitle).toBe("各市场热门技能");
+  });
+
+  it("keeps the Simplified Chinese group workflow localized", () => {
+    const workbench = resources["zh-CN"].common.workbench;
+
+    expect(workbench.tabAria).toBe("分组：{{title}}");
+    expect(workbench.createGroup).toBe("创建分组");
+    expect(workbench.renameGroupTitle).toBe("重命名分组");
+    expect(workbench.renameGroupDescription).toBe("为这个分组命名。");
+    expect(workbench.renameGroupPlaceholder).toBe("分组名称");
+    expect(workbench.moveTo).toBe("移动到");
+    expect(workbench.detachPane).toBe("移出");
   });
 
   it("keeps Indonesian and Vietnamese settings free of copied Spanish help text", () => {

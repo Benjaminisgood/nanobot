@@ -19,21 +19,26 @@ nanobot webui
 
 `nanobot webui` creates the config/workspace when needed, enables the local
 WebSocket channel after confirmation, generates a WebUI bootstrap secret when
-one is missing, starts the gateway, and opens the browser. With a fresh config,
+one is missing, starts or joins the same on-demand gateway used by the native
+TUI, and opens the browser. With a fresh config,
 it can open before a model is configured so you can finish setup in **Settings
 → Models**. The first-run path binds the WebUI to `127.0.0.1` by default, so
-it is not available from other devices on your LAN.
+it is not available from other devices on your LAN. While the launcher remains
+attached, it mirrors new log output from that exact gateway instance in the
+terminal without replaying older logs.
 
-Run it in the background when you do not want to keep a terminal open:
+After model setup, explicitly promote the shared gateway when you do not want to keep a client open:
 
 ```bash
-nanobot webui --background
+nanobot gateway --background
 ```
 
-Complete first-time model setup in a foreground `nanobot webui` session before using
-`--background`.
+`nanobot webui --background` is retained only to print migration guidance. This keeps one
+unambiguous owner for persistent process lifecycle.
 
-Manage the background gateway with `nanobot gateway status`, `nanobot gateway
+Each foreground WebUI or TUI launcher releases only its own client. The last
+interactive launcher stops an on-demand gateway. `nanobot gateway --background` makes the
+gateway persistent; manage it with `nanobot gateway status`, `nanobot gateway
 logs`, `nanobot gateway restart`, and `nanobot gateway stop`.
 
 Manual config still works. Same-machine localhost WebUI access can run without
@@ -103,7 +108,7 @@ diff** to expand the change; large diffs may hide unchanged lines or truncate th
 inline preview. Use **Open file** from a file edit to open the read-only file
 preview panel.
 
-File previews follow the active session access mode. Restricted workspace access
+File previews follow the active topic's access mode. Restricted workspace access
 previews only files under the selected workspace. Full Access can preview files
 outside the workspace when that access mode is allowed by the gateway.
 
@@ -132,8 +137,9 @@ or a result you must retain.
 ## Workspace and Access
 
 Use the workspace picker before starting project-specific work. This gives the
-agent the right project context for file paths, shell commands, and session
-metadata.
+agent the right project context for file paths, shell commands, and topic
+metadata. A locally hosted WebUI opens the operating system's folder chooser
+when one is available; remote deployments keep the manual absolute path entry.
 
 Selecting a project does not replace the configured agent workspace. The two
 paths have different responsibilities:
@@ -169,14 +175,17 @@ clients.
 ## Composer
 
 The composer supports plain messages, image attachments, voice input when
-transcription is configured, slash commands, and `@` mentions for installed Apps
-or MCP presets. Select another topic from the `@` menu to attach a stable
-reference, or drag that topic from the sidebar into the composer. Plain text
-that happens to start with `@` does not attach history.
-Restricted chats offer topics from the same project, while Full Access chats can
-reference any WebUI topic. Nanobot reads a referenced topic only when its history
-is relevant and can link it in the response. The model badge shows the current
-model or preset and links back to model settings when setup is incomplete.
+transcription is configured, slash commands, and `@` mentions for installed Apps,
+MCP presets, or persisted topics. Topics have short, pronounceable handles such as
+`@luma`; titles are display text rather than addresses. Select a topic
+from the menu, or drag it from the sidebar, to attach its structured reference.
+Typing the same text without selecting it remains plain text.
+
+The agent can inspect an attached topic with `read_session`. It can discover other
+persisted topics with `list_sessions` and send asynchronous messages with
+`send_session_message`; topic messaging is not limited by workspace scope.
+The model badge shows the current model or preset and links to model settings when
+setup is incomplete.
 
 For image generation, configure an image provider first and then use the WebUI
 image mode from the composer. See [`image-generation.md`](./image-generation.md)
@@ -198,12 +207,16 @@ Test a new channel with a private DM. When a supported channel sends a pairing c
 
 ## Apps
 
-Open Apps from the sidebar to manage tools that nanobot can attach to a chat
-turn. The default **Ready** view shows only tools that can be used immediately:
+Open Apps from the sidebar to review and manage installable capabilities. The
+default **Ready** view shows only capabilities that can be used immediately:
 
-- **Apps** are local command-line adapters that nanobot runs on your machine.
-  Installing an adapter does not modify the native desktop or web app it
-  connects to.
+- **Agent Plugins** are local packages that can bundle skills, MCP servers, or
+  both. A package under `<workspace>/plugins/` is installed but remains inactive
+  until you enable it in Apps.
+- **CLI Apps** are local command-line adapters that nanobot runs on your
+  machine. Their installer manages the executable and exposes its adapter
+  through the same plugin activation model. Installing an adapter does not
+  modify the native desktop or web app it connects to.
 - **MCP** lists Model Context Protocol servers. Presets provide known
   configurations, and the **Add MCP server** panel accepts stdio, HTTP, and SSE
   servers. Custom HTTP/SSE servers can use no authentication, OAuth, or request
@@ -219,6 +232,7 @@ are not tools that can be attached to a turn with `@`. Manage them from
 included in nanobot and activate automatically when a file is attached. The
 equivalent CLI for optional integrations remains `nanobot plugins`. See
 [`cli-reference.md`](./cli-reference.md#optional-features).
+That command manages nanobot runtime extras, not Agent Plugin packages.
 
 Some MCP presets connect to hosted keyless endpoints. For example, the Firecrawl
 preset uses Firecrawl's hosted MCP endpoint for search, scrape, crawl, and
@@ -231,8 +245,9 @@ endpoint and exposes `web_search` and `web_fetch` without requiring an API key.
 It is an optional integration and does not replace nanobot's built-in web search
 provider; mention `@parallel-search` when a turn should use it.
 
-After an App or MCP server is available, mention it from the composer with `@`
-to attach that tool to the next message.
+After a CLI App or MCP server is available, mention it from the composer with
+`@` to attach that tool to the next message. Plugin-provided skills participate
+in normal skill discovery and can be invoked with `$skill-name`.
 
 ## Skills
 
@@ -296,7 +311,7 @@ with the content that should be delivered.
 
 ## Settings
 
-Settings is the control surface for the browser session and gateway-backed
+Settings is the control surface for browser-local and gateway-backed
 runtime configuration. Use it to review or adjust model presets, providers,
 image generation, voice transcription, web tools, chat channels, Apps,
 Automations, Skills, runtime identity, and advanced safety controls.

@@ -439,7 +439,7 @@ describe("webui API helpers", () => {
 
   it("serializes model configuration creation", async () => {
     await createModelConfiguration(mutationTransport, {
-      label: "Fast writing",
+      name: "Fast writing",
       provider: "openai",
       model: "openai/gpt-4.1-mini",
       maxTokens: 4096,
@@ -451,7 +451,7 @@ describe("webui API helpers", () => {
     expect(requestMutation).toHaveBeenCalledWith(
       "settings.model_configuration.create",
       {
-        label: "Fast writing",
+        name: "Fast writing",
         provider: "openai",
         model: "openai/gpt-4.1-mini",
         max_tokens: 4096,
@@ -466,7 +466,7 @@ describe("webui API helpers", () => {
   it("serializes model configuration updates", async () => {
     await updateModelConfiguration(mutationTransport, {
       name: "codex",
-      label: "Codex",
+      newName: "Codex",
       provider: "openai_codex",
       model: "openai-codex/gpt-5.5",
       maxTokens: 8192,
@@ -479,7 +479,7 @@ describe("webui API helpers", () => {
       "settings.model_configuration.update",
       {
         name: "codex",
-        label: "Codex",
+        new_name: "Codex",
         provider: "openai_codex",
         model: "openai-codex/gpt-5.5",
         max_tokens: 8192,
@@ -1061,6 +1061,10 @@ describe("webui API helpers", () => {
             title: "优化 WebUI 标题",
             model_preset: "fast",
             run_started_at: 1_700_000_000,
+            handle: {
+              id: "handle_0123456789abcdef0123456789abcdef",
+              name: "mira-0123456789",
+            },
           },
         ],
       }),
@@ -1073,6 +1077,10 @@ describe("webui API helpers", () => {
         preview: "",
         modelPreset: "fast",
         runStartedAt: 1_700_000_000,
+        handle: {
+          id: "handle_0123456789abcdef0123456789abcdef",
+          name: "mira-0123456789",
+        },
       },
     ]);
   });

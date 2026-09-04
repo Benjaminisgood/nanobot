@@ -1,5 +1,7 @@
 """Utility functions for nanobot."""
 
+from __future__ import annotations
+
 import base64
 import json
 import os
@@ -12,10 +14,13 @@ from contextlib import suppress
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 import tiktoken
 from loguru import logger
+
+if TYPE_CHECKING:
+    from nanobot.providers.base import LLMUsage
 
 _TOOLS_TOKEN_CACHE_MAX_ENTRIES = 64
 _TOOLS_TOKEN_CACHE: dict[int, tuple[tuple[int, ...], dict[bool, int]]] = {}
@@ -628,21 +633,69 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
         return [content]
     if len(content) <= max_len:
         return [content]
+    original_content = content
     chunks: list[str] = []
     while content:
         if len(content) <= max_len:
-            chunks.append(content)
+            if content.strip():
+                chunks.append(content)
             break
         cut = content[:max_len]
-        # Try to break at newline first, then space, then hard break
-        pos = cut.rfind("\n")
-        if pos <= 0:
-            pos = cut.rfind(" ")
-        if pos <= 0:
-            pos = max_len
-        chunks.append(content[:pos])
-        content = content[pos:].lstrip()
-    return chunks
+        # Consume only the newline itself so indentation starts the next chunk.
+        newline_pos = cut.rfind("\n")
+        if newline_pos >= 0:
+            # Exclude both bytes of a CRLF boundary from the emitted chunk.
+            line_end = newline_pos
+            if line_end > 0 and content[line_end - 1] == "\r":
+                line_end -= 1
+            chunk = content[:line_end]
+            if chunk.strip():
+                chunks.append(chunk)
+            content = content[newline_pos + 1 :]
+            continue
+
+        # Keep the existing word-boundary behavior, but avoid emitting a
+        # whitespace-only chunk when an indented line exceeds max_len.
+        space_pos = cut.rfind(" ")
+        if space_pos > 0 and cut[:space_pos].strip():
+            chunks.append(content[:space_pos])
+            content = content[space_pos:].lstrip(" \t")
+            # A space boundary may sit immediately before a line break. Drop
+            # that delimiter too, without stripping the next line's indent.
+            if content.startswith("\r\n"):
+                content = content[2:]
+            elif content.startswith("\n"):
+                content = content[1:]
+            continue
+
+        # Do not split between the two code points of a CRLF delimiter.
+        if cut.endswith("\r") and content[max_len : max_len + 1] == "\n":
+            chunk = cut[:-1]
+            if chunk.strip():
+                chunks.append(chunk)
+            content = content[max_len + 1 :]
+            continue
+
+        chunk = content[:max_len]
+        if chunk.strip():
+            chunks.append(chunk)
+        content = content[max_len:]
+        if not chunk.strip():
+            # Keep any remaining indentation so the final non-blank chunk can
+            # retain as much of it as the channel limit permits.
+            continue
+        # A delimiter can sit immediately after the hard-break boundary. Keep
+        # ordinary space trimming, but consume only the newline so indentation
+        # on the following line is preserved.
+        content = content.lstrip(" \t")
+        if content.startswith("\r\n"):
+            content = content[2:]
+        elif content.startswith("\n"):
+            content = content[1:]
+    # Preserve the historical non-empty-input contract for callers that take
+    # the first chunk directly. This fallback is only reachable for content
+    # made entirely of whitespace.
+    return chunks or [original_content[:max_len]]
 
 
 def build_assistant_message(
@@ -793,7 +846,7 @@ def build_status_content(
     version: str,
     model: str,
     start_time: float,
-    last_usage: dict[str, int],
+    last_usage: LLMUsage | None,
     context_window_tokens: int,
     session_msg_count: int,
     context_tokens_estimate: int,
@@ -814,9 +867,9 @@ def build_status_content(
         if uptime_s >= 3600
         else f"{uptime_s // 60}m {uptime_s % 60}s"
     )
-    last_in = last_usage.get("prompt_tokens", 0)
-    last_out = last_usage.get("completion_tokens", 0)
-    cached = last_usage.get("cached_tokens", 0)
+    last_in = last_usage.input_tokens if last_usage else 0
+    last_out = last_usage.output_tokens if last_usage else 0
+    cached = last_usage.cache_read_tokens if last_usage else None
     ctx_total = max(context_window_tokens, 0)
     # Budget mirrors Consolidator formula: ctx_window - max_completion - _SAFETY_BUFFER
     ctx_budget = max(ctx_total - int(max_completion_tokens) - 1024, 1)

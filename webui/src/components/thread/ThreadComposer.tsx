@@ -71,6 +71,11 @@ import {
   type ModelPresetOption,
 } from "@/components/thread/ModelPresetBadge";
 import {
+  ComposerUsagePopover,
+  type ComposerContextUsage,
+  type ComposerRoundUsage,
+} from "@/components/thread/ComposerUsagePopover";
+import {
   ACCEPT_ATTR,
   MAX_ATTACHMENTS_PER_MESSAGE,
   useAttachedImages,
@@ -83,7 +88,6 @@ import { useClipboardAndDrop } from "@/hooks/useClipboardAndDrop";
 import { useLogoFallback } from "@/hooks/useLogoFallback";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import type { SendAttachment, SendOptions } from "@/hooks/useNanobotStream";
-import { usePageVisibility } from "@/hooks/usePageVisibility";
 import { useVoiceRecorder, type VoiceRecorderErrorKey } from "@/hooks/useVoiceRecorder";
 import type {
   CliAppInfo,
@@ -102,6 +106,7 @@ import type {
 import {
   logoFallbackUrls,
 } from "@/lib/provider-brand";
+import { sessionHandleColor } from "@/lib/session-handle";
 import {
   isSideChannelLifecycle,
   slashCommandLifecycle,
@@ -186,6 +191,7 @@ interface ThreadComposerProps {
   ) => boolean | void | Promise<boolean | void>;
   disabled?: boolean;
   placeholder?: string;
+  inputAriaLabel?: string;
   isStreaming?: boolean;
   modelLabel?: string | null;
   modelDetail?: string | null;
@@ -197,6 +203,9 @@ interface ThreadComposerProps {
   modelNeedsSetup?: boolean;
   fallbackModelName?: string | null;
   onModelBadgeClick?: () => void;
+  onManageModels?: () => void;
+  contextUsage?: ComposerContextUsage | null;
+  recentRoundUsage?: readonly ComposerRoundUsage[];
   variant?: "thread" | "hero";
   slashCommands?: SlashCommand[];
   cliApps?: CliAppInfo[];
@@ -206,8 +215,6 @@ interface ThreadComposerProps {
   onStop?: () => void;
   surfaceRef?: Ref<HTMLDivElement>;
   onTranscribeAudio?: (dataUrl: string, options?: { durationMs?: number }) => Promise<string>;
-  /** Unix seconds from server; turn elapsed timer above input while set. */
-  runStartedAt?: number | null;
   /** Sustained objective for this chat (WebSocket ``goal_state``). */
   goalState?: GoalStateWsPayload;
   workspaceScope?: WorkspaceScopePayload | null;
@@ -216,6 +223,7 @@ interface ThreadComposerProps {
   workspaceControls?: WorkspacesPayload["controls"] | null;
   workspaceScopeDisabled?: boolean;
   workspaceError?: string | null;
+  onPickWorkspaceFolder?: () => Promise<string | null>;
   onWorkspaceScopeChange?: (scope: WorkspaceScopePayload) => void;
   pendingQueueKey?: string | null;
   transcriptionProvider?: string | null;
@@ -358,40 +366,16 @@ function mentionInsertion(
   };
 }
 
-function sessionMentionBase(session: ChatSummary): string {
-  const label = session.title?.trim() || session.preview.trim() || "session";
-  const slug = label
-    .normalize("NFKC")
-    .replace(/\s+/g, "-")
-    .replace(/[^\p{L}\p{N}_-]+/gu, "")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-  return Array.from(slug || "session").slice(0, 40).join("");
-}
-
-function sessionMentionOptions(
-  sessions: ChatSummary[],
-  reservedNames: string[],
-): SessionMention[] {
-  const used = new Set(reservedNames.map((name) => name.toLowerCase()));
-  const namesByKey = new Map<string, string>();
-  for (const session of [...sessions].sort((a, b) => a.key.localeCompare(b.key))) {
-    const base = sessionMentionBase(session);
-    let name = base;
-    let suffix = 2;
-    if (used.has(name.toLowerCase())) name = `${base}-chat`;
-    while (used.has(name.toLowerCase())) {
-      name = `${base}-chat-${suffix}`;
-      suffix += 1;
-    }
-    used.add(name.toLowerCase());
-    namesByKey.set(session.key, name);
-  }
-  return sessions.map((session) => ({
-    name: namesByKey.get(session.key) ?? sessionMentionBase(session),
-    session_key: session.key,
-    title: session.title?.trim() || session.preview.trim(),
-  }));
+function sessionMentionOptions(sessions: ChatSummary[]): SessionMention[] {
+  return sessions.flatMap((session) => {
+    if (!session.handle) return [];
+    return [{
+      id: session.handle.id,
+      name: session.handle.name,
+      session_key: session.key,
+      title: session.title?.trim() || session.preview.trim(),
+    }];
+  });
 }
 
 interface SlashPaletteCommand {
@@ -463,6 +447,9 @@ function normalizeQueuedSessionMentions(value: unknown): SessionMention[] {
       || !/^[\p{L}\p{N}_-]+$/u.test(name)
     ) return [];
     return [{
+      ...(typeof candidate.id === "string" && /^handle_[a-f0-9]{32}$/i.test(candidate.id)
+        ? { id: candidate.id }
+        : {}),
       name,
       session_key: sessionKey,
       title: candidate.title?.trim().slice(0, 160) ?? "",
@@ -693,63 +680,38 @@ function mcpPresetMentionPayload(preset: McpPresetInfo): OutboundMcpPresetMentio
   };
 }
 
-function RunPulseIcon() {
-  return (
-    <span className="run-pulse-icon relative flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden>
-      <span className="run-pulse-icon__ring" />
-      <span className="run-pulse-icon__dot" />
-    </span>
-  );
-}
-
-function RunElapsedStrip({
-  startedAt,
+function GoalStateStrip({
   goalState,
 }: {
-  startedAt: number | null;
   goalState?: GoalStateWsPayload;
 }) {
   const { t } = useTranslation();
-  const pageVisible = usePageVisibility();
   const [goalPanelOpen, setGoalPanelOpen] = useState(false);
-  const showTimer = startedAt != null;
   const stripLabel = goalStateStripPreview(goalState, t);
-  const showGoal = !!stripLabel?.trim();
-  const active = showTimer || showGoal;
+  const active = !!stripLabel?.trim();
   const [, setTick] = useState(0);
   const stripWrapperRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const expandToggleRef = useRef<HTMLButtonElement>(null);
   const stripSnapshotRef = useRef<{
-    startedAt: number | null;
     goalState?: GoalStateWsPayload;
     stripLabel: string | null;
   } | null>(null);
   const [panelMaxPx, setPanelMaxPx] = useState(280);
 
   if (active) {
-    stripSnapshotRef.current = { startedAt, goalState, stripLabel };
+    stripSnapshotRef.current = { goalState, stripLabel };
   }
 
   useEffect(() => {
     if (!active) setGoalPanelOpen(false);
   }, [active]);
 
-  useEffect(() => {
-    if (startedAt == null || !pageVisible) return;
-    setTick((n) => n + 1);
-    const id = window.setInterval(() => setTick((n) => n + 1), 1000);
-    return () => window.clearInterval(id);
-  }, [pageVisible, startedAt]);
-
   const display = active
-    ? { startedAt, goalState, stripLabel }
+    ? { goalState, stripLabel }
     : stripSnapshotRef.current;
-  const displayStartedAt = display?.startedAt ?? null;
   const displayGoalState = display?.goalState;
   const displayStripLabel = display?.stripLabel ?? null;
-  const displayShowTimer = displayStartedAt != null;
-  const displayShowGoal = !!displayStripLabel?.trim();
 
   const objectiveFull = displayGoalState?.objective?.trim() ?? "";
   const summaryFull = displayGoalState?.ui_summary?.trim() ?? "";
@@ -817,17 +779,11 @@ function RunElapsedStrip({
     };
   }, [goalPanelOpen]);
 
-  const elapsed =
-    displayStartedAt != null ? Math.max(0, Math.floor(Date.now() / 1000 - displayStartedAt)) : 0;
-  const m = Math.floor(elapsed / 60);
-  const sec = elapsed % 60;
-  const shortElapsed = m > 0 ? `${m}:${sec.toString().padStart(2, "0")}` : `${sec}s`;
-  const timerTitle = displayShowTimer
-    ? t("thread.composer.runRuntimeTitle", { elapsed: shortElapsed })
-    : null;
+  if (!display) return null;
 
-  const ariaParts = [timerTitle, displayShowGoal ? displayStripLabel : null].filter(Boolean);
-  const ariaLabel = ariaParts.join(" · ");
+  const ariaLabel = displayStripLabel
+    ? t("thread.composer.goalStateStrip", { label: displayStripLabel })
+    : t("thread.composer.goalStateFallback");
 
   return (
     <div
@@ -836,6 +792,11 @@ function RunElapsedStrip({
       data-composer-status-drawer=""
       data-state={active ? "open" : "closed"}
       aria-hidden={active ? undefined : true}
+      onTransitionEnd={(event) => {
+        if (active || event.target !== event.currentTarget) return;
+        stripSnapshotRef.current = null;
+        setTick((n) => n + 1);
+      }}
     >
       {goalPanelOpen && canExpandGoal && markdownBody ? (
         <div
@@ -889,19 +850,9 @@ function RunElapsedStrip({
             role="status"
             aria-label={ariaLabel}
           >
-            {displayShowTimer ? (
-              <RunPulseIcon />
-            ) : (
-              <Target className="h-4 w-4 shrink-0 text-primary/75" aria-hidden />
-            )}
+            <Target className="h-4 w-4 shrink-0 text-primary/75" aria-hidden />
             <span className="flex min-w-0 flex-1 items-center gap-1.5 text-[12px] font-medium text-foreground/75">
-              {timerTitle ? <span className="shrink-0">{timerTitle}</span> : null}
-              {timerTitle && displayShowGoal ? (
-                <span className="shrink-0 text-muted-foreground/45" aria-hidden>
-                  ·
-                </span>
-              ) : null}
-              {displayShowGoal ? (
+              {displayStripLabel ? (
                 <span className="truncate">
                   {t("thread.composer.goalStateStrip", { label: displayStripLabel })}
                 </span>
@@ -940,6 +891,7 @@ export function ThreadComposer({
   onSend,
   disabled,
   placeholder,
+  inputAriaLabel,
   isStreaming = false,
   modelLabel = null,
   modelDetail = null,
@@ -951,6 +903,9 @@ export function ThreadComposer({
   modelNeedsSetup = false,
   fallbackModelName = null,
   onModelBadgeClick,
+  onManageModels,
+  contextUsage = null,
+  recentRoundUsage = [],
   variant = "thread",
   slashCommands = [],
   cliApps = [],
@@ -960,7 +915,6 @@ export function ThreadComposer({
   onStop,
   surfaceRef,
   onTranscribeAudio,
-  runStartedAt = null,
   goalState,
   workspaceScope = null,
   workspaceControlsHidden = false,
@@ -968,6 +922,7 @@ export function ThreadComposer({
   workspaceControls = null,
   workspaceScopeDisabled = false,
   workspaceError = null,
+  onPickWorkspaceFolder,
   onWorkspaceScopeChange,
   pendingQueueKey = null,
   transcriptionProvider = null,
@@ -986,6 +941,7 @@ export function ThreadComposer({
   } | null>(null);
   const [inlineError, setInlineError] = useState<string | null>(null);
   const [sendPending, setSendPending] = useState(false);
+  const [modelSetupAttentionRequest, setModelSetupAttentionRequest] = useState(0);
   const interactionDisabled = !!disabled || sendPending;
   const [voiceErrorFading, setVoiceErrorFading] = useState(false);
   const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
@@ -1303,16 +1259,8 @@ export function ThreadComposer({
   }, [cliAppMenuDismissed, cursorPosition, interactionDisabled, value]);
 
   const availableSessionMentions = useMemo(
-    () => sessionMentionOptions(
-      sessions,
-      [
-        ...cliApps.filter((app) => app.installed).map((app) => app.name),
-        ...mcpPresets
-          .filter((preset) => preset.installed && preset.configured)
-          .map((preset) => preset.name),
-      ],
-    ),
-    [cliApps, mcpPresets, sessions],
+    () => sessionMentionOptions(sessions),
+    [sessions],
   );
   const mentionSegments = useMemo(
     () => splitCapabilityMentionSegments(value, cliApps, mcpPresets, selectedSessionMentions),
@@ -1361,8 +1309,12 @@ export function ThreadComposer({
         displayName: mention.title || mention.name,
         mention,
       }));
+    const sessionNames = new Set(
+      availableSessionMentions.map((mention) => mention.name.toLowerCase()),
+    );
     const cliCandidates: MentionCandidate[] = cliApps
       .filter((app) => app.installed)
+      .filter((app) => !sessionNames.has(app.name.toLowerCase()))
       .filter((app) => {
         const haystack = [
           app.name,
@@ -1383,6 +1335,7 @@ export function ThreadComposer({
       }));
     const mcpCandidates: MentionCandidate[] = mcpPresets
       .filter((preset) => preset.installed && preset.configured)
+      .filter((preset) => !sessionNames.has(preset.name.toLowerCase()))
       .filter((preset) => {
         const haystack = [
           preset.name,
@@ -1402,9 +1355,9 @@ export function ThreadComposer({
         initials: mcpPresetInitials(preset),
       }));
     const groups = [
+      { candidates: sessionCandidates, reserved: 4 },
       { candidates: cliCandidates, reserved: 2 },
       { candidates: mcpCandidates, reserved: 2 },
-      { candidates: sessionCandidates, reserved: 4 },
     ];
     let remaining = 8;
     const counts = groups.map(({ candidates, reserved }) => {
@@ -1412,7 +1365,7 @@ export function ThreadComposer({
       remaining -= count;
       return count;
     });
-    for (const index of [2, 0, 1]) {
+    for (const index of [0, 1, 2]) {
       const extra = Math.min(remaining, groups[index].candidates.length - counts[index]);
       counts[index] += extra;
       remaining -= extra;
@@ -1961,7 +1914,9 @@ export function ThreadComposer({
 
   const submit = useCallback(() => {
     if (modelNeedsSetup) {
-      onModelBadgeClick?.();
+      if (hasComposerContent) {
+        setModelSetupAttentionRequest((request) => request + 1);
+      }
       return;
     }
     if (!canSend) return;
@@ -2065,11 +2020,11 @@ export function ThreadComposer({
     clear,
     clearComposerText,
     hasTouchPrimaryPointer,
+    hasComposerContent,
     handleStop,
     isStreaming,
     maxTextBytes,
     modelNeedsSetup,
-    onModelBadgeClick,
     onSend,
     onStop,
     onQuotedContextChange,
@@ -2282,8 +2237,8 @@ export function ThreadComposer({
         className={cn(
           "thread-composer-surface group/composer relative mx-auto flex w-full flex-col overflow-visible transition-all duration-200",
           isHero
-            ? "max-w-[58rem] rounded-[28px] bg-muted/30 focus-within:bg-muted/50 dark:bg-card dark:focus-within:bg-white/[0.06]"
-            : "max-w-[49.5rem] rounded-[22px] bg-muted/30 focus-within:bg-muted/50 dark:bg-card dark:focus-within:bg-white/[0.06]",
+            ? "max-w-[58rem] rounded-prominent bg-muted/30 focus-within:bg-muted/50 dark:bg-card dark:focus-within:bg-white/[0.06]"
+            : "max-w-[49.5rem] rounded-panel bg-muted/30 focus-within:bg-muted/50 dark:bg-card dark:focus-within:bg-white/[0.06]",
           interactionDisabled && "opacity-60",
           sessionDragPreview && "ring-1 ring-primary/25",
           isDragging && "ring-2 ring-primary/40 motion-reduce:ring-0 motion-reduce:border-primary",
@@ -2366,7 +2321,7 @@ export function ThreadComposer({
             </button>
           </div>
         ) : null}
-        <RunElapsedStrip startedAt={runStartedAt} goalState={goalState} />
+        <GoalStateStrip goalState={goalState} />
         <div className="relative">
           {hasMentionDecorations ? (
             <ComposerCliMentionOverlay
@@ -2400,7 +2355,7 @@ export function ThreadComposer({
             rows={1}
             placeholder={sessionDragPreview ? "" : resolvedPlaceholder}
             disabled={interactionDisabled}
-            aria-label={t("thread.composer.inputAria")}
+            aria-label={inputAriaLabel ?? t("thread.composer.inputAria")}
             className={cn(
               inputTextClasses,
               "relative z-10 caret-foreground placeholder:text-muted-foreground/70",
@@ -2494,12 +2449,21 @@ export function ThreadComposer({
                 modelPreset={modelPreset}
                 modelPresets={modelPresets}
                 onPresetChange={onModelPresetChange}
+                onManageModels={onManageModels}
+                onRequestComposerFocus={() => textareaRef.current?.focus()}
                 provider={modelProvider}
                 providerLabel={modelProviderLabel}
                 needsSetup={modelNeedsSetup}
+                attentionRequest={modelSetupAttentionRequest}
                 fallbackModelName={fallbackModelName}
                 isHero={isHero}
                 onClick={modelNeedsSetup ? onModelBadgeClick : undefined}
+              />
+            ) : null}
+            {!voiceRecorder.isRecording ? (
+              <ComposerUsagePopover
+                context={contextUsage}
+                rounds={recentRoundUsage}
               />
             ) : null}
             {showVoiceButton ? (
@@ -2598,6 +2562,7 @@ export function ThreadComposer({
                   defaultScope={workspaceDefaultScope}
                   controls={workspaceControls}
                   error={workspaceError}
+                  onPickFolder={onPickWorkspaceFolder}
                   onChange={onWorkspaceScopeChange}
                 />
               </div>
@@ -2645,7 +2610,7 @@ function QueuedPromptStack({
       role="group"
       data-state="enter"
       className={cn(
-        "composer-status-strip relative z-20 mx-3 mt-3 overflow-hidden rounded-[18px]",
+        "composer-status-strip relative z-20 mx-3 mt-3 overflow-hidden rounded-floating",
         "border border-black/[0.05] bg-popover/90 p-1.5",
         "shadow-[0_10px_28px_rgba(15,23,42,0.07)] backdrop-blur-md",
         "dark:border-white/[0.08] dark:bg-popover/90 dark:shadow-[0_14px_34px_rgba(0,0,0,0.30)]",
@@ -2723,7 +2688,7 @@ function QueuedPromptRow({
       }}
       onDragEnd={onDragEnd}
       className={cn(
-        "queued-prompt-row group/queued flex min-h-8 items-center gap-1.5 rounded-[12px] px-2 py-0.5",
+        "queued-prompt-row group/queued flex min-h-8 items-center gap-1.5 rounded-control px-2 py-0.5",
         "text-[13px] transition-colors hover:bg-muted/55 dark:hover:bg-white/[0.055]",
         isHero && "text-[13.5px]",
       )}
@@ -2887,7 +2852,7 @@ function CliAppMentionPalette({
     layout.maxHeight - SLASH_PALETTE_CHROME_PX,
   );
   const listRef = useSelectedOptionScroll(selectedIndex);
-  const groupedCandidates = (["cli", "mcp", "session"] as const)
+  const groupedCandidates = (["session", "cli", "mcp"] as const)
     .map((kind) => ({
       kind,
       label: kind === "session"
@@ -2991,7 +2956,9 @@ function MentionCandidateLogo({
   selected: boolean;
 }) {
   const color = candidate.kind === "session"
-    ? INLINE_TOKEN_HIGHLIGHT_COLOR
+    ? candidate.mention.id
+      ? sessionHandleColor(candidate.mention.id)
+      : INLINE_TOKEN_HIGHLIGHT_COLOR
     : candidate.brandColor || INLINE_TOKEN_HIGHLIGHT_COLOR;
   const rawLogoUrl = candidate.kind === "session" ? null : candidate.logoUrl;
   const logoUrls = useMemo(() => logoFallbackUrls(rawLogoUrl), [rawLogoUrl]);
@@ -2999,7 +2966,10 @@ function MentionCandidateLogo({
 
   if (candidate.kind === "session") {
     return (
-      <span className="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground">
+      <span
+        className="flex h-5 w-5 shrink-0 items-center justify-center"
+        style={{ color }}
+      >
         <MessageCircle className="h-4 w-4" aria-hidden />
       </span>
     );
@@ -3008,7 +2978,7 @@ function MentionCandidateLogo({
     return (
       <span
         className={cn(
-          "flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded-[5px]",
+          "flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded-compact",
           selected ? "bg-background/55" : "bg-transparent",
         )}
       >
@@ -3026,7 +2996,7 @@ function MentionCandidateLogo({
   }
   return (
     <span
-      className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] text-[7.5px] font-semibold text-white"
+      className="flex h-5 w-5 shrink-0 items-center justify-center rounded-compact text-[7.5px] font-semibold text-white"
       style={{ backgroundColor: color }}
     >
       {candidate.initials}
@@ -3170,7 +3140,7 @@ function AttachmentChip({
   return (
     <div
       className={cn(
-        "group relative flex items-center gap-2 rounded-[12px] border px-2 py-1.5",
+        "group relative flex items-center gap-2 rounded-control border px-2 py-1.5",
         "transition-colors motion-reduce:transition-none",
         tone,
       )}
