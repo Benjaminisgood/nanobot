@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 消息总线与事件模型 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 02 章 · 核心链路</div>
+<h1>消息总线与事件模型</h1>
+<p class="lede">
+  整个项目最短的一个模块，也是形态影响最大的一个。<code>bus/queue.py</code> 只有 44 行——
+  我们把它<strong>一行不漏地读完</strong>，然后讨论为什么这 44 行能撑起 18 个聊天平台。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="full">一、完整源码：44 行的总线</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/bus/queue.py" data-start="1">
+<pre><code>"""Async message queue for decoupled channel-agent communication."""
+
+import asyncio
+
+from nanobot.bus.events import InboundMessage, OutboundMessage
+
+
+class MessageBus:
+    """
+    Async message bus that decouples chat channels from the agent core.
+
+    Channels push messages to the inbound queue, and the agent processes
+    them and pushes responses to the outbound queue.
+    """
+
+    def __init__(self):
+        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
+        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+
+    async def publish_inbound(self, msg: InboundMessage) -> None:
+        """Publish a message from a channel to the agent."""
+        await self.inbound.put(msg)
+
+    async def consume_inbound(self) -> InboundMessage:
+        """Consume the next inbound message (blocks until available)."""
+        return await self.inbound.get()
+
+    async def publish_outbound(self, msg: OutboundMessage) -> None:
+        """Publish a response from the agent to channels."""
+        await self.outbound.put(msg)
+
+    async def consume_outbound(self) -> OutboundMessage:
+        """Consume the next outbound message (blocks until available)."""
+        return await self.outbound.get()
+
+    @property
+    def inbound_size(self) -> int:
+        """Number of pending inbound messages."""
+        return self.inbound.qsize()
+
+    @property
+    def outbound_size(self) -> int:
+        """Number of pending outbound messages."""
+        return self.outbound.qsize()</code></pre>
+</div>
+
+<p>就这些。没有主题订阅、没有中间件、没有优先级、没有持久化、没有 ack 确认。</p>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    <strong>两个无界 <code>asyncio.Queue</code>，四个方法，两个只读属性。</strong>
+    <code>inbound</code> 是"渠道 → agent"，<code>outbound</code> 是"agent → 渠道"。
+    方向是单向的，队列是分开的，所以永远不会出现"回复被当成新消息重新处理"这种环路。
+  </p>
+</div>
+
+<h3>逐点注意的三个细节</h3>
+
+<p>
+  <strong>1. 泛型标注 <code>asyncio.Queue[InboundMessage]</code>。</strong>
+  这不是装饰，而是让 basedpyright 能在编译期发现"把 OutboundMessage 放进 inbound 队列"这类错误。
+  <code>asyncio.Queue</code> 在运行时不做类型检查，类型参数是唯一的防线。
+</p>
+
+<p>
+  <strong>2. 队列无界（没传 <code>maxsize</code>）。</strong>
+  这意味着 <code>publish_inbound</code> 实际上永远不会 <code>await</code> 挂起。
+  代价是没有天然背压：如果 agent 处理速度跟不上消息涌入，队列会无限增长。
+  项目把背压推到了别处——你会在第 03 章看到，真正限流的是<strong>会话锁</strong>和
+  <code>_concurrency_gate</code>，而不是队列长度。
+</p>
+
+<p>
+  <strong>3. <code>inbound_size</code> / <code>outbound_size</code> 只用于观测。</strong>
+  它们是 <code>qsize()</code> 的只读包装，供状态查询（如 <code>/status</code> 命令）使用。
+</p>
+
+<div class="callout why">
+  <div class="t">? 为什么不用成熟的消息队列库</div>
+  <p>
+    因为需求边界非常清楚：<strong>单进程内、同一事件循环、无需持久化、无需扇出</strong>。
+    Redis/RabbitMQ 会引入运维依赖；一个 pub-sub 框架会引入订阅注册表和主题命名规范。
+    而 <code>.agent/design.md</code> 的第二条约束就是"Less structure, more intelligence"——
+    只有当结构<em>消除了真实的复杂度</em>时才引入它。
+  </p>
+  <p style="margin-bottom:0">
+    这里 44 行就够了，那就 44 行。需要多进程时，替换点也很清晰：只要保持这四个方法的签名，
+    内部换成任何实现都不影响上下游。
+  </p>
+</div>
+
+<h2 id="inbound">二、InboundMessage：渠道的统一出口</h2>
+
+<p>
+  总线之所以能解耦，功劳其实在事件类型上。<code>InboundMessage</code> 定义了
+  "一条聊天消息在这个系统里长什么样"，18 个渠道都必须把自己的平台数据翻译成它：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/bus/events.py" data-start="24">
+<pre><code>@dataclass
+class InboundMessage:
+    """Message received from a chat channel."""
+
+    channel: str  # telegram, discord, slack, whatsapp
+    sender_id: str  # User identifier
+    chat_id: str  # Chat/channel identifier
+    content: str  # Message text
+    timestamp: datetime = field(default_factory=datetime.now)
+    media: list[str] = field(default_factory=list)  # Media URLs
+    metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
+    session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    require_existing_session: bool = False
+
+    @property
+    def session_key(self) -> str:
+        """Unique key for session identification."""
+        return self.session_key_override or f"{self.channel}:{self.chat_id}"</code></pre>
+</div>
+
+<h3>字段设计的取舍</h3>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>字段</th><th>为什么是这个类型</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>channel: str</code></td>
+  <td>不是枚举。渠道是<strong>运行时发现</strong>的（插件可以来自第三方包），编译期无法穷举，所以只能是字符串。</td>
+</tr>
+<tr>
+  <td><code>content: str</code></td>
+  <td>纯文本。图片、位置、语音等全部被渠道"文本化"后拼进来（如 <code>[location: 31.2, 121.5]</code>），媒体的本地路径另放 <code>media</code>。这让核心层不必理解任何平台的富媒体结构。</td>
+</tr>
+<tr>
+  <td><code>media: list[str]</code></td>
+  <td>渠道已经把附件<strong>下载到本地</strong>并给出路径。核心层不做网络 IO，这也是安全边界的一部分。</td>
+</tr>
+<tr>
+  <td><code>metadata: dict[str, Any]</code></td>
+  <td>唯一的"逃生舱"。平台专属信息（<code>message_id</code>、话题 id、是否想要流式）都塞这里。<strong>这是有意保留的动态边界</strong>。</td>
+</tr>
+<tr>
+  <td><code>session_key_override</code></td>
+  <td>让渠道能覆盖默认会话键。Telegram 的话题（Topic）功能就靠它把同一群里的不同话题分成不同会话。</td>
+</tr>
+<tr>
+  <td><code>require_existing_session</code></td>
+  <td>"只在会话已存在时才处理"。用于 cron / 自动化触发——不要因为一个定时任务而给用户凭空建一个新会话。</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>session_key：整个系统的分区键</h3>
+
+<p>那个 4 行的 <code>@property</code> 是全项目最高频被引用的一段逻辑：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/bus/events.py" data-start="38">
+<pre><code>    @property
+    def session_key(self) -> str:
+        """Unique key for session identification."""
+        return self.session_key_override or f"{self.channel}:{self.chat_id}"</code></pre>
+</div>
+
+<p>它同时决定了四件事：</p>
+<ol>
+  <li><strong>历史归属</strong>——会话文件名是 <code>base64url(session_key) + ".jsonl"</code></li>
+  <li><strong>并发粒度</strong>——每个 session_key 一把 <code>asyncio.Lock</code></li>
+  <li><strong>压缩单位</strong>——TTL 空闲压缩按 session 扫描</li>
+  <li><strong>命令作用域</strong>——<code>/new</code>、<code>/stop</code>、<code>/model</code> 都作用于当前 session</li>
+</ol>
+
+<p>实际运行中会看到这些形态：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>形态</th><th>场景</th></tr></thead>
+<tbody>
+<tr><td><code>telegram:123456</code></td><td>默认规则：<code>channel:chat_id</code></td></tr>
+<tr><td><code>telegram:123456:topic:7</code></td><td>Telegram 话题，由渠道通过 <code>session_key_override</code> 注入</td></tr>
+<tr><td><code>unified:default</code></td><td>开启 <code>unified_session</code> 后，所有渠道共享一个会话</td></tr>
+<tr><td><code>dream:20260403-000210</code></td><td>Dream 记忆整合的内部运行，用前缀隔离，不参与 TTL 扫描</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点</div>
+  <p>
+    <code>msg.session_key</code> <strong>不一定</strong>是最终使用的会话键。<code>AgentLoop</code>
+    还有一层 <code>_effective_session_key(msg)</code>（<code>loop.py:821</code>），
+    它在开启统一会话模式时会把所有键映射到 <code>unified:default</code>。
+  </p>
+  <p style="margin-bottom:0">
+    所以你在 <code>loop.py</code> 里会看到大量 <code>effective_key != msg.session_key</code> 的判断和
+    <code>dataclasses.replace(msg, session_key_override=effective_key)</code>——
+    这是在把"有效键"回写进消息，保证下游（比如注入队列里的消息）看到的是一致的键。
+  </p>
+</div>
+
+<h2 id="outbound">三、OutboundMessage：回复与富交互</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/bus/events.py" data-start="44">
+<pre><code>@dataclass
+class OutboundMessage:
+    """Message to send to a chat channel.
+
+    ``event`` carries internal runtime/UI semantics. ``metadata`` is reserved
+    for channel routing context (``message_id``, thread ids, etc.) and optional
+    ``OUTBOUND_META_AGENT_UI`` blobs for rich clients.
+    """
+
+    channel: str
+    chat_id: str
+    content: str
+    reply_to: str | None = None
+    media: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    buttons: list[list[str]] = field(default_factory=list)
+    event: "OutboundEvent | None" = None</code></pre>
+</div>
+
+<p>
+  注意最后两个字段，它们体现了"如何在统一抽象下支持能力不均等的平台"这个经典问题的解法：
+</p>
+
+<p>
+  <strong><code>buttons: list[list[str]]</code></strong> —— 二维数组表示按钮的行列布局。
+  Telegram / 飞书能渲染成内联键盘；邮件渠道直接忽略它。
+  <em>能力探测由渠道自己做，核心层只负责表达意图。</em>
+</p>
+
+<p>
+  <strong><code>event: OutboundEvent | None</code></strong> —— 内部运行时/UI 语义。
+  这是理解"进度提示"、"流式增量"、"回合结束"这些非用户文本消息的关键。
+</p>
+
+<h3>event 与 metadata 的分工</h3>
+
+<p>docstring 里那句话值得展开：</p>
+
+<div class="callout">
+  <div class="t">原文</div>
+  <p style="margin-bottom:0">
+    "<code>event</code> carries internal runtime/UI semantics. <code>metadata</code> is reserved
+    for channel routing context (<code>message_id</code>, thread ids, etc.) and optional
+    <code>OUTBOUND_META_AGENT_UI</code> blobs for rich clients."
+  </p>
+</div>
+
+<ul>
+  <li><code>event</code> = <strong>这条消息是什么</strong>（进度？增量？终态？）——语义</li>
+  <li><code>metadata</code> = <strong>这条消息发到哪</strong>（回复哪条？哪个话题？）——路由</li>
+</ul>
+
+<p>
+  <code>nanobot/bus/events.py</code> 顶部定义了几个约定键，都是内部用的：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/bus/events.py" data-start="10">
+<pre><code># Optional ``OutboundMessage.metadata`` key for structured, channel-agnostic UI
+# payloads. Value is JSON-serializable with at least ``kind``; rich clients may
+# render it and other channels may ignore unknown keys.
+OUTBOUND_META_AGENT_UI = "_agent_ui"
+
+# Internal-only inbound metadata used by in-process channels to ask the agent
+# loop to update runtime state without going through a user session.
+INBOUND_META_RUNTIME_CONTROL = "_runtime_control"
+RUNTIME_CONTROL_ACK = "_ack"
+RUNTIME_CONTROL_MCP_RELOAD = "mcp_reload"
+RUNTIME_CONTROL_IMAGE_GENERATION_RELOAD = "image_generation_reload"
+RUNTIME_CONTROL_SESSION_DISCARD = "session_discard"</code></pre>
+</div>
+
+<p>
+  <code>INBOUND_META_RUNTIME_CONTROL</code> 特别有意思：<strong>它让 WebUI
+  能通过同一条消息总线要求 agent 重载 MCP 服务器或丢弃会话，而不需要伪造一个用户回合。</strong>
+  处理入口在 <code>AgentLoop.run()</code> 的第一个判断：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1180">
+<pre><code>                raw = msg.content.strip()
+                effective_key = self._effective_session_key(msg)
+                if await agent_context.handle_runtime_control(self, msg, self.tools):
+                    continue</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p>
+    这也是"运行时改配置立刻生效"的实现路线。想加一种新的运行时控制指令，
+    在 <code>bus/events.py</code> 加一个常量、在 <code>agent_context.handle_runtime_control</code>
+    加一个分支即可，<strong>完全不用碰七阶段流水线</strong>。
+  </p>
+</div>
+
+<h2 id="progress">四、进度回调：把回调转成总线事件</h2>
+
+<p>
+  agent 内部产生的"进度"（正在调用什么工具、思考过程、流式文本）不是通过返回值传出来的，
+  而是通过回调函数。<code>bus/progress.py</code> 负责把回调翻译成总线消息：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/bus/progress.py" data-start="18">
+<pre><code>def build_bus_progress_callback(
+    bus: MessageBus,
+    msg: InboundMessage,
+) -> Callable[..., Awaitable[None]]:
+    """Return a callback that publishes progress as outbound messages."""
+
+    async def _publish_progress(
+        content: str,
+        *,
+        tool_hint: bool = False,
+        tool_events: list[dict[str, Any]] | None = None,
+        file_edit_events: list[dict[str, Any]] | None = None,
+        reasoning: bool = False,
+        reasoning_end: bool = False,
+    ) -> None:
+        await bus.publish_outbound(
+            outbound_message_for_event(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                event=ProgressEvent(
+                    content=content,
+                    tool_hint=tool_hint,
+                    reasoning_delta=reasoning,
+                    reasoning_end=reasoning_end,
+                    tool_events=tool_events,
+                    file_edit_events=file_edit_events,
+                ),
+                metadata=msg.metadata,
+            )
+        )</code></pre>
+</div>
+
+<p>
+  这是一个<strong>闭包工厂</strong>：它捕获 <code>bus</code> 和原始 <code>msg</code>，
+  返回一个只接受内容的回调。这样 <code>AgentRunner</code> 里就不需要知道 bus 的存在——
+  它只调用 <code>spec.progress_callback(...)</code>。
+</p>
+
+<p>
+  文件头的 docstring 还划清了一条边界：
+  "Runtime state notifications such as turn lifecycle and model changes live in
+  <code>nanobot.bus.runtime_events</code>."
+  ——用户可见的进度输出和内部运行时状态通知是<strong>两个不同的模块</strong>，
+  这正是 <code>.agent/design.md</code> 里"运行时状态扇出遵循同一边界"那条约束的落地。
+</p>
+
+<h2 id="quiz">五、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span><code>MessageBus</code> 的两个队列都没有设置 <code>maxsize</code>。这带来什么后果？项目在哪里补上了限流？</p>
+  </div>
+  <div class="ans">
+    <p><strong>后果：没有背压。</strong></p>
+    <p>
+      <code>asyncio.Queue()</code> 默认 <code>maxsize=0</code> 表示无界，
+      所以 <code>await queue.put(msg)</code> 永远不会真正挂起等待。
+      理论上如果消息涌入速度持续超过处理速度，内存会一直涨。
+    </p>
+    <p><strong>限流补在三个地方：</strong></p>
+    <ul>
+      <li>
+        <strong>会话锁</strong>（<code>loop.py:2338</code> 的 <code>_get_session_lock</code>）——
+        同一会话严格串行，天然限制了单会话的并发。
+      </li>
+      <li>
+        <strong>全局并发闸门</strong> <code>self._concurrency_gate</code>（<code>_dispatch</code> 里
+        <code>async with lock, gate</code>）——限制同时进行的回合总数。
+      </li>
+      <li>
+        <strong>注入队列有界</strong>——<code>_dispatch</code> 里创建的是
+        <code>asyncio.Queue(maxsize=20)</code>，并且 <code>put_nowait</code> 遇到
+        <code>QueueFull</code> 时会降级为"回退到排队任务"，而不是阻塞。
+      </li>
+    </ul>
+    <p>
+      设计上的取舍很清楚：<strong>让入口尽量不阻塞（避免拖慢平台 SDK 的回调），
+      把限流放在真正消耗资源的地方（LLM 调用）。</strong>
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>为什么 <code>InboundMessage.media</code> 是"本地文件路径"而不是"URL"？字段注释里明明写的是 <code># Media URLs</code>。</p>
+  </div>
+  <div class="ans">
+    <p>
+      这是一个<strong>注释与实现已经漂移</strong>的地方——很好的源码阅读训练：注释会过期，调用点不会。
+    </p>
+    <p>看 Telegram 渠道的实际填充逻辑（<code>channels/telegram/runtime.py:1546</code> 附近）：</p>
+    <div class="code" data-lang="python" data-file="nanobot/channels/telegram/runtime.py" data-start="1541">
+<pre><code>        # Download current message media
+        current_media_paths, current_media_parts = await self._download_message_media(
+            message, add_failure_content=True
+        )
+        media_paths.extend(current_media_paths)
+        content_parts.extend(current_media_parts)
+        if current_media_paths:
+            self.logger.debug("Downloaded message media to {}", current_media_paths[0])</code></pre>
+    </div>
+    <p>
+      变量名就是 <code>media_paths</code>，来自 <code>_download_message_media</code>——
+      <strong>渠道在发布消息前就已经把附件下载到本地了。</strong>
+    </p>
+    <p><strong>为什么必须这样设计？三个理由：</strong></p>
+    <ul>
+      <li>
+        <strong>凭证隔离。</strong> Telegram 的文件 URL 需要 bot token 才能下载。
+        如果传 URL，核心层和所有工具都得知道渠道的凭证——这会彻底破坏解耦。
+      </li>
+      <li>
+        <strong>安全边界。</strong> 核心层不做出网 IO，是第 <a href="10-security.html">10 章</a>
+        SSRF 防护的前提。让 agent 去 fetch 一个来自外部消息的 URL 是典型的 SSRF 面。
+      </li>
+      <li>
+        <strong>时效性。</strong> 平台的媒体 URL 通常几分钟就过期，而消息可能在队列里等待、
+        或在压缩后被回放。本地路径才是稳定引用。
+      </li>
+    </ul>
+    <p>
+      <strong>阅读方法论</strong>：判断一个字段的真实语义，要看<strong>写入方</strong>（渠道）而不是注释。
+      在 Cursor 里对 <code>media=</code> 全局搜索，几秒钟就能确认。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>假设你要给系统加一个"消息已读回执"能力：agent 收到消息后先给平台发一个"已读"标记，再开始处理。请判断这该放在哪一层，并说明如果放错层会有什么后果。</p>
+  </div>
+  <div class="ans">
+    <p><strong>结论：放在渠道层，而且不应该经过总线。</strong></p>
+    <p><strong>判断依据</strong>——问三个问题：</p>
+    <ol>
+      <li>
+        <strong>这个能力所有平台都有吗？</strong> 没有。Telegram 有 <code>sendChatAction</code>，
+        邮件没有已读回执的对等概念。→ 说明它不是统一抽象的一部分。
+      </li>
+      <li>
+        <strong>agent 的决策会影响它吗？</strong> 不会。"已读"是收到消息就该发的，
+        与 LLM 说什么无关。→ 说明它不需要穿过核心层。
+      </li>
+      <li>
+        <strong>它需要平台凭证/SDK 吗？</strong> 需要。→ 只有渠道持有这些。
+      </li>
+    </ol>
+    <p>
+      三个答案都指向渠道层。具体位置：在渠道自己的消息处理函数里，
+      调用 <code>self._handle_message(...)</code> <em>之前</em> 直接调平台 API。
+      比如 Telegram 就是在 <code>_process_message_update</code> 里加一行。
+    </p>
+    <p><strong>如果放错层，会发生什么：</strong></p>
+    <ul>
+      <li>
+        <strong>放进 <code>OutboundMessage</code> 加一个 <code>mark_read: bool</code> 字段？</strong>
+        这会污染统一抽象——18 个渠道里 17 个必须忽略这个字段，而且它和
+        <code>content</code> 的语义完全不同（一个是"发文本"，一个是"改状态"）。
+        更糟的是时序：outbound 要等回合结束才发，"已读"就变成"回复完了才已读"，失去意义。
+      </li>
+      <li>
+        <strong>放进 <code>AgentLoop.run()</code>？</strong> 核心层就得判断
+        <code>if msg.channel == "telegram"</code>——这正是 <code>.agent/design.md</code>
+        明令禁止的：能放在渠道适配器里的特性，不应内联进 agent 循环。
+      </li>
+      <li>
+        <strong>用 <code>OutboundEvent</code> 新增一种事件类型？</strong>
+        这是三个错误方案里最接近合理的，但仍然多绕了一圈（agent → bus → manager → channel），
+        换来的只是延迟增加和一个只有一个渠道用得上的事件类型。
+      </li>
+    </ul>
+    <p>
+      <strong>通用判据</strong>：如果一个能力的"输入"和"输出"都在同一层内部，
+      就不要让它穿过总线。总线只承载<strong>跨越所有权边界</strong>的数据。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    44 行的总线 + 两个 dataclass = 18 个平台的解耦。关键在于
+    <code>InboundMessage</code> 把"富媒体的平台消息"降维成"文本 + 本地路径 + metadata 逃生舱"。
+    下一章进入核心层的上半场：<code>AgentLoop</code> 如何调度这些消息。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

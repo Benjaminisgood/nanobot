@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 综合练习与实战 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 17 章 · 总结</div>
+<h1>综合练习与实战</h1>
+<p class="lede">
+  前 16 章按链路拆开读了 nanobot 的骨架。这一章<strong>不分模块</strong>——
+  用自测题检验你是否能在脑子里串起数据流，用三个动手任务验证「扩展点」是否真的理解，
+  最后用一条调试路线应对「agent 没回复」这类真实故障。
+  建议顺序：先闭卷做自测 → 再挑一个动手任务 → 最后扫一遍调试清单。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="self-test">一、跨章节自测</h2>
+
+<p>难度分布：3 基础 / 4 进阶 / 3 挑战。答案含源码位置，可点击跳回对应章节。</p>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>把下面函数按「一条用户消息从渠道到回复」的执行顺序排列：</p>
+    <ul class="opts">
+      <li><b>A</b> <code>AgentRunner.run()</code></li>
+      <li><b>B</b> <code>Channel._handle_message()</code> → <code>bus.publish_inbound()</code></li>
+      <li><b>C</b> <code>AgentLoop.run()</code> → <code>_dispatch()</code></li>
+      <li><b>D</b> <code>ChannelManager</code> 消费 <code>outbound</code> 队列</li>
+      <li><b>E</b> <code>AgentLoop._process_message()</code> 七阶段流水线</li>
+    </ul>
+  </div>
+  <div class="ans">
+    <p><strong>正确顺序：B → C → E → A → D</strong></p>
+    <ol>
+      <li>渠道收消息，封装 <code>InboundMessage</code>，<code>publish_inbound</code>（<a href="02-bus.html">02 章</a>）</li>
+      <li><code>AgentLoop.run()</code> 消费 inbound，分流后 <code>create_task(_dispatch)</code>（<a href="03-loop.html">03 章</a>）</li>
+      <li><code>_process_message</code>：restore → compact → command → build → run → save → respond（<code>loop.py:1541-1548</code>）</li>
+      <li>run 阶段调用 <code>AgentRunner.run()</code> 做 ReAct 循环（<a href="04-runner.html">04 章</a>）</li>
+      <li>respond 后 outbound 入队，渠道 manager 发送（<a href="02-bus.html">02 章</a> / <a href="08-channels.html">08 章</a>）</li>
+    </ol>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>下面三处改动，分别该落在哪一层？</p>
+    <ul class="opts">
+      <li><b>1</b> Telegram 群聊按 topic 拆分 session</li>
+      <li><b>2</b> 新增 <code>/export</code> slash 命令</li>
+      <li><b>3</b> 工具调用失败后自动换 fallback model</li>
+    </ul>
+  </div>
+  <div class="ans">
+    <p><strong>1 → 渠道层</strong>：设置 <code>InboundMessage.session_key_override</code>（<a href="08-channels.html">08 章</a>，参考 Telegram 的 topic session key）。<strong>不要改 <code>loop.py</code></strong>。</p>
+    <p><strong>2 → 命令层</strong>：在 <code>builtin.py</code> 加 handler + <code>register_builtin_commands</code>（<a href="09-config.html">09 章</a>）。</p>
+    <p><strong>3 → Provider 层</strong>：<code>FallbackProvider</code> 包装主 provider（<a href="05-providers.html">05 章</a>）——主模型返回 error 时切到 fallback 链。工具失败本身通常是「喂回模型」而非换模型（<a href="04-runner.html">04 章</a>）。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span><code>restrict_to_workspace</code> 配置项在旧版 JSON 里写在
+    <code>tools.exec.restrictToWorkspace</code>。新版应该写在哪？加载时谁负责迁移？</p>
+  </div>
+  <div class="ans">
+    <p>
+      新版写在顶层 <code>tools.restrictToWorkspace</code>（Python: <code>config.tools.restrict_to_workspace</code>）。
+      <code>_migrate_config()</code>（<code>loader.py:347-358</code>，<a href="09-config.html">09 章</a>）
+      在 validate 前把旧键提升到顶层。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>同一会话连发两条用户消息 M1、M2，M1 的 <code>_dispatch</code> 还在跑。
+    M2 到达时会发生什么？M2 是 slash 命令 <code>/help</code> 呢？</p>
+  </div>
+  <div class="ans">
+    <p><strong>普通消息 M2</strong>：命中 <code>effective_key in self._pending_queues</code>（<code>loop.py:1214</code>），
+    放入 pending queue 等待注入——不会创建第二个 dispatch 任务（<a href="03-loop.html">03 章</a>）。</p>
+    <p><strong><code>/help</code></strong>：<code>is_dispatchable_command</code> 为真 → inline
+    <code>dispatch</code>（<code>loop.py:1217-1221</code>），不排队——命令响应不应被长回合阻塞。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>为什么不能在对 tool 结果的处理中，随意插入一条新的 <code>role: user</code> 消息到会话历史？</p>
+  </div>
+  <div class="ans">
+    <p>
+      LLM API 要求消息序列合法：assistant 带 tool_calls 后必须跟 tool 结果；
+      不能在没有 assistant 的前提下插入 user。
+      <code>AgentRunner</code> 维护严格的 message list（<a href="04-runner.html">04 章</a>）；
+      违规会导致 provider 400 或模型行为异常。
+    </p>
+    <p>
+      工具错误应通过 <code>role: tool</code> 消息返回（或 <code>ToolResult.error</code> 字符串作为 tool content），
+      而不是伪造 user 消息。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>会话有 200 条消息，<code>last_consolidated = 150</code>。
+    <code>get_history()</code> 回放时从哪开始？Dream 归档时处理哪一段？</p>
+  </div>
+  <div class="ans">
+    <p>
+      <code>last_consolidated</code> 是<strong>归档进度指针</strong>，不是 replay 边界（<code>session/manager.py:210-212</code>，<a href="07-memory.html">07 章</a>）。
+    </p>
+    <ul>
+      <li><strong>Replay（<code>get_history</code>）</strong>：从 <code>last_consolidated</code> 起取未归档后缀，但至少保留尾部 8 条（<code>MIN_COMPACTED_REPLAY_MESSAGES</code>），并回溯到合法的 user turn 边界</li>
+      <li><strong>Consolidator（阶段一）</strong>：对 <code>messages[last_consolidated:boundary]</code> 做 LLM 摘要，写入 <code>history.jsonl</code>，再推进指针（边界选择见 <code>pick_consolidation_boundary</code>，<code>memory.py:844</code> 起）</li>
+      <li><strong>Dream（阶段二）</strong>：读 <code>history.jsonl</code> 里 <code>cursor &gt; .dream_cursor</code> 的条目，编辑 <code>SOUL.md</code> / <code>USER.md</code> / <code>MEMORY.md</code>——它不直接扫 session.messages</li>
+    </ul>
+    <p>索引 0–149 已摘要进 history（或 raw dump），默认不再整段送进 LLM 上下文。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>Provider 流式输出已推送 500 token 文本后连接断开。
+    <code>should_retry_guard</code> 此时返回什么？为什么？</p>
+  </div>
+  <div class="ans">
+    <p>
+      返回 <code>False</code>——<strong>禁止盲目重试</strong>（<a href="05-providers.html">05 章</a>，
+      <code>base.py:912</code>：<code>should_retry_guard=lambda: not has_streamed_content</code>）。
+    </p>
+    <p>
+      已有 partial content 时重试会导致用户看到重复片段或消息序列不一致。
+      首次失败后 <code>should_retry_guard</code> 会被置 <code>None</code> 允许后续重试路径调整（<code>base.py:1096</code>）。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>工具执行时磁盘满导致 <code>OSError</code>，与参数校验失败，应分别返回什么？
+    为什么 SSRF 拦截也不抛异常？</p>
+  </div>
+  <div class="ans">
+    <p><strong>契约</strong>（<a href="06-tools.html">06 章</a>）：</p>
+    <ul>
+      <li><strong>可恢复的业务/环境错误</strong> → <code>return ToolResult.error("…")</code>，runner 把文本作为 tool 结果喂回模型</li>
+      <li><strong>参数不合法</strong> → 多数工具在 execute 入口返回 <code>ToolResult.error</code>；Schema 校验失败同理</li>
+      <li><strong>不应让整回合崩溃的错误</strong> → 绝不裸抛到 runner 外（除非真正的 invariant 破坏）</li>
+    </ul>
+    <p>
+      SSRF / 工作区边界返回 error 字符串 + runner <code>_classify_violation</code>（<code>runner.py:1568</code>，<a href="10-security.html">10 章</a>）——
+      抛异常会中断 ReAct 循环；软失败让模型换策略，反复违规才升级硬失败。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>对比两种攻击：(1) 允许列表里的 symlink 读 <code>/etc/passwd</code>；
+    (2) DNS 重绑定访问 <code>169.254.169.254</code>。各自由哪层防御？</p>
+  </div>
+  <div class="ans">
+    <p><strong>(1) Symlink</strong>：<code>_is_path_exactly_allowed()</code> 比较 logical vs resolved 路径键
+    （<code>workspace_policy.py:60-68</code>，<a href="10-security.html">10 章</a>）。
+    仅 <code>resolve()</code> 检查不够。</p>
+    <p><strong>(2) DNS rebinding</strong>：<code>resolve_url_target</code> 校验 IP +
+    <code>PinnedDNSAsyncTransport</code> 钉扎 DNS（<code>network.py:264-285</code>）+
+    重定向二次校验 <code>validate_resolved_url</code>。
+    仅校验 URL 字符串不够——必须钉死连接时的 IP。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>启用 <code>tools.exec.sandbox: "bwrap"</code> 但在 Windows 上运行。
+    命令实际如何执行？配置上的 <code>restrictToWorkspace</code> 还有效吗？</p>
+  </div>
+  <div class="ans">
+    <p>
+      <code>shell.py:467-472</code>：打 warning 后<strong>无沙箱</strong>运行原生 shell。
+      bwrap 是 Linux 容器场景的能力，代码诚实声明而非 silent fallback。
+    </p>
+    <p>
+      <code>restrict_to_workspace</code> 仍生效——它是应用层 <code>_guard_command</code> 路径检查（<code>shell.py:808</code> 起），
+      与 bwrap 独立（<a href="10-security.html">10 章</a>）。
+      生产环境 Windows 应靠受限用户账户 + allow/deny 正则，而非 bwrap。
+    </p>
+  </div>
+</div>
+
+<h2 id="hands-on">二、动手任务</h2>
+
+<div class="card">
+  <h3>任务 A（入门）：实现 <code>word_count</code> 工具</h3>
+  <p><strong>目标</strong>：新建只读工具，统计给定文本或文件的词数。</p>
+  <p><strong>涉及文件</strong>：<code>nanobot/agent/tools/word_count.py</code>（新建）</p>
+  <p><strong>要求</strong>：</p>
+  <ul>
+    <li>继承 <code>Tool</code>，实现 4 个抽象成员：<code>name</code>、<code>description</code>、<code>parameters</code>、<code>execute</code></li>
+    <li><code>read_only = True</code>；按需设置 <code>config_key</code></li>
+    <li>文件名不以 <code>_</code> 开头，且不在 <code>_SKIP_MODULES</code> 里（<code>loader.py:20-23</code>）</li>
+  </ul>
+  <p><strong>验收</strong>：启动 gateway 或跑测试，确认 <code>ToolRegistry.tool_names</code> 包含 <code>word_count</code>。</p>
+  <p><strong>提示</strong>：参考 <code>filesystem.py</code> 的 Tool 子类结构；pkgutil 扫描自动发现，无需改 registry。</p>
+</div>
+
+<div class="card">
+  <h3>任务 B（中级）：渠道自定义 session_key</h3>
+  <p><strong>目标</strong>：为某渠道（如 Matrix 或自建 WebSocket 客户端）实现「每 thread/topic 独立会话」。</p>
+  <p><strong>涉及文件</strong>：对应 <code>nanobot/channels/&lt;name&gt;/runtime.py</code></p>
+  <p><strong>要求</strong>：</p>
+  <ul>
+    <li>构造 <code>InboundMessage</code> 时设置 <code>session_key_override</code>（参考 Feishu <code>feishu:oc:om</code> 模式，<a href="08-channels.html">08 章</a>）</li>
+    <li><strong>不修改 <code>loop.py</code></strong>——session 拆分是渠道职责</li>
+  </ul>
+  <p><strong>验收</strong>：同 chat 不同 thread 的消息写入不同 JSONL 文件；<code>/history</code> 互不干扰。</p>
+</div>
+
+<div class="card">
+  <h3>任务 C（进阶）：注册 OpenAI 兼容 Provider</h3>
+  <p><strong>目标</strong>：添加一个指向自建网关的 provider，factory 能路由到它。</p>
+  <p><strong>涉及文件</strong>：</p>
+  <ul>
+    <li><code>nanobot/providers/registry.py</code> — <code>PROVIDERS</code> 加 <code>ProviderSpec</code></li>
+    <li><code>nanobot/config/schema.py</code> — <code>ProvidersConfig</code> 加对应字段</li>
+  </ul>
+  <p><strong>要求</strong>：若 endpoint 完全 OpenAI 兼容，可能只需 registry + schema，不必新写 provider 类（<a href="05-providers.html">05 章</a>）。</p>
+  <p><strong>验收</strong>：<code>nanobot provider list</code> 可见新 provider；配置 API key 后能完成一次 chat。</p>
+</div>
+
+<h2 id="debug">三、调试路线：「agent 没回复」</h2>
+
+<p>从症状出发，按顺序收窄范围。每步给出建议日志关键字。</p>
+
+<div class="ascii">  用户: "agent 没回复"
+        │
+        ▼
+  [1] 日志级别 DEBUG，搜 "stage"
+        │  loop.py _run_turn_stage 会记录七阶段耗时
+        │  卡在哪一 stage？ restore / build / run / save？
+        ▼
+  [2] 搜 "_dispatch" / "create_task"
+        │  run() 六道分流是否把消息 continue 掉了？
+        │  require_existing_session？ runtime_control？
+        ▼
+  [3] 搜 'finish_reason == "error"' / "LLM returned error"
+        │  provider 是否返回 finish_reason="error"？
+        │  runner 会把错误内容当 final_content；loop 侧有 logger.error
+        ▼
+  [4] 搜 "ToolResult" / "tool_call" / "blocked by"
+        │  工具是否返回 ToolResult.error？
+        │  SSRF / workspace / deny pattern？
+        ▼
+  [5] 搜 "publish_outbound" / "outbound"
+        │  respond 阶段是否产出 OutboundMessage？
+        │  outbound 队列是否有消费者？
+        ▼
+  [6] 渠道层：搜 channel 名 + "send" / "Failed"
+        │  Telegram/Discord API 是否拒发？
+        ▼
+  [7] 仍无头绪 → 检查 pairing / allowFrom
+        空 allowFrom 默认拒绝（SECURITY.md）</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    同步发一条 <code>/status</code>（priority 命令，不经锁）确认 event loop 存活、
+    provider 连通、inbound/outbound queue 深度——再决定深入哪一层。
+  </p>
+</div>
+
+<h2 id="reading">四、延伸阅读</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>文档</th><th>内容</th><th>何时读</th></tr></thead>
+  <tbody>
+    <tr><td><code>.agent/design.md</code></td><td>架构约束、「Less structure, more intelligence」</td><td>想加新抽象之前</td></tr>
+    <tr><td><code>.agent/security.md</code></td><td>安全边界规则清单</td><td>改 tools / channels / web fetch 之前</td></tr>
+    <tr><td><code>.agent/gotchas.md</code></td><td>常见坑（async、Windows、配置）</td><td>CI 失败或本地诡异行为</td></tr>
+    <tr><td><code>CONTRIBUTING.md</code></td><td>PR 流程、测试要求</td><td>准备提交补丁</td></tr>
+    <tr><td><code>docs/</code></td><td>用户向配置、渠道、部署文档</td><td>对照源码与用户可见行为</td></tr>
+    <tr><td><code>SECURITY.md</code></td><td>部署安全最佳实践</td><td>生产环境上线前</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="quiz-final">五、本章最后一题</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>用一句话说明 nanobot 的「边缘层」（第 08–10 章）与「核心链路」（第 02–04 章）的职责边界。</p>
+  </div>
+  <div class="ans">
+    <p>
+      <strong>核心链路</strong>回答「消息如何被调度、回合如何执行」——与具体平台、具体配置文件格式无关。
+      <strong>边缘层</strong>回答「外部世界如何被翻译成核心能理解的形状」——渠道协议、JSON 配置、camelCase、
+      slash 命令、安全策略——并且<strong>遵循</strong>核心的所有权边界（不把 WebUI 协议塞进 loop，不把已读回执塞进 bus）。
+    </p>
+    <p>
+      判据（<a href="01-architecture.html">01 章</a> / <a href="02-bus.html">02 章</a>）：
+      如果一段代码需要某个平台的 token 或用户 JSON 的键名，它属于边缘层；
+      如果只处理 <code>InboundMessage</code> / <code>TurnContext</code> / <code>ToolResult</code>，它属于核心或能力层。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    读懂 nanobot 不是记住 18 个渠道的名字——而是能在故障时说出「问题在 bus / loop / runner / provider / 渠道 / 配置哪一层」。
+    回到 <a href="index.html">目录页</a> 标记进度，或带着动手任务的 PR 去贡献代码。祝阅读愉快。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

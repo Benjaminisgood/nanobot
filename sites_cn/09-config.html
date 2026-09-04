@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 配置与命令路由 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 09 章 · 边缘层</div>
+<h1>配置与命令路由</h1>
+<p class="lede">
+  nanobot 的「用户界面」不只有 WebUI——还有 <code>~/.nanobot/config.json</code> 和聊天里的 slash 命令。
+  这一章读透 <strong>Pydantic 配置模型</strong>（camelCase 兼容、环境变量、迁移与加载）和
+  <strong>CommandRouter 三层路由表</strong>，理解配置如何从磁盘进入运行时，以及
+  <code>/stop</code> 为什么能在会话锁之外立即生效。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="root">一、根配置模型 <code>Config(BaseSettings)</code></h2>
+
+<p>
+  所有配置的顶层容器是 <code>Config</code>（<code>schema.py:431</code>）。
+  它把 agent、渠道、Provider、工具等子系统各自聚合成一个字段——
+  CLI、Gateway、WebUI 都通过 <code>load_config()</code> 拿到同一个对象。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/config/schema.py" data-start="431">
+<pre><code>class Config(BaseSettings):
+    """Root configuration for nanobot."""
+
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    model_presets: dict[str, ModelPresetConfig] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("modelPresets", "model_presets"),
+        serialization_alias="modelPresets",
+    )</code></pre>
+</div>
+
+<p>
+  注意 <code>model_presets</code> 已经用了显式 alias——这是根级字段里
+  「读多种键名、写固定键名」模式的预览，下面会看到更多例子。
+</p>
+
+<h2 id="camel">二、camelCase 双命名兼容</h2>
+
+<p>
+  配置 DTO 的公共基类是 <code>config_base.py</code> 里的 <code>Base</code>（不是 Pydantic v2 自带的
+  <code>BaseModel</code> 配置名，而是项目自定义的模型基类）：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/config_base.py" data-start="12">
+<pre><code>class Base(BaseModel):
+    """Base model that accepts both camelCase and snake_case keys."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    <strong><code>alias_generator=to_camel</code></strong>：序列化/反序列化时，JSON 键用 camelCase（前端友好）。
+    Python 属性仍写 snake_case（PEP 8）。
+    <strong><code>populate_by_name=True</code></strong>：解析时<strong>两种键名都能接受</strong>——
+    既可以用 <code>sessionTtlMinutes</code>，也可以用 <code>session_ttl_minutes</code> 构造模型。
+  </p>
+</div>
+
+<h3>字段级 alias：配置演进与向后兼容</h3>
+
+<p>
+  全局 camelCase 生成器解决不了「改名后旧配置文件还能读」的问题。
+  这时在字段上显式声明 <code>validation_alias</code> 和 <code>serialization_alias</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/config/schema.py" data-start="150">
+<pre><code>    session_ttl_minutes: int = Field(
+        default=15,
+        ge=0,
+        validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes"),
+        serialization_alias="idleCompactAfterMinutes",
+    )  # Auto-compact idle threshold in minutes (0 = disabled)</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么这样设计</div>
+  <p style="margin-bottom:0">
+    <strong>读</strong>：<code>idleCompactAfterMinutes</code>（旧名）和 <code>sessionTtlMinutes</code>（过渡名）都认。
+    <strong>写</strong>：<code>save_config()</code> 只输出 <code>idleCompactAfterMinutes</code>（新 canonical 键）。
+    用户升级 nanobot 后不必立刻改配置文件；保存一次就自动迁移键名。
+    这是「配置演进」的标准模式——比硬 breaking change 温和得多。
+  </p>
+</div>
+
+<h2 id="env">三、环境变量覆盖</h2>
+
+<p>
+  <code>Config</code> 继承 <code>BaseSettings</code>，环境变量前缀与嵌套分隔符在
+  <code>model_config</code> 里声明：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/config/schema.py" data-start="659">
+<pre><code>    model_config = SettingsConfigDict(
+        env_prefix="NANOBOT_",
+        env_nested_delimiter="__",
+    )</code></pre>
+</div>
+
+<p>
+  嵌套字段用双下划线展开。例如覆盖默认模型：
+</p>
+
+<div class="code" data-lang="shell" data-file="环境变量示例">
+<pre><code>export NANOBOT_AGENTS__DEFAULTS__MODEL="gpt-4o"
+export NANOBOT_TOOLS__RESTRICT_TO_WORKSPACE="true"</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    复杂嵌套值（如整个 <code>mcpServers</code> 对象）可以用 JSON 字符串作为环境变量值。
+    若解析失败，<code>load_config()</code> 在无配置文件时会抛出带明确提示的
+    <code>ConfigLoadError</code>（<code>loader.py:63-69</code>）。
+  </p>
+</div>
+
+<h2 id="loader">四、配置路径与加载流程</h2>
+
+<h3>4.1 路径：<code>get_config_path()</code></h3>
+
+<div class="code" data-lang="python" data-file="nanobot/config/loader.py" data-start="35">
+<pre><code>def get_config_path() -> Path:
+    """Get the configuration file path."""
+    if _current_config_path:
+        return _current_config_path
+    return Path.home() / ".nanobot" / "config.json"</code></pre>
+</div>
+
+<p>
+  默认 <code>~/.nanobot/config.json</code>。多实例部署时 CLI 可调用
+  <code>set_config_path()</code> 覆盖全局路径（<code>loader.py:29-32</code>）。
+</p>
+
+<h3>4.2 <code>load_config()</code> 主流程</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/config/loader.py" data-start="42">
+<pre><code>def load_config(config_path: Path | None = None) -> Config:
+    """
+    Load configuration from file or create default.
+
+    Args:
+        config_path: Optional path to config file. Uses default if not provided.
+
+    Returns:
+        Loaded configuration object.
+    """
+    global _schema_refs_ready
+    if not _schema_refs_ready:
+        _resolve_tool_config_refs()
+        _schema_refs_ready = True
+
+    path = config_path or get_config_path()
+
+    if not path.exists():
+        try:
+            config = Config()
+        except SettingsError as exc:
+            raise ConfigLoadError(
+                path,
+                kind="invalid_schema",
+                summary=(
+                    "Environment-based configuration could not be parsed. "
+                    "Check that complex NANOBOT_* values use valid JSON."
+                ),
+            ) from exc
+        except ValidationError as exc:
+            raise ConfigLoadError(
+                path,
+                kind="invalid_schema",
+                summary="Environment-based configuration is invalid.",
+                issues=validation_issues(exc),
+            ) from exc
+        _apply_ssrf_whitelist(config)
+        return config
+
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ConfigLoadError(
+            path,
+            kind="invalid_json",
+            summary=(
+                f"JSON syntax error at line {exc.lineno}, column {exc.colno}: "
+                f"{_sentence(exc.msg)}"
+            ),
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigLoadError(
+            path,
+            kind="io_error",
+            summary="The file is not valid UTF-8.",
+        ) from exc
+    except OSError as exc:
+        detail = exc.strerror or type(exc).__name__
+        raise ConfigLoadError(
+            path,
+            kind="io_error",
+            summary=f"Unable to read the file: {_sentence(detail)}",
+        ) from exc
+
+    if not isinstance(data, dict):
+        root_type = type(data).__name__
+        raise ConfigLoadError(
+            path,
+            kind="invalid_root",
+            summary="The top level of config.json must be a JSON object.",
+            issues=(
+                ConfigIssue(
+                    path=(),
+                    message=f"Expected an object, but found {root_type}.",
+                ),
+            ),
+        )
+
+    data = _migrate_config(cast(dict[str, Any], data))
+    try:
+        config = Config.model_validate(data)
+    except ValidationError as exc:
+        issues = validation_issues(exc)
+        raise ConfigLoadError(
+            path,
+            kind="invalid_schema",
+            summary=f"Found {len(issues)} invalid setting(s).",
+            issues=issues,
+        ) from exc
+
+    _apply_ssrf_whitelist(config)
+    return config</code></pre>
+</div>
+
+<p>按时间顺序拆解：</p>
+
+<div class="flow">
+  <div class="step">
+    <div class="idx">1</div>
+    <div class="body">
+      <b><code>_resolve_tool_config_refs()</code></b>
+      <span>打破 <code>ToolsConfig</code> 与前向引用的循环导入（<code>schema.py:665</code> 起）。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">2</div>
+    <div class="body">
+      <b>文件不存在 → <code>Config()</code> 默认值</b>
+      <span>仍可从环境变量注入；最后 <code>_apply_ssrf_whitelist</code>。</span>
+    </div>
+  </div>
+  <div class="arrow">↓ 文件存在</div>
+  <div class="step">
+    <div class="idx">3</div>
+    <div class="body">
+      <b><code>json.load</code> → <code>_migrate_config</code> → <code>Config.model_validate</code></b>
+      <span>旧键名在这里被改写，再交给 Pydantic 校验。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">4</div>
+    <div class="body">
+      <b><code>_apply_ssrf_whitelist(config)</code></b>
+      <span>把 <code>tools.ssrfWhitelist</code> 同步到 <code>security/network.py</code>（第 <a href="10-security.html">10 章</a>）。</span>
+    </div>
+  </div>
+</div>
+
+<h3>4.3 旧格式迁移 <code>_migrate_config()</code></h3>
+
+<div class="code" data-lang="python" data-file="nanobot/config/loader.py" data-start="345">
+<pre><code>def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate old config formats to current."""
+    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
+    tools_value = data.get("tools", {})
+    if not isinstance(tools_value, dict):
+        return data
+    tools = cast(dict[str, Any], tools_value)
+    exec_cfg = _as_config_object(tools.get("exec", {}))
+    if (
+        exec_cfg is not None
+        and "restrictToWorkspace" in exec_cfg
+        and "restrictToWorkspace" not in tools
+    ):
+        tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    # Move tools.myEnabled / tools.mySet → tools.my.{enable, allowSet}.
+    # The old flat keys shipped in the initial MyTool landing; wrapping them in a
+    # sub-config keeps `web` / `exec` / `my` symmetric and gives room to grow.
+    if "myEnabled" in tools or "mySet" in tools:
+        my_cfg = tools.get("my")
+        if my_cfg is None:
+            my_cfg = {}
+            tools["my"] = my_cfg
+        if not isinstance(my_cfg, dict):
+            return data
+        my_cfg = cast(dict[str, Any], my_cfg)
+        if "myEnabled" in tools and "enable" not in my_cfg:
+            my_cfg["enable"] = tools.pop("myEnabled")
+        else:
+            tools.pop("myEnabled", None)
+        if "mySet" in tools and "allowSet" not in my_cfg:
+            my_cfg["allowSet"] = tools.pop("mySet")
+        else:
+            tools.pop("mySet", None)
+
+    return data</code></pre>
+</div>
+
+<h3>4.4 递归补默认值 <code>merge_missing_defaults()</code></h3>
+
+<div class="code" data-lang="python" data-file="nanobot/config/loader.py" data-start="175">
+<pre><code>def merge_missing_defaults(existing: object, defaults: object) -> object:
+    """Recursively add missing defaults without replacing configured values."""
+    if not isinstance(existing, dict) or not isinstance(defaults, dict):
+        return cast(object, existing)
+
+    existing_dict = cast(dict[str, object], existing)
+    defaults_dict = cast(dict[str, object], defaults)
+    merged = dict(existing_dict)
+    for key, value in defaults_dict.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = merge_missing_defaults(merged[key], value)
+    return merged</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么需要 merge_missing_defaults</div>
+  <p style="margin-bottom:0">
+    新版本可能在 schema 里<strong>新增</strong>配置项并给出默认值。
+    老用户的 <code>config.json</code> 里没有这些键——直接覆盖会把用户已有设置冲掉；
+    完全不管又会让新功能缺省行为不一致。
+    <code>merge_missing_defaults</code> 只补缺失键，<strong>不覆盖已配置值</strong>，
+    实现平滑升级。
+  </p>
+</div>
+
+<h3>4.5 <code>${VAR}</code> 环境变量引用</h3>
+
+<p>
+  <code>resolve_config_env_vars()</code>（<code>loader.py:194</code>）遍历整个
+  <code>Config</code> 对象，把字符串里的 <code>${VAR}</code> 替换成环境变量值；
+  缺失则抛 <code>ConfigLoadError</code>（kind=<code>missing_env</code>）。
+  单字段懒解析用更宽松的 <code>resolve_env_refs()</code>（<code>loader.py:224</code>）——
+  变量未设置时返回空字符串，适合 API key 等「未配置 = 禁用」的场景。
+</p>
+
+<h3>4.6 保存：写回 camelCase</h3>
+
+<p>
+  <code>save_config()</code>（<code>loader.py:144</code>）用
+  <code>config.model_dump(mode="json", by_alias=True)</code> 序列化，
+  再经 <code>_write_text_atomic</code> 原子写入——崩溃 mid-write 不会留下截断的 JSON。
+</p>
+
+<div class="code" data-lang="json" data-file="~/.nanobot/config.json 片段示例">
+<pre><code>{
+  "agents": {
+    "defaults": {
+      "model": "claude-sonnet-4-20250514",
+      "idleCompactAfterMinutes": 15
+    }
+  },
+  "tools": {
+    "restrictToWorkspace": true,
+    "exec": {
+      "sandbox": "bwrap",
+      "timeout": 60
+    }
+  }
+}</code></pre>
+</div>
+
+<h2 id="router">五、命令路由三层表</h2>
+
+<p>
+  <code>CommandRouter</code>（<code>command/router.py</code>）是纯字典路由——
+  没有正则引擎，没有插件扫描，注册表在 <code>register_builtin_commands()</code> 里一次性填好。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/command/router.py" data-start="57">
+<pre><code>class CommandRouter:
+    """Pure dict-based command dispatch.
+
+    Three tiers checked in order:
+      1. *priority* — exact-match commands handled before the dispatch lock
+         (e.g. /stop, /restart).
+      2. *exact* — exact-match commands handled inside the dispatch lock.
+      3. *prefix* — longest-prefix-first match (e.g. "/team ").
+    """
+
+    def __init__(self) -> None:
+        self._priority: dict[str, Handler] = {}
+        self._exact: dict[str, Handler] = {}
+        self._prefix: list[tuple[str, Handler]] = []</code></pre>
+</div>
+
+<div class="ascii">  用户输入 "/model fast"
+        │
+        ▼
+  normalize_command_text()     ← 剥 @bot 后缀
+        │
+        ├─ priority 精确匹配？  /stop /restart /status
+        │     └─ 是 → dispatch_priority()，不经会话锁
+        │
+        ├─ exact 精确匹配？     /new /help /dream …
+        │
+        ├─ prefix 最长前缀？    /model  /goal  /history …
+        │
+        └─ 以 / 开头但都不中 → fuzzy match 提示 + /help</div>
+
+<h3>5.1 群聊命令归一化</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/command/router.py" data-start="23">
+<pre><code>def normalize_command_text(text: str) -> str:
+    """Normalize slash-command transport variants before routing.
+
+    Telegram and Discord-style command dispatch can produce ``/cmd@bot args``.
+    The bot suffix belongs to the transport, not the command name, so strip it
+    once at the router boundary while preserving user arguments verbatim.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return stripped
+    first, sep, rest = stripped.partition(" ")
+    if "@" not in first:
+        return stripped
+    command, suffix = first.rsplit("@", 1)
+    if command and suffix and _BOT_SUFFIX_RE.fullmatch(suffix):
+        return f"{command}{sep}{rest}" if sep else command
+    return stripped</code></pre>
+</div>
+
+<h3>5.2 <code>dispatch()</code> 与无效命令提示</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/command/router.py" data-start="110">
+<pre><code>    async def dispatch(self, ctx: CommandContext) -> OutboundMessage | None:
+        """Try exact and prefix handlers, then reject invalid slash commands."""
+        ctx.raw = normalize_command_text(ctx.raw)
+        cmd = ctx.raw.lower()
+
+        if handler := self._exact.get(cmd):
+            return await handler(ctx)
+
+        for pfx, handler in self._prefix:
+            if cmd.startswith(pfx):
+                ctx.args = ctx.raw[len(pfx):]
+                return await handler(ctx)
+
+        return self._invalid_command_response(ctx)</code></pre>
+</div>
+
+<p>
+  <code>_invalid_command_response()</code>（<code>router.py:125</code>）用
+  <code>difflib.get_close_matches</code> 做模糊匹配——
+  输入 <code>/hel</code> 会提示 <code>Did you mean "/help"?</code>。
+  这保证<strong>所有以 <code>/</code> 开头的消息都不会漏进 LLM</strong>，
+  避免模型把无效命令当成普通对话。
+</p>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：priority 与 exact 的重复注册</div>
+  <p style="margin-bottom:0">
+    <code>/status</code> 同时注册在 <code>priority</code> 和 <code>exact</code>（<code>builtin.py:1025-1027</code>）。
+    活跃会话有 pending queue 时，用户发 <code>/status</code> 走 priority 路径立即响应；
+    空闲时走 turn pipeline 的 command 阶段也能响应。
+    设计意图是「状态查询不应被会话锁卡住」——与 <code>/stop</code> 同类。
+  </p>
+</div>
+
+<h2 id="loop-entry">六、AgentLoop 侧的三个入口</h2>
+
+<p>
+  命令不是单独的服务——<code>AgentLoop</code> 在三个时机调用
+  <code>CommandRouter</code>，对应不同的并发语义（详见第
+  <a href="03-loop.html">03 章</a> 的会话锁与 pending queue）：
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>检查方法</th><th>调用时机</th><th>处理器</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>is_priority(raw)</code></td>
+      <td><code>run()</code> 六道分流第 3 层（<code>loop.py:1189</code>）</td>
+      <td><code>dispatch_priority</code>——<strong>不经 dispatch lock</strong></td>
+    </tr>
+    <tr>
+      <td><code>is_dispatchable_command(raw)</code></td>
+      <td>会话已有 pending queue 时（<code>loop.py:1217</code>）</td>
+      <td><code>dispatch</code>——inline，不排队注入</td>
+    </tr>
+    <tr>
+      <td>turn pipeline <code>command</code> 阶段</td>
+      <td>正常回合的七阶段流水线（<code>loop.py:1543</code>）</td>
+      <td><code>_dispatch_command</code> → <code>commands.dispatch</code></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1677">
+<pre><code>    async def _dispatch_command(self, ctx: TurnContext) -> bool:
+        if ctx.kind is TurnKind.SYSTEM:
+            return False
+        session = ctx.require_session()
+        raw = ctx.msg.content.strip()
+        _, automation_metadata = automation_history_overrides(ctx.msg.metadata)
+        is_user_turn = (
+            ctx.original_user_text is not None
+            and not automation_metadata
+            and ctx.msg.channel != "system"
+            and ctx.msg.sender_id != "subagent"
+        )
+        cmd_ctx = CommandContext(
+            msg=ctx.msg,
+            session=session,
+            key=ctx.session_key,
+            raw=raw,
+            loop=self,
+            runtime=ctx.runtime,
+            is_user_turn=is_user_turn,
+            turn_scopes=ctx.turn_scopes,
+        )
+        result = await self.commands.dispatch(cmd_ctx)</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：/stop 为何必须在锁外</div>
+  <p style="margin-bottom:0">
+    第 <a href="03-loop.html">03 章</a> 讲过：同一会话同时只能有一个
+    <code>_dispatch</code> 任务。如果 <code>/stop</code> 也要等锁，用户就无法取消正在运行的回合——
+    形成<strong>死等</strong>。所以 <code>/stop</code>、<code>/restart</code> 走
+    <code>priority</code> 层，在 <code>dispatch_priority</code> 里直接
+    <code>_cancel_active_tasks</code> 并 drain pending queue（<code>builtin.py:202-216</code>）。
+  </p>
+</div>
+
+<h2 id="builtin">七、内置命令表</h2>
+
+<p>
+  元数据定义在 <code>BUILTIN_COMMAND_SPECS</code>（<code>builtin.py:63-179</code>），
+  注册入口 <code>register_builtin_commands(router)</code>（<code>builtin.py:1021</code>）：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/command/builtin.py" data-start="1021">
+<pre><code>def register_builtin_commands(router: CommandRouter) -> None:
+    """Register the default set of slash commands."""
+    router.priority("/stop", cmd_stop)
+    router.priority("/restart", cmd_restart)
+    router.priority("/status", cmd_status)
+    router.exact("/new", cmd_new)
+    router.exact("/status", cmd_status)
+    router.exact("/model", cmd_model)
+    router.prefix("/model ", cmd_model)
+    router.exact("/history", cmd_history)
+    router.prefix("/history ", cmd_history)
+    router.exact("/goal", cmd_goal)
+    router.prefix("/goal ", cmd_goal)
+    router.exact("/trigger", cmd_trigger)
+    router.prefix("/trigger ", cmd_trigger)
+    router.exact("/dream", cmd_dream)
+    router.exact("/dream-log", cmd_dream_log)
+    router.prefix("/dream-log ", cmd_dream_log)
+    router.exact("/dream-restore", cmd_dream_restore)
+    router.prefix("/dream-restore ", cmd_dream_restore)
+    router.exact("/dream-prompt", cmd_dream_prompt)
+    router.prefix("/dream-prompt ", cmd_dream_prompt)
+    router.exact("/evaluator-prompt", cmd_evaluator_prompt)
+    router.prefix("/evaluator-prompt ", cmd_evaluator_prompt)
+    router.exact("/skill", cmd_skill)
+    router.exact("/help", cmd_help)
+    router.exact("/pairing", cmd_pairing)
+    router.prefix("/pairing ", cmd_pairing)</code></pre>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>命令</th><th>一句话说明</th><th>路由层</th></tr></thead>
+  <tbody>
+    <tr><td><code>/new</code></td><td>重置当前会话，开始新对话</td><td>exact</td></tr>
+    <tr><td><code>/stop</code></td><td>取消本会话所有活跃 agent 任务</td><td>priority</td></tr>
+    <tr><td><code>/restart</code></td><td>重启 bot 进程</td><td>priority</td></tr>
+    <tr><td><code>/status</code></td><td>显示运行时、Provider、渠道状态</td><td>priority + exact</td></tr>
+    <tr><td><code>/model [preset]</code></td><td>查看或切换 model preset</td><td>exact + prefix</td></tr>
+    <tr><td><code>/history [n]</code></td><td>打印最近 N 条持久化消息</td><td>exact + prefix</td></tr>
+    <tr><td><code>/goal &lt;text&gt;</code></td><td>将请求作为长期运行目标</td><td>exact + prefix</td></tr>
+    <tr><td><code>/trigger &lt;name&gt;</code></td><td>创建绑定此会话的 CLI trigger</td><td>exact + prefix</td></tr>
+    <tr><td><code>/dream</code></td><td>手动触发 Dream 记忆整合</td><td>exact</td></tr>
+    <tr><td><code>/dream-log</code></td><td>显示上次 Dream 整合改了什么</td><td>exact + prefix</td></tr>
+    <tr><td><code>/dream-restore</code></td><td>回滚到之前的 Dream 快照</td><td>exact + prefix</td></tr>
+    <tr><td><code>/dream-prompt</code></td><td>定制 Dream 如何组织工作区记忆</td><td>exact + prefix</td></tr>
+    <tr><td><code>/evaluator-prompt</code></td><td>定制 heartbeat 通知门控 prompt</td><td>exact + prefix</td></tr>
+    <tr><td><code>/skill</code></td><td>列出 agent 可用的 skills</td><td>exact</td></tr>
+    <tr><td><code>/help</code></td><td>列出所有 slash 命令</td><td>exact</td></tr>
+    <tr><td><code>/pairing</code></td><td>管理 DM pairing（list/approve/deny/revoke）</td><td>exact + prefix</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="quiz">八、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>用户在 Telegram 群聊发送 <code>/model fast@my_nanobot_bot</code>。
+    路由层最终看到的 <code>ctx.raw</code> 是什么？为什么不在渠道层处理？</p>
+  </div>
+  <div class="ans">
+    <p><strong>最终 <code>ctx.raw</code> = <code>/model fast</code>。</strong></p>
+    <p>
+      <code>normalize_command_text()</code>（<code>router.py:23-39</code>）在路由边界统一处理：
+      把 <code>/model@my_nanobot_bot</code> 剥成 <code>/model</code>，参数 <code>fast</code> 原样保留。
+    </p>
+    <p>
+      不在渠道层处理的原因：<code>@bot</code> 后缀是<strong>传输层细节</strong>（Telegram/Discord 特有），
+      18 个渠道不应各自实现一遍。集中在 router 一处，所有渠道的命令语义保持一致。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>老配置文件里有 <code>tools.exec.restrictToWorkspace: true</code>，
+    但没有顶层的 <code>tools.restrictToWorkspace</code>。加载后这两个键分别是什么状态？</p>
+  </div>
+  <div class="ans">
+    <p>
+      <code>_migrate_config()</code>（<code>loader.py:347-358</code>）在
+      <code>Config.model_validate</code> 之前运行：把
+      <code>tools.exec.restrictToWorkspace</code> <strong>移动</strong>到
+      <code>tools.restrictToWorkspace</code>，并从 exec 子对象中删除。
+    </p>
+    <p>
+      加载完成后：内存中 <code>config.tools.restrict_to_workspace == True</code>（Python snake_case）；
+      若调用 <code>save_config()</code>，磁盘 JSON 写 <code>tools.restrictToWorkspace: true</code>，
+      旧的嵌套键不再出现。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>某会话正在执行一个 30 秒的工具调用。
+    用户连发 <code>/stop</code> 和 <code>/help</code>。请说明两条命令各自走哪条入口、
+    能否打断工具调用、以及 <code>/help</code> 的响应会不会进入 LLM 上下文。</p>
+  </div>
+  <div class="ans">
+    <p><strong><code>/stop</code></strong></p>
+    <ul>
+      <li>入口：<code>run()</code> → <code>is_priority</code> → <code>dispatch_priority</code>（<code>loop.py:1189-1193</code>）</li>
+      <li>不经会话锁；<code>cmd_stop</code> 调用 <code>_cancel_active_tasks</code> 并 drain pending queue（<code>builtin.py:206-215</code>）</li>
+      <li>能否打断工具：取决于 runner 对 CancelledError 的处理——stop 会取消 dispatch 任务，正在 await 的工具可能收到取消信号</li>
+    </ul>
+    <p><strong><code>/help</code></strong></p>
+    <ul>
+      <li>若 pending queue 已存在：<code>is_dispatchable_command</code> → inline <code>dispatch</code>（<code>loop.py:1217-1221</code>）</li>
+      <li>否则走 turn pipeline 的 command 阶段 → <code>_dispatch_command</code></li>
+      <li>shortcut 命令会 <code>_persist_user_message_early(..., _command=True)</code>（<code>loop.py:1707-1708</code>），
+      写入会话但 <code>get_history</code> 会过滤 <code>_command</code> 标记——<strong>不进 LLM 上下文</strong></li>
+    </ul>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    配置层 = <strong>Pydantic camelCase 双命名</strong> + <strong>loader 迁移/加载/原子保存</strong>；
+    命令层 = <strong>priority / exact / prefix 三层路由</strong> + <strong>AgentLoop 三入口</strong>。
+    下一章进入安全边界：工作区围栏、SSRF、shell 沙箱与违规升级策略。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

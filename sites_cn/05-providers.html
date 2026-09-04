@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 Provider 抽象层 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 05 章 · 能力层</div>
+<h1>Provider 抽象层</h1>
+<p class="lede">
+  nanobot 支持 Anthropic、OpenAI Chat Completions、OpenAI Responses API、Azure、Bedrock、
+  GitHub Copilot、OpenAI Codex 等十余种后端——协议差异巨大，但抽象面<strong>只有两个抽象方法</strong>。
+  这一章读透 <code>nanobot/providers/</code> 如何把"各家 API 长什么样"收敛成
+  <code>AgentRunner</code> 能统一调用的 <code>LLMProvider</code>。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="abstract">一、反直觉的起点：只有两个抽象方法</h2>
+
+<p>
+  <code>LLMProvider</code>（Large Language Model Provider，大语言模型后端）定义在
+  <code>base.py</code>。类本身有几百行——重试、流式回退、消息清洗、角色交替检查——
+  但子类<strong>必须实现</strong>的只有两件事：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="503">
+<pre><code>    @abstractmethod
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        """
+        Send a chat completion request.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'.
+            tools: Optional list of tool definitions.
+            model: Model identifier (provider-specific).
+            max_tokens: Maximum tokens in response.
+            temperature: Sampling temperature.
+            tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
+
+        Returns:
+            LLMResponse with content and/or tool calls.
+        """
+        pass</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="1190">
+<pre><code>    @abstractmethod
+    def get_default_model(self) -> str:
+        """Get the default model for this provider."""
+        pass</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    <strong><code>chat()</code> + <code>get_default_model()</code> = 全部后端契约。</strong>
+    流式、重试、错误映射、消息格式转换——要么在基类有默认实现，要么在各 Provider 的
+    <code>_convert_*</code> 私有方法里完成，不进入抽象接口。
+  </p>
+  <p style="margin-bottom:0">
+    这样 <code>AgentRunner</code>（见第 <a href="04-runner.html">04 章</a>）永远只调
+    <code>provider.chat(...)</code> 或 <code>provider.chat_stream(...)</code>，
+    不必知道背后是 Anthropic Messages API 还是 OpenAI Responses API。
+  </p>
+</div>
+
+<h2 id="messages">二、统一消息格式：OpenAI Chat Completions 风格</h2>
+
+<p>
+  项目没有单独的 <code>ContentBlock</code> 类。内部 canonical 格式就是
+  <strong><code>list[dict[str, Any]]</code></strong>——每条消息是一个 dict，
+  字段与 OpenAI Chat Completions API 对齐。允许的 key 白名单写在
+  <code>openai_compat_provider.py</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/openai_compat_provider.py" data-start="85">
+<pre><code>_ALLOWED_MSG_KEYS = frozenset({
+    "role", "content", "tool_calls", "tool_call_id", "name",
+    "reasoning_content", "extra_content",
+})</code></pre>
+</div>
+
+<p>
+  各后端在自己的 <code>_convert_*</code> 里做适配。以 Anthropic 为例，
+  <code>_convert_messages</code> 把 <code>role="tool"</code> 合并进 user 消息块、
+  把 assistant 的 <code>tool_calls</code> 拆成 <code>tool_use</code> block：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/anthropic_provider.py" data-start="185">
+<pre><code>    def _convert_messages(
+        self, messages: list[dict[str, Any]],
+    ) -> tuple[str | list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return ``(system, anthropic_messages)``."""
+        system: str | list[dict[str, Any]] = ""
+        raw: list[dict[str, Any]] = []
+        seen_tool_ids: set[str] = set()
+        pending_tool_ids: dict[str, deque[str]] = {}
+
+        def unique_tool_id(value: Any) -> str:
+            raw_key = str(value) if value else ""
+            mapped_id = _sanitize_tool_id(raw_key) if raw_key else _gen_tool_id()
+            if mapped_id and mapped_id not in seen_tool_ids:
+                seen_tool_ids.add(mapped_id)
+                if raw_key:
+                    pending_tool_ids.setdefault(raw_key, deque()).append(mapped_id)
+                return mapped_id
+
+            seed = mapped_id or _gen_tool_id()
+            suffix = 2
+            while True:
+                candidate = f"{seed}__dedupe_{suffix}"
+                if candidate not in seen_tool_ids:
+                    seen_tool_ids.add(candidate)
+                    if raw_key:
+                        pending_tool_ids.setdefault(raw_key, deque()).append(candidate)
+                    return candidate
+                suffix += 1
+
+        def map_tool_result_id(value: Any) -> str:
+            if not value:
+                return _sanitize_tool_id(value or "")
+            raw_id = str(value)
+            queue = pending_tool_ids.get(raw_id)
+            if queue:
+                mapped_id = queue.popleft()
+                if not queue:
+                    pending_tool_ids.pop(raw_id, None)
+                return mapped_id
+            return _sanitize_tool_id(raw_id)
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content")
+
+            if role == "system":
+                system = (
+                    cast(list[dict[str, Any]], content)
+                    if isinstance(content, list)
+                    else content
+                    if isinstance(content, str)
+                    else str(content or "")
+                )
+                continue
+
+            if role == "tool":
+                block = self._tool_result_block(msg, map_tool_result_id=map_tool_result_id)
+                if raw and raw[-1]["role"] == "user":
+                    prev_c = raw[-1]["content"]
+                    if isinstance(prev_c, list):
+                        cast(list[Any], prev_c).append(block)
+                    else:
+                        raw[-1]["content"] = [
+                            {"type": "text", "text": prev_c or ""}, block,
+                        ]
+                else:
+                    raw.append({"role": "user", "content": [block]})
+                continue
+
+            if role == "assistant":
+                raw.append({
+                    "role": "assistant",
+                    "content": self._assistant_blocks(msg, map_tool_id=unique_tool_id),
+                })
+                continue
+
+            if role == "user":
+                raw.append({
+                    "role": "user",
+                    "content": self._convert_user_content(content),
+                })
+                continue
+
+        return system, self._merge_consecutive(raw)</code></pre>
+</div>
+
+<p>
+  OpenAI Responses API 走另一条路径——<code>openai_responses/converters.py</code>
+  的 <code>convert_messages</code> 产出 <code>(system_prompt, input_items)</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/openai_responses/converters.py" data-start="15">
+<pre><code>def convert_messages(
+    messages: list[dict[str, Any]],
+    *,
+    preserve_reasoning: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Convert Chat Completions messages to Responses API input items.
+
+    Returns ``(system_prompt, input_items)`` where *system_prompt* is extracted
+    from any ``system`` role message and *input_items* is the Responses API
+    ``input`` array.
+    """
+    system_prompt = ""
+    input_items: list[dict[str, Any]] = []
+    used_item_ids: set[str] = set()
+
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "system":
+            system_prompt = content if isinstance(content, str) else ""
+            continue
+
+        if role == "user":
+            input_items.append(convert_user_message(content))
+            continue
+
+        if role == "assistant":
+            if preserve_reasoning:
+                reasoning = msg.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    input_items.append({
+                        "type": "reasoning",
+                        "content": [{"type": "output_text", "text": reasoning}],
+                    })
+            if isinstance(content, str) and content:
+                message_id = _unique_item_id(f"msg_{idx}", used_item_ids)
+                input_items.append({
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": content}],
+                    "status": "completed", "id": message_id,
+                })
+            for raw_tool_call in cast(list[object], msg.get("tool_calls", []) or []):
+                tool_call = _as_json_object(raw_tool_call)
+                if tool_call is None:
+                    continue
+                fn = _as_json_object(tool_call.get("function")) or {}
+                call_id, item_id = split_tool_call_id(tool_call.get("id"))
+                response_item_id = _unique_item_id(item_id or f"fc_{idx}", used_item_ids)
+                input_items.append({
+                    "type": "function_call",
+                    "id": response_item_id,
+                    "call_id": call_id or f"call_{idx}",
+                    "name": fn.get("name"),
+                    "arguments": tool_arguments_json_for_replay(fn.get("arguments")),
+                })
+            continue
+
+        if role == "tool":
+            call_id, _ = split_tool_call_id(msg.get("tool_call_id"))
+            output = convert_tool_output(content)
+            input_items.append({"type": "function_call_output", "call_id": call_id, "output": output})
+
+    return system_prompt, input_items</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么选 OpenAI dict 做 canonical 格式</div>
+  <p>
+    因为 function calling（函数调用）生态已经围绕 OpenAI 的
+    <code>tool_calls</code> / <code>role="tool"</code> 序列成熟起来——
+    会话历史 JSONL、工具 schema、<code>AgentRunner</code> 的消息追加逻辑都按这个形状写。
+  </p>
+  <p style="margin-bottom:0">
+    如果 canonical 层用 Anthropic 的 block 数组，每个非 Anthropic 后端都要做双向转换；
+    现在转换只发生在 Provider 边界，<strong>会话存储和 runner 完全后端无关</strong>。
+  </p>
+</div>
+
+<h2 id="toolcall">三、ToolCallRequest 与 should_execute_tools</h2>
+
+<p>
+  模型返回的工具调用统一表示为 <code>ToolCallRequest</code>，
+  含 <code>to_openai_tool_call()</code> 用于写回会话历史：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="53">
+<pre><code>@dataclass
+class ToolCallRequest:
+    """A tool call request from the LLM."""
+    id: str
+    name: str
+    arguments: Any
+    extra_content: dict[str, Any] | None = None
+    provider_specific_fields: dict[str, Any] | None = None
+    function_provider_specific_fields: dict[str, Any] | None = None
+
+    def has_valid_name(self) -> bool:
+        """Whether this call carries a usable (non-empty string) tool name.
+
+        ToolCallRequest.name is typed ``str`` but not enforced at runtime: a
+        model/gateway can emit a degenerate call with ``name=None`` or ``""``.
+        Such a call cannot be executed and, if persisted and replayed, makes
+        upstream APIs reject the whole request (e.g. Anthropic-style
+        ``messages.content.N.tool_use.name: Input should be a valid string``),
+        which permanently wedges the session.
+        """
+        runtime_name = cast(object, self.name)
+        return isinstance(runtime_name, str) and bool(runtime_name)
+
+    def to_openai_tool_call(self) -> dict[str, Any]:
+        """Serialize to an OpenAI-style tool_call payload."""
+        arguments = (
+            self.arguments
+            if isinstance(self.arguments, str)
+            else json.dumps(self.arguments, ensure_ascii=False)
+        )
+        tool_call: dict[str, Any] = {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": arguments,
+            },
+        }
+        if self.extra_content:
+            tool_call["extra_content"] = self.extra_content
+        if self.provider_specific_fields:
+            tool_call["provider_specific_fields"] = self.provider_specific_fields
+        if self.function_provider_specific_fields:
+            tool_call["function"]["provider_specific_fields"] = self.function_provider_specific_fields
+        return tool_call</code></pre>
+</div>
+
+<p>
+  执行前用 <code>parse_tool_arguments</code> 解析 JSON——注意 malformed JSON
+  <strong>保留原样</strong>，交给 <code>ToolRegistry</code> 拒绝，而不是静默修掉：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="100">
+<pre><code>def parse_tool_arguments(arguments: Any) -> Any:
+    """Parse provider tool arguments without guessing executable parameters.
+
+    Valid JSON object strings become dicts. Empty strings become no-arg calls.
+    Malformed JSON and JSON array/scalar values are preserved so ToolRegistry
+    can reject them before execution.
+    """
+    if arguments is None:
+        return {}
+    if not isinstance(arguments, str):
+        return arguments
+
+    stripped = arguments.strip()
+    if not stripped:
+        return {}
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return arguments
+    return arguments if parsed is None else parsed</code></pre>
+</div>
+
+<p>
+  并非所有带 <code>tool_calls</code> 的响应都该执行工具。
+  <code>LLMResponse.should_execute_tools</code> 是一道安全闸：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="281">
+<pre><code>    @property
+    def should_execute_tools(self) -> bool:
+        """Tools execute only when has_tool_calls AND finish_reason is a tool-capable stop.
+        Blocks gateway-injected calls under ``refusal`` / ``content_filter`` / ``error`` (#3220)."""
+        if not self.has_tool_calls:
+            return False
+        return self.finish_reason in ("tool_calls", "function_call", "stop")</code></pre>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点</div>
+  <p style="margin-bottom:0">
+    某些网关会在 <code>finish_reason="content_filter"</code> 或 <code>"refusal"</code>
+    时仍然附带 <code>tool_calls</code> 字段。如果无脑执行，agent 会在模型已拒绝的请求上
+    跑 shell / 写文件——<code>should_execute_tools</code> 就是防这个的。
+  </p>
+</div>
+
+<h2 id="streaming">四、流式不是 AsyncIterator：回调 + 完整 LLMResponse</h2>
+
+<p>
+  很多人预期 <code>chat_stream</code> 返回 <code>AsyncIterator[str]</code> 然后
+  <code>async for chunk in ...</code>。实际签名是：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="780">
+<pre><code>    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Stream a chat completion, calling *on_content_delta* for each text chunk.
+
+        *on_thinking_delta* is reserved for providers that expose incremental
+        thinking/reasoning on the wire; the default fallback invokes neither
+        callback for native deltas (only the optional single *on_content_delta*
+        after :meth:`chat`).
+
+        Returns the same ``LLMResponse`` as :meth:`chat`.  The default
+        implementation falls back to a non-streaming call and delivers the
+        full content as a single delta.  Providers that support native
+        streaming should override this method.
+        """
+        _ = on_thinking_delta, on_tool_call_delta
+        response = await self.chat(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
+        )
+        if on_content_delta and response.content:
+            await on_content_delta(response.content)
+        return response</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么用回调而不是 yield</div>
+  <p><strong>三个理由：</strong></p>
+  <ol>
+    <li>
+      <strong>流式与非流式共用下游逻辑。</strong>
+      <code>AgentRunner</code> 拿到的是同一个 <code>LLMResponse</code>——
+      里面有聚合好的 <code>tool_calls</code>、<code>finish_reason</code>、
+      <code>usage</code>。如果用 iterator，runner 还得自己拼 tool call 参数。
+    </li>
+    <li>
+      <strong>tool call 参数是分片到达的。</strong>
+      增量在 <code>on_tool_call_delta</code> 里推 UI 进度，
+      但最终执行必须等完整 JSON 拼好——这发生在返回 <code>LLMResponse</code> 时。
+    </li>
+    <li>
+      <strong>默认实现零成本退化为非流式。</strong>
+      不支持流式的 Provider 不用 override 任何东西，基类直接调 <code>chat()</code>
+      再一次性回调。
+    </li>
+  </ol>
+</div>
+
+<h2 id="factory">五、factory 分发：从 registry.backend 到具体类</h2>
+
+<p>
+  <code>registry.py</code> 的 <code>ProviderSpec</code> 声明每个配置 provider 用哪个 backend 实现：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/registry.py" data-start="32">
+<pre><code>class ProviderSpec:
+    """One LLM provider's metadata. See PROVIDERS below for real examples.
+
+    Placeholders in env_extras values:
+      {api_key}  — the user's API key
+      {api_base} — api_base from config, or this spec's default_api_base
+    """
+
+    # identity
+    name: str  # config field name, e.g. "dashscope"
+    keywords: tuple[str, ...]  # model-name keywords for matching (lowercase)
+    env_key: str  # env var for API key, e.g. "DASHSCOPE_API_KEY"
+    display_name: str = ""  # shown in `nanobot status`
+    model_catalog: str = "auto"  # WebUI model-list source
+    builtin_models: tuple[ProviderModelSpec, ...] = ()
+    settings_alias_for: str = ""  # compatibility alias grouped under this provider in Settings
+
+    # which provider implementation to use
+    # "openai_compat" | "anthropic" | "azure_openai" | "openai_codex" | "xai_grok"
+    # | "github_copilot" | "bedrock"
+    backend: str = "openai_compat"</code></pre>
+</div>
+
+<p>
+  创建入口是 <code>make_provider</code> → <code>_resolve_model_preset</code> →
+  <code>_make_provider_core</code>，后者是一长串 <code>if backend == ...</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/factory.py" data-start="126">
+<pre><code>def _make_provider_core(
+    config: Config,
+    *,
+    preset: ModelPresetConfig,
+    model: str | None = None,
+) -> LLMProvider:
+    """Create a plain LLM provider without failover wrapping."""
+    setup = _resolve_provider_setup(
+        config,
+        preset=preset,
+        model=model,
+    )
+    model = setup.model
+    provider_name = setup.provider_name
+    p = setup.provider_config
+    spec = setup.spec
+    backend = setup.backend
+
+    if backend == "openai_codex":
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
+        provider = OpenAICodexProvider(
+            default_model=model,
+            proxy=getattr(p, "proxy", None) if p else None,
+            extra_body=p.extra_body if p else None,
+        )
+    elif backend == "xai_grok":
+        from nanobot.providers.xai_grok_provider import XAIGrokProvider
+
+        provider = XAIGrokProvider(
+            default_model=model,
+            proxy=getattr(p, "proxy", None) if p else None,
+            extra_body=p.extra_body if p else None,
+        )
+    elif backend == "azure_openai":
+        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+
+        if p is None or p.api_base is None:
+            raise RuntimeError("validated Azure provider setup is missing api_base")
+        provider = AzureOpenAIProvider(
+            api_key=p.api_key or "",
+            api_base=p.api_base,
+            default_model=model,
+        )
+    elif backend == "github_copilot":
+        from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
+
+        provider = GitHubCopilotProvider(default_model=model)
+    elif backend == "anthropic":
+        from nanobot.providers.anthropic_provider import AnthropicProvider
+
+        provider = AnthropicProvider(
+            api_key=p.api_key if p else None,
+            api_base=config.get_api_base(model, preset=preset),
+            default_model=model,
+            extra_headers=_provider_extra_headers(spec, p),
+        )
+    elif backend == "bedrock":
+        from nanobot.providers.bedrock_provider import BedrockProvider
+
+        provider = BedrockProvider(
+            api_key=p.api_key if p else None,
+            api_base=p.api_base if p else None,
+            default_model=model,
+            region=getattr(p, "region", None) if p else None,
+            profile=getattr(p, "profile", None) if p else None,
+            extra_body=p.extra_body if p else None,
+        )
+    else:
+        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            api_key=p.api_key if p else None,
+            api_base=config.get_api_base(model, preset=preset),
+            default_model=model,
+            extra_headers=_provider_extra_headers(spec, p),
+            spec=spec,
+            extra_body=p.extra_body if p else None,
+            api_type=p.api_type if p and provider_name == "openai" else "auto",
+            extra_query=p.extra_query if p else None,
+            proxy=p.proxy if p else None,
+        )
+
+    provider.generation = preset.to_generation_settings()
+    return provider</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/factory.py" data-start="243">
+<pre><code>def make_provider(
+    config: Config,
+    *,
+    preset_name: str | None = None,
+    preset: ModelPresetConfig | None = None,
+    model: str | None = None,
+) -> LLMProvider:
+    """Create the LLM provider implied by config.
+
+    When *model* is given, it overrides the resolved/preset model — used by
+    the failover path to create providers for fallback models.
+    """
+    resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
+    provider = _make_provider_core(config, preset=resolved, model=model)
+    fallback_presets = _resolve_fallback_presets(config, resolved)
+
+    if fallback_presets:
+        provider = FallbackProvider(
+            primary=provider,
+            fallback_presets=fallback_presets,
+            provider_factory=lambda fb: _make_provider_core(config, preset=fb),
+            primary_context_window_tokens=resolved.context_window_tokens,
+        )
+
+    return provider</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    <code>.agent/design.md</code> 要求：<strong>每条解析路径都必须能从 factory 追踪到具体 provider 类</strong>。
+    加新后端时：在 <code>ProviderSpec</code> 注册 <code>backend</code> 字符串 →
+    在 <code>_make_provider_core</code> 加一个 <code>elif</code> → 实现
+    <code>LLMProvider</code> 子类。不要绕过 factory 直接 <code>new</code> Provider。
+  </p>
+</div>
+
+<h2 id="chunks">六、流式增量聚合：function.arguments 分片到达</h2>
+
+<p>
+  OpenAI 兼容流式 API 里，tool call 的 <code>function.arguments</code> 是逐 chunk 追加的字符串片段。
+  <code>OpenAICompatProvider._parse_chunks</code> 用 <code>tc_bufs: dict[int, dict]</code>
+  按 <code>index</code> 做 buffer，最后统一 <code>parse_tool_arguments</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/openai_compat_provider.py" data-start="1542">
+<pre><code>    @classmethod
+    def _parse_chunks(cls, chunks: list[Any]) -> LLMResponse:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tc_bufs: dict[int, dict[str, Any]] = {}
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+
+        def _accum_tc(tc: Any, idx_hint: int) -> None:
+            """Accumulate one streaming tool-call delta into *tc_bufs*."""
+            tc_index: int = _get(tc, "index") if _get(tc, "index") is not None else idx_hint
+            buf = tc_bufs.setdefault(tc_index, {
+                "id": "", "name": "", "arguments": "",
+                "extra_content": None, "prov": None, "fn_prov": None,
+            })
+            tc_id = _get(tc, "id")
+            if tc_id:
+                buf["id"] = str(tc_id)
+            fn = _get(tc, "function")
+            if fn is not None:
+                fn_name = _get(fn, "name")
+                if fn_name:
+                    buf["name"] = str(fn_name)
+                fn_args = _get(fn, "arguments")
+                if fn_args:
+                    buf["arguments"] += str(fn_args)
+            ec, prov, fn_prov = _extract_tc_extras(tc)
+            if ec:
+                buf["extra_content"] = ec
+            if prov:
+                buf["prov"] = prov
+            if fn_prov:
+                buf["fn_prov"] = fn_prov
+
+        def _accum_legacy_function_call(function_call: Any) -> None:
+            """Accumulate legacy ``delta.function_call`` streaming chunks."""
+            if not function_call:
+                return
+            buf = tc_bufs.setdefault(0, {
+                "id": "", "name": "", "arguments": "",
+                "extra_content": None, "prov": None, "fn_prov": None,
+            })
+            fn_name = _get(function_call, "name")
+            if fn_name:
+                buf["name"] = str(fn_name)
+            fn_args = _get(function_call, "arguments")
+            if fn_args:
+                buf["arguments"] += str(fn_args)</code></pre>
+</div>
+
+<div class="ascii">流式 tool call 时序（简化）
+
+chunk 0:  delta.tool_calls[0].function.name = "read_file"
+chunk 1:  delta.tool_calls[0].function.arguments = '{"path":'
+chunk 2:  delta.tool_calls[0].function.arguments = ' "/tmp/x"}'
+          ↓ _accum_tc 逐片 buf["arguments"] += ...
+stream 结束 → parse_tool_arguments(buf["arguments"]) → {"path": "/tmp/x"}
+          ↓ 组装 ToolCallRequest → 返回 LLMResponse</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点</div>
+  <p style="margin-bottom:0">
+    如果在第一个 chunk 就尝试 <code>json.loads(arguments)</code>，必然失败——
+    参数 JSON 可能跨十几个 chunk 才完整。必须在 buffer 里<strong>字符串拼接</strong>，
+    流结束后再解析。这也是 <code>chat_stream</code> 必须返回完整
+    <code>LLMResponse</code> 而不是 yield 半成品的原因之一。
+  </p>
+</div>
+
+<h2 id="retry">七、错误契约与重试</h2>
+
+<p>
+  Provider 层错误<strong>不抛异常</strong>，而是返回
+  <code>LLMResponse(finish_reason="error", ...)</code> 并填充结构化字段
+  （<code>error_status_code</code>、<code>error_kind</code>、<code>error_retry_after_s</code> 等）。
+  统一重试在 <code>_run_with_retry</code>，退避序列 <code>[1, 2, 4]</code> 秒。
+</p>
+
+<p>
+  SDK 层都设 <code>max_retries=0</code>，避免与基类重试叠加：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/anthropic_provider.py" data-start="107">
+<pre><code>        # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
+        client_kw["max_retries"] = 0
+        self._client = AsyncAnthropic(**client_kw)</code></pre>
+</div>
+
+<p>
+  <code>is_transient_response</code> 判断可重试；429 还要区分限流与配额耗尽：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="535">
+<pre><code>    @classmethod
+    def is_transient_response(cls, response: LLMResponse) -> bool:
+        """Prefer structured error metadata, fallback to text markers for legacy providers."""
+        if response.error_should_retry is not None:
+            return bool(response.error_should_retry)
+
+        if response.error_status_code is not None:
+            status = int(response.error_status_code)
+            if status == 429:
+                return cls._is_retryable_429_response(response)
+            if status in cls._RETRYABLE_STATUS_CODES or status >= 500:
+                return True
+
+        kind = (response.error_kind or "").strip().lower()
+        if kind in cls._TRANSIENT_ERROR_KINDS:
+            return True
+
+        return cls._is_transient_error(response.content)</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="611">
+<pre><code>    @classmethod
+    def _is_retryable_429_response(cls, response: LLMResponse) -> bool:
+        type_token = cls._normalize_error_token(response.error_type)
+        code_token = cls._normalize_error_token(response.error_code)
+        semantic_tokens = {
+            token for token in (type_token, code_token)
+            if token is not None
+        }
+        if any(token in cls._NON_RETRYABLE_429_ERROR_TOKENS for token in semantic_tokens):
+            return False
+
+        content = (response.content or "").lower()
+        if any(marker in content for marker in cls._NON_RETRYABLE_429_TEXT_MARKERS):
+            return False
+
+        if any(token in cls._RETRYABLE_429_ERROR_TOKENS for token in semantic_tokens):
+            return True
+        if any(marker in content for marker in cls._RETRYABLE_429_TEXT_MARKERS):
+            return True
+        # Unknown 429 defaults to WAIT+retry.
+        return True</code></pre>
+</div>
+
+<h3>should_retry_guard：流式已输出后不能盲目重试</h3>
+
+<p>
+  流式已经向用户推送了部分内容后再重试，会导致<strong>内容重复</strong>。
+  <code>should_retry_guard</code> 在 <code>_run_with_retry</code> 里拦截这种情况：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="1078">
+<pre><code>            if should_retry_guard is not None and not should_retry_guard():
+                is_timeout = (response.error_kind or "").lower() == "timeout"
+                if is_timeout:
+                    if on_stream_recover:
+                        logger.warning(
+                            "LLM stream stalled after content was emitted; "
+                            "starting a new stream segment and retrying"
+                        )
+                        await on_stream_recover()
+                    else:
+                        logger.warning(
+                            "LLM stream stalled after content was emitted; "
+                            "suppressing delta callbacks and retrying"
+                        )
+                        kw.setdefault("on_content_delta", None)
+                        kw["on_content_delta"] = None
+                        kw["on_thinking_delta"] = None
+                        kw["on_tool_call_delta"] = None
+                        should_retry_guard = None
+                else:
+                    logger.warning(
+                        "LLM stream failed after content was emitted; skipping retry"
+                    )
+                    return response</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 timeout 例外</div>
+  <p>
+    流式 timeout 通常是"连接卡住、后半段没收到"，用户可能已经看到半截回答。
+    此时可以通过 <code>on_stream_recover</code> 开新 stream segment 续传，
+    或 suppress 回调后静默重试——比直接放弃或重复输出前半段更合理。
+  </p>
+  <p style="margin-bottom:0">
+    非 timeout 错误（如 500）在已输出内容后<strong>直接放弃重试</strong>——
+    因为重试会从头生成，前半段已经推给用户的内容无法撤回。
+  </p>
+</div>
+
+<p>
+  <code>retry_mode</code> 有两种：<code>"standard"</code> 最多 3 次（<code>len(_CHAT_RETRY_DELAYS)</code>）；
+  <code>"persistent"</code> 无限重试但单次 delay 上限 60s，相同错误 10 次后停止。
+  配置见第 <a href="09-config.html">09 章</a>。
+</p>
+
+<h2 id="quiz">八、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span><code>LLMProvider</code> 只有两个抽象方法，但子类文件（如 <code>anthropic_provider.py</code>）有 800+ 行。多出来的代码主要在做什么？</p>
+    <ul class="opts">
+      <li><b>A</b> 实现额外的抽象方法</li>
+      <li><b>B</b> 消息/工具格式转换（<code>_convert_*</code>）和错误映射（<code>_handle_error</code>）</li>
+      <li><b>C</b> 工具执行逻辑</li>
+      <li><b>D</b> 会话持久化</li>
+    </ul>
+  </div>
+  <div class="ans">
+    <p><strong>答案：B。</strong></p>
+    <p>
+      抽象面只有 <code>chat()</code> 和 <code>get_default_model()</code>（<code>base.py:503</code>、
+      <code>1190</code>）。Anthropic 子类的大头是
+      <code>_convert_messages</code>（<code>anthropic_provider.py:185</code>）、
+      <code>_assistant_blocks</code>、<code>_tool_result_block</code> 等适配逻辑，
+      以及 <code>_handle_error</code> 把 SDK 异常转成 <code>LLMResponse(finish_reason="error")</code>。
+      工具执行在 <code>ToolRegistry</code>（第 06 章），会话持久化在 <code>SessionManager</code>（第
+      <a href="07-memory.html">07 章</a>）。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>流式响应中，第一个 tool call chunk 只带了 <code>function.name</code>，
+    第二个 chunk 带了 <code>function.arguments='{"path":'</code>，第三个 chunk 带了
+    <code>' "/etc/passwd"}'</code>。如果 Provider 在收到第一个 chunk 就执行工具，会发生什么？正确做法在哪段源码？</p>
+  </div>
+  <div class="ans">
+    <p><strong>后果：<code>json.loads</code> 失败或解析出残缺参数，工具以错误/空参数执行。</strong></p>
+    <p>
+      正确做法在 <code>openai_compat_provider.py</code> 的 <code>_parse_chunks</code>
+      （<code>1542</code> 起）：<code>_accum_tc</code> 用 <code>tc_bufs[index]["arguments"] += str(fn_args)</code>
+      逐片拼接，流结束后才 <code>parse_tool_arguments</code>。
+    </p>
+    <p>
+      时序上，<code>on_tool_call_delta</code> 回调可以推 UI 进度（"正在调用 read_file…"），
+      但 <code>AgentRunner</code> 只会在拿到完整 <code>LLMResponse.tool_calls</code> 后
+      调 <code>ToolRegistry.execute</code>——且还要过
+      <code>should_execute_tools</code> 检查。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>某网关返回 <code>finish_reason="content_filter"</code> 且
+    <code>tool_calls=[{name:"exec", arguments:"{}"}]</code>。
+    如果没有 <code>should_execute_tools</code>，会话历史回放时还会踩什么坑？
+    结合 <code>ToolCallRequest.has_valid_name</code> 和 Anthropic 的 tool id 映射说明。</p>
+  </div>
+  <div class="ans">
+    <p><strong>即时后果：agent 在模型已拒绝的请求上执行 shell。</strong></p>
+    <p>
+      <code>should_execute_tools</code>（<code>base.py:281</code>）要求
+      <code>finish_reason in ("tool_calls", "function_call", "stop")</code>，
+      <code>content_filter</code> 不在其中 → 不执行。
+    </p>
+    <p><strong>持久化/回放层面的二次伤害：</strong></p>
+    <ul>
+      <li>
+        如果错误执行了工具并把结果写进会话，下一轮请求会带上
+        <code>assistant(tool_calls) + tool(result)</code> 序列——模型会以为上一步合法完成。
+      </li>
+      <li>
+        Anthropic 回放时 <code>_convert_messages</code> 用 <code>unique_tool_id</code> /
+        <code>map_tool_result_id</code> 做 id 映射（<code>anthropic_provider.py:194</code> 起）。
+        若 <code>tool_calls</code> 里 name 为空或非法（<code>has_valid_name()</code> 为 False，
+        <code>base.py:63</code>），上游 API 会直接拒整个请求
+        （<code>tool_use.name: Input should be a valid string</code>），<strong>会话永久 wedged</strong>。
+      </li>
+    </ul>
+    <p>
+      所以 <code>should_execute_tools</code> 既是运行时安全闸，也是防止脏历史进入 JSONL 的第一道防线。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    Provider 层 = <strong>两个抽象方法</strong> + <strong>OpenAI dict 作 canonical 消息</strong> +
+    <strong>回调式流式</strong> + <strong>finish_reason="error" 错误契约</strong> +
+    <strong>factory 可追踪分发</strong>。下一章看 agent 拿到 <code>tool_calls</code> 后如何执行——工具系统。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

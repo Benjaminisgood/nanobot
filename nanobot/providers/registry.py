@@ -399,9 +399,15 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_catalog="builtin",
         builtin_models=(
             ProviderModelSpec(
+                id="openai-codex/gpt-5.7-sol",
+                label="GPT-5.7-Sol",
+                description="Latest frontier agentic coding model.",
+                context_window=372000,
+            ),
+            ProviderModelSpec(
                 id="openai-codex/gpt-5.6-sol",
                 label="GPT-5.6-Sol",
-                description="Latest frontier agentic coding model.",
+                description="Previous-generation frontier agentic coding model.",
                 context_window=372000,
             ),
             ProviderModelSpec(

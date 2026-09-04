@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 AgentLoop：七阶段流水线 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 03 章 · 核心链路</div>
+<h1>AgentLoop：七阶段流水线</h1>
+<p class="lede">
+  2344 行，全项目最大的单文件，也是<code>.agent/design.md</code> 里明确标记为"受保护关键路径"的一半。
+  但它的结构其实非常清晰：<strong>一个调度器 + 一个七阶段流水线</strong>。
+  这一章我们把这两件事拆开读透。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="scope">一、先划清职责：AgentLoop 做什么、不做什么</h2>
+
+<p>类的 docstring 已经把职责写得很直白：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="181">
+<pre><code>class AgentLoop:
+    """
+    The agent loop is the core processing engine.
+
+    It:
+    1. Receives messages from the bus
+    2. Builds context with history, memory, skills
+    3. Calls the LLM
+    4. Executes tool calls
+    5. Sends responses back
+    """</code></pre>
+</div>
+
+<p>
+  但真正关键的是它<strong>不</strong>做什么。这条边界写在架构约束里：
+</p>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：状态扇出的所有权边界</div>
+  <p>
+    <code>AgentLoop</code> <em>可以</em>从 <code>nanobot.bus.runtime_events</code>
+    发布<strong>通用</strong>运行时事件（回合/运行/模型/目标状态变化），
+    但 WebUI/WebSocket 的<strong>协议细节</strong>——比如 <code>_turn_end</code>、
+    <code>_goal_status</code>、标题刷新、目标状态同步——属于
+    <code>nanobot.session.webui_turns.WebuiTurnCoordinator</code> 或相应的渠道适配器。
+  </p>
+  <p style="margin-bottom:0">
+    <strong>判据</strong>：如果一段代码里出现了某个客户端专属的字段名，它就不该在 <code>loop.py</code> 里。
+  </p>
+</div>
+
+<h2 id="run">二、run()：调度循环的六道分流</h2>
+
+<p>
+  <code>run()</code> 是常驻任务。它的核心是一个 <code>while self._running</code> 循环，
+  每次取一条消息，然后做<strong>六次分流判断</strong>——只有全部不命中，才真正创建处理任务。
+</p>
+
+<h3>2.1 取消息：1 秒超时的心跳设计</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1161">
+<pre><code>            while self._running:
+                try:
+                    msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    self._check_expired_sessions_if_due()
+                    continue
+                except asyncio.CancelledError:
+                    # Preserve real task cancellation so shutdown can complete cleanly.
+                    # Only ignore non-task CancelledError signals that may leak from integrations.
+                    if not self._running or task_is_cancelling():
+                        raise
+                    logger.warning(
+                        "Ignoring leaked CancelledError while consuming inbound messages"
+                    )
+                    continue
+                except Exception as e:
+                    logger.warning("Error consuming inbound message: {}, continuing...", e)
+                    continue</code></pre>
+</div>
+
+<p>三个异常分支，每一个都对应一个真实教训：</p>
+
+<p>
+  <strong><code>TimeoutError</code> → 心跳。</strong>
+  <code>timeout=1.0</code> 不是为了避免死等（<code>consume_inbound</code> 本来就是可取消的协程），
+  而是为了<strong>获得一个周期性的执行时机</strong>。这一秒的空闲被用来跑
+  <code>_check_expired_sessions_if_due()</code>——扫描空闲超时的会话并触发压缩。
+  这样就不需要额外起一个定时任务。
+</p>
+
+<p>
+  <strong><code>CancelledError</code> → 区分"真取消"与"泄漏取消"。</strong>
+  这是异步编程里非常隐蔽的坑。第三方集成（比如某些 SDK 内部用 <code>anyio</code> cancel scope）
+  可能让 <code>CancelledError</code> 冒泡到这里，但进程<em>并没有</em>要退出。
+  如果无脑 <code>raise</code>，整个 agent 就被一个第三方 bug 干掉了；
+  如果无脑忽略，进程又永远关不掉。所以这里用
+  <code>not self._running or task_is_cancelling()</code> 做判别：
+  <strong>只有"我们自己要停"或"当前任务确实处于取消中"，才尊重这个取消信号。</strong>
+</p>
+
+<p>
+  <strong>其他 <code>Exception</code> → 记日志继续。</strong>
+  调度循环是最高优先级的常驻任务，绝不能因为单条消息的问题而退出。
+</p>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    <code>_check_expired_sessions_if_due()</code>（<code>loop.py:1142</code>）内部自己做节流：
+    "Scan idle sessions no more often than the configured interval"。
+    也就是说虽然每秒都会调它，但真正扫描的频率由配置决定（默认 60 秒）。
+    <strong>把"调用时机"和"执行频率"解耦</strong>，是这类心跳设计的常用手法。
+  </p>
+</div>
+
+<h3>2.2 六道分流：顺序即优先级</h3>
+
+<p>取到消息后的判断顺序<strong>不能调换</strong>，每一层都假定前面的层已经过滤掉了某类消息：</p>
+
+<div class="flow">
+  <div class="step">
+    <div class="idx">1</div>
+    <div class="body">
+      <b>运行时控制指令</b>
+      <span><code>agent_context.handle_runtime_control(...)</code>。WebUI 要求重载 MCP、丢弃会话等。
+      这类消息根本不是"对话"，必须最先拦掉。</span>
+    </div>
+  </div>
+  <div class="arrow">↓ 不是</div>
+  <div class="step">
+    <div class="idx">2</div>
+    <div class="body">
+      <b>要求已存在会话但会话不存在</b>
+      <span><code>msg.require_existing_session and self.sessions.get_cached(...) is None → continue</code>。
+      静默丢弃。cron/自动化触发不该凭空创建会话。</span>
+    </div>
+  </div>
+  <div class="arrow">↓ 通过</div>
+  <div class="step">
+    <div class="idx">3</div>
+    <div class="body">
+      <b>优先命令</b>
+      <span><code>self.commands.is_priority(raw)</code> → <code>_dispatch_command_inline(..., dispatch_priority)</code>。
+      典型是 <code>/stop</code>、<code>/restart</code>。<strong>它们必须在会话锁之外执行</strong>——
+      否则 <code>/stop</code> 会排在它要取消的那个任务后面，永远等不到。</span>
+    </div>
+  </div>
+  <div class="arrow">↓ 不是</div>
+  <div class="step">
+    <div class="idx">4</div>
+    <div class="body">
+      <b>自动化回合延后</b>
+      <span>遍历 <code>self._automation_turn_coordinators</code>，若 <code>defer_if_active(...)</code>
+      返回真则跳过。会话正忙时，cron 触发的回合延后而不是插队。</span>
+    </div>
+  </div>
+  <div class="arrow">↓ 不需延后</div>
+  <div class="step">
+    <div class="idx">5</div>
+    <div class="body">
+      <b>会话正忙 → 回合中注入</b>
+      <span><code>effective_key in self._pending_queues</code>。这是本章第四节的重点。
+      注意内部还有一层：普通斜杠命令要 inline 分发，不能进注入队列。</span>
+    </div>
+  </div>
+  <div class="arrow">↓ 空闲</div>
+  <div class="step">
+    <div class="idx">6</div>
+    <div class="body">
+      <b>创建处理任务</b>
+      <span><code>asyncio.create_task(self._dispatch(msg))</code>，并登记到
+      <code>self._active_tasks[effective_key]</code>，用 <code>add_done_callback</code> 自动摘除。</span>
+    </div>
+  </div>
+</div>
+
+<p>最后这一步值得看原文，因为它解释了 <code>/stop</code> 为什么能找到要取消的任务：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1242">
+<pre><code>                # Compute the effective session key before dispatching
+                # This ensures /stop command can find tasks correctly when unified session is enabled
+                task = asyncio.create_task(self._dispatch(msg))
+                active_tasks = self._active_tasks.setdefault(effective_key, set())
+                active_tasks.add(task)
+                task.add_done_callback(active_tasks.discard)</code></pre>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：为什么是 effective_key 而不是 msg.session_key</div>
+  <p>
+    开启统一会话（<code>unified_session</code>）后，所有渠道的消息都映射到 <code>unified:default</code>。
+    如果任务登记用 <code>msg.session_key</code>（比如 <code>telegram:123</code>），
+    而 <code>/stop</code> 查找时用有效键 <code>unified:default</code>，就<strong>找不到任务</strong>——
+    表现为"<code>/stop</code> 没反应"。这条注释就是为了防止后人改回去。
+  </p>
+</div>
+
+<h2 id="dispatch">三、_dispatch()：会话锁与善后</h2>
+
+<p>
+  <code>_dispatch</code> 的 docstring 一句话说清了并发模型：
+  "Process a message: per-session serial, cross-session concurrent."
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1252">
+<pre><code>    async def _dispatch(self, msg: InboundMessage) -> None:
+        """Process a message: per-session serial, cross-session concurrent."""
+        session_key = self._effective_session_key(msg)
+        if session_key != msg.session_key:
+            msg = dataclasses.replace(msg, session_key_override=session_key)
+        lock = self._get_session_lock(session_key)
+        gate = self._concurrency_gate or nullcontext()</code></pre>
+</div>
+
+<p>
+  注意第 4-5 行：如果有效键和消息自带的键不同，就用
+  <code>dataclasses.replace</code> <strong>造一个新消息</strong>把有效键写回去。
+  <code>InboundMessage</code> 虽然是普通 dataclass（可变），但代码风格上把它当不可变对象处理——
+  这样后续任何持有这条消息引用的地方（注入队列、自动化协调器）看到的键都是一致的。
+</p>
+
+<p>然后是双重上下文管理：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1263">
+<pre><code>            async with lock, gate:
+                # Only the task that owns the session lock may publish the
+                # active mid-turn injection queue for this session.
+                pending = asyncio.Queue(maxsize=20)
+                self._pending_queues[session_key] = pending</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：锁的所有权即队列的所有权</div>
+  <p>
+    <strong><code>_pending_queues[session_key]</code> 的存在，就是"这个会话正忙"的标志。</strong>
+    而只有拿到会话锁的任务才有权注册它。这个不变量让第 5 道分流（回合中注入）
+    可以用一次字典查找代替复杂的状态机——非常漂亮的简化。
+  </p>
+</div>
+
+<h3>3.1 finally 块：三件必须做的善后</h3>
+
+<p>
+  <code>_dispatch</code> 的 <code>finally</code> 块（<code>loop.py:1335</code> 起）是全文最容易被忽略但最重要的部分。它做三件事：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1335">
+<pre><code>                finally:
+                    # Drain any messages still in the pending queue and re-publish
+                    # them to the bus so they are processed as fresh inbound messages
+                    # rather than silently lost.  Only remove our own queue; a
+                    # later task waiting on the lock must not be able to steal
+                    # cleanup ownership.
+                    queue = None
+                    if self._pending_queues.get(session_key) is pending:
+                        queue = self._pending_queues.pop(session_key, None)
+                    else:
+                        queue = pending
+                    if queue is not None:
+                        leftover = 0
+                        while True:
+                            try:
+                                item = queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            await self.bus.publish_inbound(item)
+                            leftover += 1
+                        if leftover:
+                            logger.info(
+                                "Re-published {} leftover message(s) to bus for session {}",
+                                leftover, session_key,
+                            )</code></pre>
+</div>
+
+<p><strong>第一件：只清理自己的队列。</strong></p>
+<p>
+  <code>if self._pending_queues.get(session_key) is pending</code> 用的是
+  <strong><code>is</code> 身份比较</strong>，不是 <code>in</code>。为什么？
+  设想会话 A 的任务 1 正在收尾，任务 2 已经拿到锁并注册了自己的队列。
+  如果任务 1 无脑 <code>pop(session_key)</code>，就会把<strong>任务 2 的队列删掉</strong>——
+  于是任务 2 变成"看起来空闲"，第 5 道分流失效，同一会话出现并发。
+  注释里那句 "a later task waiting on the lock must not be able to steal cleanup ownership"
+  说的就是这个竞态。
+</p>
+
+<p><strong>第二件：残留消息重新入队，不静默丢弃。</strong></p>
+<p>
+  队列里可能还有没被注入的消息（比如 LLM 提前收尾了）。它们被
+  <code>publish_inbound</code> 送回 inbound 总线，下一轮当作新消息处理。
+  这保证了<strong>用户发的每条消息最终都会被响应</strong>。
+</p>
+
+<p><strong>第三件：释放流式与状态。</strong></p>
+<p>
+  <code>delivery.idle()</code> 通知前端"回合结束"，
+  <code>_publish_next_deferred_automation_turn()</code> 把之前延后的 cron 回合放出来。
+</p>
+
+<h3>3.2 取消路径：保住已经做完的工作</h3>
+
+<p>
+  用户按 <code>/stop</code> 时会抛 <code>CancelledError</code>。这里的处理很有讲究：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1300">
+<pre><code>                    # Preserve partial context from the interrupted turn so
+                    # the user does not lose tool results and assistant
+                    # messages accumulated before /stop.  The checkpoint was
+                    # already persisted to session metadata by
+                    # _emit_checkpoint during tool execution; materializing
+                    # it into session history now makes it visible in the
+                    # next conversation turn.
+                    if session_key in self._discarding_sessions:
+                        raise
+                    try:
+                        key = self._effective_session_key(msg)
+                        session = self.sessions.get_or_create(key)
+                        if self._restore_runtime_checkpoint(session):
+                            self._clear_pending_user_turn(session)
+                            self.sessions.save(session)</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么要"检查点"这套机制</div>
+  <p>
+    想象 agent 已经跑了 5 分钟、执行了 12 个工具调用，用户此刻按下 <code>/stop</code>。
+    如果什么都不保存，那 12 个工具的结果（可能包括昂贵的 web 搜索、已经写好的文件分析）全部消失，
+    用户下一句话得从零开始。
+  </p>
+  <p>
+    所以 <code>AgentRunner</code> 在工具执行的两个时点（<code>awaiting_tools</code> 和
+    <code>tools_completed</code>）会调用 <code>_emit_checkpoint</code>，
+    把当前的 assistant 消息和已完成的工具结果写进 <strong>session metadata</strong>。
+    取消时 <code>_restore_runtime_checkpoint</code> 再把它"物化"成正式的会话历史。
+  </p>
+  <p style="margin-bottom:0">
+    注意那个前置判断 <code>if session_key in self._discarding_sessions: raise</code>——
+    如果这次取消的原因<em>本身就是</em>用户要丢弃会话（<code>/new</code>），那就别恢复了，
+    直接把取消传播出去。
+  </p>
+</div>
+
+<h2 id="turncontext">四、TurnContext：阶段之间的唯一载体</h2>
+
+<p>
+  七阶段流水线的每个阶段签名都是 <code>async def stage(ctx: TurnContext) -> ...</code>。
+  所有中间状态都挂在这个 dataclass 上：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="118">
+<pre><code>@dataclass
+class TurnContext:
+    msg: InboundMessage
+    session_key: str
+    turn_id: str
+    runtime: LLMRuntime | None
+    kind: TurnKind
+    delivery: TurnDelivery
+    original_user_text: str | None = None
+    session: Session | None = None
+
+    history: list[dict[str, Any]] = field(default_factory=list)
+    initial_messages: list[dict[str, Any]] = field(default_factory=list)
+    provider_state: ProviderConversationState | None = field(default=None, repr=False)
+    request_context: RequestContext | None = None
+    runtime_context_blocks: list[RuntimeContextBlock] = field(default_factory=list)
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+    final_content: str | None = None
+    all_messages: list[dict[str, Any]] = field(default_factory=list)
+    stop_reason: str = ""
+    had_injections: bool = False
+    streamed_content: bool = False</code></pre>
+</div>
+
+<p>
+  字段是按<strong>生命周期分组</strong>的：第一组在构造时就有；第二组由 <code>build</code>
+  阶段填充；第三组由 <code>run</code> 阶段填充。
+</p>
+
+<h3>用 require_* 把"阶段顺序"变成类型安全</h3>
+
+<p>
+  <code>runtime</code> 和 <code>session</code> 声明成 <code>| None</code>，
+  因为在早期阶段它们确实还不存在。但后续阶段每次都写 <code>if ctx.runtime is None</code>
+  会很啰嗦。作者的解法是两个访问器：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="168">
+<pre><code>    def require_runtime(self) -> LLMRuntime:
+        """Return the runtime established by the BUILD stage."""
+        if self.runtime is None:
+            raise RuntimeError("turn runtime is not initialized; BUILD must run before this stage")
+        return self.runtime
+
+    def require_session(self) -> Session:
+        """Return the session established by the RESTORE stage."""
+        if self.session is None:
+            raise RuntimeError("turn session is not initialized; RESTORE must run before this stage")
+        return self.session</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：这是一种"文档即代码"的技巧</div>
+  <p>
+    返回类型是 <code>LLMRuntime</code>（不带 <code>None</code>），所以调用方拿到的是确定类型，
+    basedpyright 不会报错，也不需要 <code>cast</code>——
+    符合"每个 cast 必须有运行时检查支撑"那条约束，因为这里<em>就是</em>那个运行时检查。
+  </p>
+  <p style="margin-bottom:0">
+    更妙的是异常消息本身就是文档：<em>"BUILD must run before this stage"</em>。
+    新人如果在错误的阶段访问，报错信息直接告诉他阶段依赖关系。
+  </p>
+</div>
+
+<h2 id="stages">五、七阶段流水线</h2>
+
+<p>整个 <code>_process_message</code> 的最后 9 行，就是全部编排：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1541">
+<pre><code>        await self._run_turn_stage(ctx, "restore", self._restore_turn)
+        await self._run_turn_stage(ctx, "compact", self._compact_session)
+        if await self._run_turn_stage(ctx, "command", self._dispatch_command):
+            return ctx.outbound
+        await self._run_turn_stage(ctx, "build", self._build_turn)
+        await self._run_turn_stage(ctx, "run", self._run_turn)
+        await self._run_turn_stage(ctx, "save", self._persist_turn)
+        await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
+        return ctx.outbound</code></pre>
+</div>
+
+<p>
+  <code>command</code> 阶段是唯一有返回值的——如果它返回 <code>True</code>
+  （消息是一条被成功处理的斜杠命令），流水线<strong>直接短路返回</strong>，
+  不进入 LLM。这就是"<code>/status</code> 不消耗 token"的实现。
+</p>
+
+<h3>_run_turn_stage：统一的可观测性包装</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1551">
+<pre><code>    async def _run_turn_stage(
+        self,
+        ctx: TurnContext,
+        name: str,
+        handler: Callable[[TurnContext], Awaitable[_T]],
+    ) -> _T:
+        started_at = time.perf_counter()
+        try:
+            result = await handler(ctx)
+        except Exception:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            logger.debug(
+                "[turn {}] Stage {} failed after {:.1f}ms",
+                ctx.turn_id,
+                name,
+                duration_ms,
+            )
+            raise</code></pre>
+</div>
+
+<p>
+  一个 5 行的装饰器式包装，换来<strong>每个阶段的耗时日志</strong>，
+  用 <code>ctx.turn_id</code> 串联。注意它用 <code>_T</code> 泛型保留了 handler 的返回类型，
+  所以 <code>command</code> 阶段的 <code>bool</code> 能正确传出来。
+</p>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示：这是调试 nanobot 最快的入口</div>
+  <p style="margin-bottom:0">
+    把日志级别设为 DEBUG，发一条消息，你会看到七行 <code>Stage X completed in Y ms</code>。
+    哪个阶段慢一目了然：<code>build</code> 慢通常是压缩或技能加载，
+    <code>run</code> 慢是 LLM/工具，<code>save</code> 慢是磁盘 fsync。
+  </p>
+</div>
+
+<h3>逐阶段职责</h3>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>阶段</th><th>函数</th><th>做什么</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>restore</code></td>
+  <td><code>_restore_turn</code><br><span style="color:var(--fg-faint);font-size:12px">loop.py:1616</span></td>
+  <td>拿到/创建 Session；把非图片附件转成文本引用；按 <code>session.policy.disabled_tools</code> 构造受限工具注册表；恢复上次的检查点与未完成的用户回合</td>
+</tr>
+<tr>
+  <td><code>compact</code></td>
+  <td><code>_compact_session</code><br><span style="color:var(--fg-faint);font-size:12px">loop.py:1669</span></td>
+  <td>调 <code>auto_compact.prepare_session()</code>，取出上次压缩留下的摘要放进 <code>ctx.pending_summary</code></td>
+</tr>
+<tr>
+  <td><code>command</code></td>
+  <td><code>_dispatch_command</code><br><span style="color:var(--fg-faint);font-size:12px">loop.py:1677</span></td>
+  <td>构造 <code>CommandContext</code> 交给 <code>CommandRouter.dispatch()</code>；命中则短路</td>
+</tr>
+<tr>
+  <td><code>build</code></td>
+  <td><code>_build_turn</code><br><span style="color:var(--fg-faint);font-size:12px">loop.py:1726</span></td>
+  <td><strong>最重的阶段</strong>：解析运行时（模型/preset）、按 token 预算压缩、取回放历史、装配 provider 续传状态、早持久化用户消息、构造 <code>initial_messages</code></td>
+</tr>
+<tr>
+  <td><code>run</code></td>
+  <td><code>_run_turn</code><br><span style="color:var(--fg-faint);font-size:12px">loop.py:1851</span></td>
+  <td>调 <code>_run_agent_loop()</code> → <code>AgentRunner.run(AgentRunSpec)</code>；结束后可能触发持续目标的续跑</td>
+</tr>
+<tr>
+  <td><code>save</code></td>
+  <td><code>_persist_turn</code><br><span style="color:var(--fg-faint);font-size:12px">loop.py:1888</span></td>
+  <td>把本轮新增消息写入会话 JSONL；后台再跑一次 consolidator</td>
+</tr>
+<tr>
+  <td><code>respond</code></td>
+  <td><code>_prepare_outbound</code><br><span style="color:var(--fg-faint);font-size:12px">loop.py:1939</span></td>
+  <td>组装 <code>OutboundMessage</code>；system 回合走 <code>background_response</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>build 阶段的一个精妙细节：早持久化</h3>
+
+<p>
+  <code>_build_turn</code> 里有一步叫 <code>_persist_user_message_early</code>。
+  为什么要在<strong>调 LLM 之前</strong>就把用户消息写盘？
+</p>
+
+<div class="callout why">
+  <div class="t">? 为什么这样设计</div>
+  <p>
+    因为 LLM 调用可能持续几分钟，期间进程可能崩溃、被 kill、或用户 <code>/stop</code>。
+    如果等回合结束才一起写盘，用户那句话就丢了——下次对话时 agent 完全不知道用户问过什么。
+  </p>
+  <p style="margin-bottom:0">
+    代价是引入了"半个回合"的持久化状态，所以需要配套的
+    <code>_mark_pending_user_turn</code> / <code>_restore_pending_user_turn</code>
+    （<code>loop.py:2132</code>、<code>2252</code>）来标记和恢复。
+    <strong>这是"崩溃安全"和"状态简洁"之间的一次明确取舍。</strong>
+  </p>
+</div>
+
+<p>还有一处同类的取舍，在 subagent 结果的处理上——注释写得非常清楚：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1763">
+<pre><code>        if is_subagent:
+            # Keep the durable internal delivery as an assistant record, but
+            # present this completion to the model as fresh follow-up input.
+            # Providers without assistant-prefill support drop trailing
+            # assistant messages, so using the persisted record as the current
+            # prompt would hide an independently dispatched subagent result.
+            subagent_followup_persisted = self._persist_subagent_followup(
+                session,
+                ctx.msg,
+            )</code></pre>
+</div>
+
+<p>
+  翻译一下：subagent 的结果<strong>持久化时是 assistant 消息</strong>（这才符合它的真实语义），
+  但<strong>喂给模型时当作新的用户输入</strong>。因为很多 provider 会丢弃末尾的 assistant 消息
+  （不支持 assistant prefill），如果直接用持久化的形态当 prompt，模型根本看不到 subagent 干了什么。
+</p>
+
+<h2 id="injection">六、回合中注入：让 agent"边干边听"</h2>
+
+<p>
+  这是 nanobot 最有体感的功能之一：agent 在跑长任务时，你追加一句话，它能立刻纳入考虑。
+  实现分布在三处，串起来看：
+</p>
+
+<div class="ascii">① 调度侧（loop.py:1214 起）
+   会话正忙 → msg 塞进 self._pending_queues[key]（maxsize=20）
+   队列满 → 降级为普通排队任务（不阻塞、不丢弃）
+
+② 注入队列的桥接（loop.py:1094 的 _drain_pending）
+   作为 AgentRunSpec.injection_callback 传给 runner
+
+③ 消费侧（runner.py 的 _try_drain_injections）
+   在两个安全点被调用：
+     · 工具执行完成后、下一次 LLM 调用前
+     · 工具出错后
+   取出消息 → _append_injected_messages() 追加为 user 消息 → continue 下一轮迭代</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：为什么只在这两个点注入</div>
+  <p>
+    因为 <strong>OpenAI/Anthropic 的消息序列有合法性约束</strong>：
+    每个 <code>assistant</code> 消息带的 <code>tool_calls</code>，必须紧跟着对应数量的
+    <code>role="tool"</code> 结果消息。如果在"已发出 tool_calls、还没回填结果"时插入一条
+    user 消息，请求会直接被 API 拒绝。
+  </p>
+  <p style="margin-bottom:0">
+    所以注入点只能选在<strong>工具序列已经闭合</strong>的时刻。这也解释了
+    <code>_append_injected_messages</code>（<code>runner.py:163</code>）为什么要做角色交替检查——
+    连续两条 user 消息在某些 provider 上同样非法，得先合并。
+  </p>
+</div>
+
+<h2 id="quiz">七、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span><code>run()</code> 的调度循环里，为什么 <code>/stop</code> 这类"优先命令"必须在会话锁<strong>之外</strong>处理？</p>
+  </div>
+  <div class="ans">
+    <p><strong>因为它要取消的正是持有那把锁的任务。</strong></p>
+    <p>
+      <code>_dispatch()</code> 的结构是 <code>async with lock, gate:</code>，
+      锁在整个回合期间被持有。如果 <code>/stop</code> 也走 <code>_dispatch()</code>，
+      它会在 <code>async with lock</code> 处挂起，等待前一个任务释放锁——
+      而前一个任务正等着 <code>/stop</code> 来取消它。<strong>典型的死等</strong>
+      （不是死锁，因为 LLM 最终会返回，但用户体验上等于 <code>/stop</code> 失效）。
+    </p>
+    <p>
+      所以 <code>run()</code> 在第 3 道分流用 <code>_dispatch_command_inline(...)</code>
+      直接在调度循环里执行，不碰锁。对应的取消实现是
+      <code>_cancel_active_tasks(key)</code>（<code>loop.py:798</code>），
+      它遍历 <code>self._active_tasks[key]</code> 逐个 <code>task.cancel()</code>。
+    </p>
+    <p>
+      这也是为什么第 6 道分流那两行注释强调必须用 <code>effective_key</code> 登记任务——
+      登记的键和查找的键必须一致。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span><code>_dispatch()</code> 的 <code>finally</code> 块用 <code>is</code> 而不是 <code>in</code> 来判断该不该清理队列。构造一个具体的时序，说明如果写成 <code>if session_key in self._pending_queues: self._pending_queues.pop(...)</code> 会出什么 bug。</p>
+  </div>
+  <div class="ans">
+    <p><strong>会导致同一会话出现并发处理。</strong>时序如下：</p>
+    <div class="ascii">t0  任务A 拿到会话锁，注册 _pending_queues["tg:1"] = QueueA
+t1  任务A 的 _process_message 返回，进入 finally 前的收尾逻辑
+    （delivery.complete、automation coordinator 等，都是 await 点）
+t2  ← 事件循环切换 → 任务A 让出控制权
+t3  任务B 拿到会话锁（A 已退出 async with 的锁作用域）
+    覆盖 _pending_queues["tg:1"] = QueueB
+t4  → 切回任务A 的 finally
+    错误写法：`in` 判断为真 → pop 掉了 QueueB！
+t5  任务C 的消息到达调度循环
+    第 5 道分流检查 "tg:1" in self._pending_queues → False
+    → 误判为空闲 → asyncio.create_task(_dispatch(msgC))
+t6  任务C 与任务B 同时处理 "tg:1"</div>
+    <p>
+      后果是两个任务同时读写同一份会话历史：消息顺序错乱、
+      <code>_persist_turn</code> 互相覆盖（后写的把先写的新消息抹掉）、
+      并且 <code>/stop</code> 只能取消其中一个。
+    </p>
+    <p>
+      <code>is</code> 比较的正确性来自一个不变量：
+      <strong>每个 <code>_dispatch</code> 调用创建的 <code>pending</code> 队列对象都是独一无二的</strong>。
+      所以 <code>self._pending_queues.get(key) is pending</code> 成立，
+      就精确表示"字典里现在放的还是我注册的那个"。
+    </p>
+    <p>
+      顺带看 <code>else</code> 分支：<code>queue = pending</code>。
+      即使字典里的已经不是自己的，也仍然要把<strong>自己队列里</strong>的残留消息排空重发——
+      否则那些消息就真的丢了。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span><code>_build_turn</code> 里在调用 LLM 之前就把用户消息写盘（<code>_persist_user_message_early</code>）。这引入了一个"半个回合已持久化"的中间状态。请说明：(1) 这个状态如何被标记；(2) 如果进程在此刻崩溃，下次启动时如何恢复；(3) 为什么不用"写盘但打删除标记"这种更简单的方案。</p>
+  </div>
+  <div class="ans">
+    <p><strong>(1) 如何标记</strong></p>
+    <p>
+      靠 session metadata 里的一个标志位，由这三个方法维护
+      （<code>loop.py:2132</code>–<code>2141</code>）：
+      <code>_mark_pending_user_turn(session)</code> 打标记、
+      <code>_clear_pending_user_turn(session)</code> 清标记、
+      <code>_clear_runtime_checkpoint(session)</code> 清检查点。
+      正常回合走完 <code>save</code> 阶段后标记会被清掉。
+    </p>
+    <p><strong>(2) 如何恢复</strong></p>
+    <p>
+      在 <code>restore</code> 阶段的末尾，两个恢复动作依次执行：
+    </p>
+    <div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1664">
+<pre><code>        if self._restore_runtime_checkpoint(session):
+            self.sessions.save(session)
+        if self._restore_pending_user_turn(session):
+            self.sessions.save(session)</code></pre>
+    </div>
+    <p>
+      注意顺序：<strong>先恢复检查点，再恢复待处理的用户回合</strong>。
+      因为检查点里可能已经包含了部分 assistant/tool 消息，
+      它们在时间上早于"这个用户回合还没答完"这个结论。
+      两次恢复各自独立 <code>save</code>，保证任一步失败都不会留下半写状态。
+    </p>
+    <p><strong>(3) 为什么不用"软删除标记"</strong></p>
+    <p>三个理由：</p>
+    <ul>
+      <li>
+        <strong>存储格式不支持原地改。</strong> 会话是 <strong>JSONL</strong>，
+        写入方式是"全量重写 tmp 文件 + <code>os.replace</code>"（见第
+        <a href="07-memory.html">07 章</a>）。要给某条消息打删除标记，就得重写整个文件——
+        和现在的成本完全一样，没有省任何东西。
+      </li>
+      <li>
+        <strong>回放路径会被污染。</strong> 会话历史的读取者不止一个：
+        <code>get_history()</code> 喂给 LLM、Consolidator 做摘要、
+        <code>read_session</code> 工具给 agent 自己查、WebUI 渲染 transcript。
+        引入"软删除"意味着<strong>每个读取者都得记得过滤</strong>，
+        漏一个就是一个 bug。而现在的方案把复杂度收敛在 restore 阶段一处。
+      </li>
+      <li>
+        <strong>语义不同。</strong> "这条消息该删掉"和"这条消息已收到但还没回答"
+        是两件事。后者是有用信息——恢复时 agent 应该<strong>回答它</strong>，
+        而不是忘掉它。软删除表达不了"待处理"这个含义。
+      </li>
+    </ul>
+    <p>
+      这题的通用启示：<strong>选择状态表示时，先问"有几个读取者"</strong>。
+      读取者越多，越应该让不变量在<em>写入侧</em>成立，而不是要求每个读取侧都做过滤。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    <code>AgentLoop</code> = <strong>六道分流的调度器</strong> +
+    <strong>七阶段的回合流水线</strong> + <strong>TurnContext 这个状态载体</strong>。
+    它负责"什么时候、以什么上下文"调用 LLM，但真正的 ReAct 循环在下一章的
+    <code>AgentRunner</code> 里。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

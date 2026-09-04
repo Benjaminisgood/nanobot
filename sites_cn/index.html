@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanobot 源码精读 · 中文教学</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content wide">
+
+<div class="eyebrow">开始之前</div>
+<h1>nanobot 源码精读</h1>
+<p class="lede">
+  这是一份针对本仓库（<code>nanobot-ai</code> v0.3.0）的中文源码教学。每一章都是
+  <strong>真实源码 + 逐行讲解 + 重难点练习</strong>，代码片段全部逐字取自
+  <code>/Users/ben/Desktop/nanobot</code>，并标注了文件路径与行号，方便你一边读一边跳回编辑器验证。
+</p>
+
+<div class="callout tip">
+  <div class="t">这份教程怎么用</div>
+  <p>
+    不要从头到尾"读完"，而要<strong>边读边跳</strong>。每个代码块的头部都写着
+    <code>文件路径</code> 与 <code>行号范围</code>，建议在 Cursor 里同时打开对应文件，用
+    <kbd>Cmd+P</kbd> 跳转、<kbd>Cmd+Shift+F</kbd> 搜索关键符号。练习题请<strong>先自己想，再展开答案</strong>——
+    答案里通常藏着源码里最容易踩坑的那一行。
+  </p>
+</div>
+
+<h2 id="what">一、nanobot 是什么</h2>
+
+<p>
+  nanobot 是一个轻量级开源 AI Agent 框架：Python 后端 + React/TypeScript WebUI。它的核心是一个
+  <strong>很小的 agent 循环</strong>——从聊天渠道接收消息、调用 LLM、执行工具、管理会话记忆，然后把回复送回渠道。
+</p>
+
+<p>
+  它最值得学习的地方不是"功能多"，而是它在 <code>.agent/design.md</code> 里明确写下并真正执行了一条架构纪律：
+</p>
+
+<div class="callout key">
+  <div class="t">核心设计约束（Core stays small; extend at the edges）</div>
+  <p>
+    新能力应该通过 <code>channels/</code>、<code>tools/</code>、skills 或 MCP server 添加。
+    <code>agent/loop.py</code> 和 <code>agent/runner.py</code> 构成关键核心路径，对它们的改动必须最小且有充分理由。
+    如果一个特性可以放在渠道适配器、工具或外部 MCP server 里，就不应该内联进 agent 循环。
+  </p>
+  <p style="margin-bottom:0;color:var(--fg-soft);font-size:14px">
+    —— 原文见 <code>.agent/design.md</code>。这条纪律解释了本项目 90% 的目录结构决策，也是你读代码时最重要的地图。
+  </p>
+</div>
+
+<h3>规模速览</h3>
+
+<div class="grid three">
+  <div class="card">
+    <div class="n">CORE</div>
+    <h3>~4000 行</h3>
+    <p><code>agent/loop.py</code> (2344) + <code>agent/runner.py</code> (1670) 是全部核心链路。读懂这两个文件，就读懂了 nanobot。</p>
+  </div>
+  <div class="card">
+    <div class="n">EDGES</div>
+    <h3>18 个渠道</h3>
+    <p>Telegram、Discord、Slack、飞书、Matrix、企业微信、钉钉、邮件…… 全部自动发现，互不依赖。</p>
+  </div>
+  <div class="card">
+    <div class="n">TOOLS</div>
+    <h3>26 个模块</h3>
+    <p>文件系统、shell、搜索、web、MCP、cron、subagent、图片生成…… 全部通过 <code>pkgutil</code> 扫描注册。</p>
+  </div>
+  <div class="card">
+    <div class="n">PROVIDERS</div>
+    <h3>10+ 后端</h3>
+    <p>Anthropic、OpenAI 兼容、OpenAI Responses、Azure、Bedrock、Copilot、Codex、xAI…… 共享一个 2 方法抽象基类。</p>
+  </div>
+  <div class="card">
+    <div class="n">STYLE</div>
+    <h3>Python 3.11+</h3>
+    <p>全异步（asyncio），行宽 100，ruff 检查 E/F/I/N/W，basedpyright 严格类型检查。</p>
+  </div>
+  <div class="card">
+    <div class="n">CONFIG</div>
+    <h3>单文件配置</h3>
+    <p><code>~/.nanobot/config.json</code>，Pydantic 模型 + camelCase 别名，支持 <code>${ENV}</code> 引用。</p>
+  </div>
+</div>
+
+<h2 id="path">二、学习路线图</h2>
+
+<p>
+  这个项目的依赖方向非常清晰：<strong>边缘 → 总线 → 核心 → 能力层</strong>。
+  建议按下面三个梯度来读，每个梯度都能独立获得完整的心智模型。
+</p>
+
+<h3>梯度一：跑通一条消息（必读，约 90 分钟）</h3>
+<p>
+  目标：能在纸上画出"用户发一条 Telegram 消息，到收到回复"之间发生的所有函数调用。
+</p>
+<div class="grid two">
+  <a class="card" href="01-architecture.html">
+    <div class="n">01</div>
+    <h3>架构总览与数据流</h3>
+    <p>先建立全局地图：五层结构、依赖方向、一条消息的完整旅程。</p>
+    <div class="meta"><span>README.md</span><span>.agent/design.md</span></div>
+  </a>
+  <a class="card" href="02-bus.html">
+    <div class="n">02</div>
+    <h3>消息总线与事件模型</h3>
+    <p>44 行代码的 <code>MessageBus</code>，以及它为什么能解耦 18 个渠道。</p>
+    <div class="meta"><span>bus/queue.py</span><span>bus/events.py</span></div>
+  </a>
+  <a class="card" href="03-loop.html">
+    <div class="n">03</div>
+    <h3>AgentLoop：七阶段流水线</h3>
+    <p>调度器 + 会话锁 + 七个 stage。核心路径的"上半场"。</p>
+    <div class="meta"><span>agent/loop.py</span></div>
+  </a>
+  <a class="card" href="04-runner.html">
+    <div class="n">04</div>
+    <h3>AgentRunner：ReAct 循环</h3>
+    <p>真正的 agent 循环：迭代调用 LLM、执行工具、判断终止。</p>
+    <div class="meta"><span>agent/runner.py</span></div>
+  </a>
+</div>
+
+<h3>梯度二：理解能力层（进阶，约 2 小时）</h3>
+<p>
+  目标：能自己动手加一个新工具、接一个新 LLM 后端，并解释上下文为什么不会爆。
+</p>
+<div class="grid two">
+  <a class="card" href="05-providers.html">
+    <div class="n">05</div>
+    <h3>Provider 抽象层</h3>
+    <p>只有 2 个抽象方法的基类，如何撑起 10 多种 API 协议差异。</p>
+    <div class="meta"><span>providers/base.py</span><span>factory.py</span></div>
+  </a>
+  <a class="card" href="06-tools.html">
+    <div class="n">06</div>
+    <h3>工具系统</h3>
+    <p>Tool 协议、pkgutil 自动发现、JSON Schema 生成与三层校验。</p>
+    <div class="meta"><span>tools/base.py</span><span>loader.py</span><span>registry.py</span></div>
+  </a>
+  <a class="card" href="07-memory.html">
+    <div class="n">07</div>
+    <h3>记忆与上下文压缩</h3>
+    <p>JSONL + 原子写入 + fsync，Consolidator 与 Dream 两阶段整合。</p>
+    <div class="meta"><span>agent/memory.py</span><span>session/manager.py</span></div>
+  </a>
+  <a class="card" href="08-channels.html">
+    <div class="n">08</div>
+    <h3>渠道适配层</h3>
+    <p>manifest 懒加载、消息规范化、配对鉴权与发送重试。</p>
+    <div class="meta"><span>channels/base.py</span><span>manager.py</span></div>
+  </a>
+</div>
+
+<h3>梯度三：工程细节与运行时（选读，约 2 小时）</h3>
+<p>
+  第 11–16 章在侧栏「运行时 / 接入」分组里；卷末<strong>综合练习</strong>在侧栏底部的「总结」分组（第 17 章）。
+  原先编号 11 的综合练习已后移，避免和「系统提示与 Skills」抢同一个序号。
+</p>
+<div class="grid two">
+  <a class="card" href="09-config.html">
+    <div class="n">09</div>
+    <h3>配置与命令路由</h3>
+    <p>Pydantic 双命名兼容、配置迁移，以及三层斜杠命令路由表。</p>
+    <div class="meta"><span>config/schema.py</span><span>command/router.py</span></div>
+  </a>
+  <a class="card" href="10-security.html">
+    <div class="n">10</div>
+    <h3>安全边界</h3>
+    <p>工作区围栏、SSRF 防护、bwrap 沙箱、重复违规升级策略。</p>
+    <div class="meta"><span>security/</span><span>tools/shell.py</span></div>
+  </a>
+  <a class="card" href="11-context.html">
+    <div class="n">11</div>
+    <h3>系统提示与 Skills</h3>
+    <p>身份、bootstrap 文件、长期记忆、渐进式技能加载如何拼进 system prompt。</p>
+    <div class="meta"><span>agent/context.py</span><span>agent/skills.py</span></div>
+  </a>
+  <a class="card" href="12-gateway.html">
+    <div class="n">12</div>
+    <h3>Gateway 启动与定时任务</h3>
+    <p>一条 <code>nanobot gateway</code> 如何把 bus、loop、渠道、cron 装进同一个事件循环。</p>
+    <div class="meta"><span>cli/gateway_runtime.py</span></div>
+  </a>
+  <a class="card" href="13-subagent.html">
+    <div class="n">13</div>
+    <h3>子 Agent</h3>
+    <p><code>spawn</code> 工具、隔离工具集、完成后如何回注入主会话。</p>
+    <div class="meta"><span>agent/subagent.py</span><span>tools/spawn.py</span></div>
+  </a>
+  <a class="card" href="14-delivery.html">
+    <div class="n">14</div>
+    <h3>流式投递与回合生命周期</h3>
+    <p>TurnDelivery 如何把 delta 变成总线事件；ContextGovernor 如何保护持久化历史。</p>
+    <div class="meta"><span>turn_delivery.py</span><span>context_governance.py</span></div>
+  </a>
+  <a class="card" href="15-pairing.html">
+    <div class="n">15</div>
+    <h3>配对鉴权</h3>
+    <p>白名单、配对码、私聊 fail-closed，以及 <code>/pairing approve</code>。</p>
+    <div class="meta"><span>pairing/store.py</span><span>channels/base.py</span></div>
+  </a>
+  <a class="card" href="16-api.html">
+    <div class="n">16</div>
+    <h3>OpenAI 兼容 HTTP API</h3>
+    <p>同一套 AgentLoop，用 <code>process_direct</code> 暴露成 <code>/v1/chat/completions</code>。</p>
+    <div class="meta"><span>api/server.py</span></div>
+  </a>
+  <a class="card" href="17-exercises.html">
+    <div class="n">17</div>
+    <h3>综合练习与实战</h3>
+    <p>跨章节问答 + 三个动手任务 + 一条调试路线。检验你真的学会了。</p>
+    <div class="meta"><span>全仓库</span></div>
+  </a>
+</div>
+
+<h2 id="setup">三、环境准备</h2>
+
+<p>先把项目跑起来，读代码时才能随时下断点验证。以下命令来自仓库 <code>AGENTS.md</code>：</p>
+
+<div class="code" data-lang="shell" data-file="开发常用命令（AGENTS.md）">
+<pre><code># 安装依赖（含所有 extras 与开发依赖）
+uv sync --all-extras --dev
+
+# 跑单个测试 / 全部测试
+pytest tests/test_openai_api.py::test_function -v
+pytest
+
+# 代码检查
+ruff check nanobot/
+
+# 严格类型检查（与 CI 一致）
+uv run --no-sync python -m scripts.install_channel_dependencies --all-channels
+uv run --no-sync basedpyright
+
+# 启动网关（会同时提供 WebUI 与 API）
+nanobot gateway
+
+# WebUI 开发（把 /api、/webui、/auth 与 WebSocket 代理到网关 :8765）
+cd webui &amp;&amp; bun run dev
+cd webui &amp;&amp; bun run build   # 产物输出到 ../nanobot/web/dist
+cd webui &amp;&amp; bun run test</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">读源码前建议先做的一件事</div>
+  <p>
+    在 <code>nanobot/agent/loop.py</code> 的 <code>_run_turn_stage</code> 里已经有 stage 级别的
+    <code>logger.debug</code> 埋点。把日志级别调到 DEBUG，发一条消息，你会直接看到七个 stage 的耗时序列——
+    这是理解第 03 章最快的方式。
+  </p>
+</div>
+
+<h2 id="conventions">四、本站的约定</h2>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>元素</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>代码块顶部的 <code>path</code> 与 <code>L120–L160</code></td><td>该片段在仓库中的真实位置，逐字摘录，可直接跳转核对</td></tr>
+<tr><td><span style="color:var(--purple);font-weight:700">◆ 核心要点</span></td><td>本节必须记住的结论，通常是面试/复盘时会被追问的点</td></tr>
+<tr><td><span style="color:var(--danger);font-weight:700">▲ 易错点</span></td><td>初读时几乎必然误解的地方，或源码注释专门警告过的坑</td></tr>
+<tr><td><span style="color:var(--warn);font-weight:700">? 为什么这样设计</span></td><td>不解释"是什么"，解释"为什么不用更简单的写法"</td></tr>
+<tr><td><span style="color:var(--ok);font-weight:700">✓ 实用提示</span></td><td>动手调试、定位问题时能立刻用上的技巧</td></tr>
+<tr><td>练习卡片</td><td>分 <span style="color:var(--accent)">基础</span> / <span style="color:var(--warn)">进阶</span> / <span style="color:var(--danger)">挑战</span> 三档，答案默认折叠</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+  侧边栏的章节可以打勾记录进度（存在浏览器 localStorage，不上传任何数据）。
+  右上角可以切换亮色/暗色主题。
+</p>
+
+<h3>本地打开与源码校验</h3>
+
+<p>
+  直接双击 HTML 文件即可阅读（无 CDN 依赖、离线可用）。如果想让"复制"按钮正常工作，
+  建议起一个本地服务：
+</p>
+
+<div class="code" data-lang="shell" data-file="本地预览与校验">
+<pre><code># 本地预览
+cd sites_cn &amp;&amp; python3 -m http.server 8899
+# 然后打开 http://127.0.0.1:8899
+
+# 校验站内所有源码片段是否与仓库逐字一致（源码升级后跑一次）
+python3 sites_cn/tools/verify_snippets.py
+
+# 校验站点结构：章节齐全、无死链、骨架与练习格式正确
+python3 sites_cn/tools/check_site.py</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    <code>verify_snippets.py</code> 会把每个代码块的 <code>data-file</code> + <code>data-start</code>
+    与源文件对应行做<strong>逐字比对</strong>。这意味着当 nanobot 升级、行号漂移后，
+    你能立刻知道哪些教学片段失效了——教程不会悄悄变成错的。
+  </p>
+</div>
+
+<div class="callout">
+  <div class="t">准备好了？</div>
+  <p style="margin-bottom:0">
+    从 <a href="01-architecture.html"><strong>第 01 章：架构总览与数据流</strong></a> 开始，
+    先花 15 分钟建立全局地图，再往下深入。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

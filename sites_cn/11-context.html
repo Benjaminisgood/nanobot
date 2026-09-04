@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 系统提示与 Skills · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 11 章 · 运行时</div>
+<h1>系统提示与 Skills</h1>
+<p class="lede">
+  第 03 章的 <code>build</code> 阶段会调用 <code>ContextBuilder.build_messages()</code>。
+  这一章拆开那一步：<strong>模型每一轮真正看到的 system prompt 是怎么拼出来的</strong>，
+  以及 Skills 如何做到「目录进提示、正文按需加载」。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="stack">一、system prompt 的分层栈</h2>
+
+<p>
+  <code>ContextBuilder</code>（<code>agent/context.py</code>）不负责对话历史——历史来自
+  <code>session.get_history()</code>（<a href="07-memory.html">07 章</a>）。
+  它只组装<strong>每轮都会重建</strong>的那一段 system 文本：
+</p>
+
+<div class="ascii">build_system_prompt()
+  1. identity.md          身份 + 工作区路径 + 平台策略
+  2. AGENTS.md / SOUL.md / USER.md   项目与人格 bootstrap
+  3. tool_contract.md     工具使用契约
+  4. MEMORY.md            长期记忆（若已定制）
+  5. Active Skills        always=true 或用户 $skill-name 点名的全文
+  6. skills_section.md    其余技能的「目录摘要」
+  7. Recent History       history.jsonl 里 Dream 尚未消化的条目
+  8. [Archived Context Summary]  本轮 compact 留下的会话摘要
+
+各段用 "---" 连接，再作为 role=system 的第一条消息。</div>
+
+<p>拼装顺序就写在这一个函数里：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/context.py" data-start="82">
+<pre><code>    def build_system_prompt(
+        self,
+        *,
+        active_skill_names: Sequence[str] | None = None,
+        channel: str | None = None,
+        session_summary: str | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+        include_memory_recent_history: bool = True,
+        session_key: str | None = None,
+        unified_session: bool = False,
+    ) -> str:
+        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        root = workspace or self.workspace
+        parts = [self._get_identity(channel=channel, workspace=root)]
+
+        bootstrap = self._load_bootstrap_files(root)
+        if bootstrap:
+            parts.append(bootstrap)
+
+        parts.append(render_template("agent/tool_contract.md"))
+
+        if include_memory:
+            memory = self.memory.read_memory()
+            if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
+                parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    system prompt <strong>不是一份写死的常量</strong>。它每轮根据工作区文件、Dream 进度、
+    用户有没有写 <code>$cron</code> 这类引用而变化。这也是为什么
+    <code>build</code> 阶段必须在 <code>run</code> 之前：Runner 拿到的
+    <code>initial_messages[0]</code> 已经是本轮定制过的提示。
+  </p>
+</div>
+
+<h2 id="bootstrap">二、Bootstrap 文件：人格写在工作区里</h2>
+
+<p>
+  三个文件名写在类常量 <code>BOOTSTRAP_FILES</code> 里，但加载时<strong>根目录并不相同</strong>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/context.py" data-start="183">
+<pre><code>    def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
+        """Load project instructions plus the agent's global profile files."""
+        parts: list[str] = []
+        project_root = workspace or self.workspace
+        sources = [
+            ("AGENTS.md", project_root),
+            ("SOUL.md", self.workspace),
+            ("USER.md", self.workspace),
+        ]
+
+        for filename, root in sources:
+            file_path = root / filename
+            if file_path.exists():
+                content = file_path.read_text(encoding="utf-8")
+                if filename == "SOUL.md" and self._is_template_content(
+                    content,
+                    "legacy/SOUL.md",
+                ):
+                    content = load_bundled_template("SOUL.md") or content
+                if not content.strip():
+                    continue
+                if filename in self._SKIPPABLE_DEFAULTS and self._is_template_content(
+                    content, filename
+                ):
+                    continue
+                parts.append(f"## {filename}\n\n{content}")</code></pre>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>文件</th><th>读取根</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><code>AGENTS.md</code></td><td><code>project_root</code>（当前会话工作区）</td><td>这个项目的操作手册，随项目走</td></tr>
+<tr><td><code>SOUL.md</code></td><td><code>self.workspace</code>（agent 全局工作区）</td><td>人格 / 价值观，Dream 会改它</td></tr>
+<tr><td><code>USER.md</code></td><td>同上全局工作区</td><td>关于用户的长期笔记</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：未定制的模板会被跳过</div>
+  <p>
+    <code>_SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}</code>。
+    如果文件内容和打包模板逐字相同，<code>_is_template_content</code> 为真，这段<strong>不会进 prompt</strong>。
+    避免把「还没写过的占位文档」浪费上下文窗口。
+    <code>SOUL.md</code> 走另一条路：若仍是 legacy 模板，会换成打包的新模板再注入。
+  </p>
+</div>
+
+<h2 id="skills">三、Skills：目录进提示，正文按需加载</h2>
+
+<p>
+  Skill 是带 YAML frontmatter 的 <code>SKILL.md</code>，目录结构是
+  <code>skills/&lt;name&gt;/SKILL.md</code>。查找顺序：工作区覆盖内置——同名时工作区赢。
+</p>
+
+<h3>两种进入 prompt 的方式</h3>
+
+<p><strong>Always-on</strong>：frontmatter 里 <code>always: true</code>（或 nanobot 元数据块里的 always）。</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/skills.py" data-start="259">
+<pre><code>    def get_always_skills(self) -> list[str]:
+        """Get skills marked as always=true that meet requirements."""
+        return [
+            entry["name"]
+            for entry in self.list_skills(filter_unavailable=True)
+            if (meta := self.get_skill_metadata(entry["name"]) or {})
+            and (
+                self._parse_nanobot_metadata(meta.get("metadata")).get("always")
+                or meta.get("always")
+            )
+        ]</code></pre>
+</div>
+
+<p><strong>显式点名</strong>：用户消息里写 <code>$cron</code>、<code>$github</code>。正则是 <code>$</code> 后跟标识符：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/skills.py" data-start="113">
+<pre><code>    def get_explicitly_invoked_skills(self, text: str) -> list[str]:
+        """Resolve ``$skill-name`` references to enabled, available skills."""
+        if not text:
+            return []
+        available = {
+            entry["name"]
+            for entry in self.list_skills(filter_unavailable=True)
+        }
+        invoked: list[str] = []
+        for match in _SKILL_REFERENCE.finditer(text):
+            name = match.group(1)
+            if name in available and name not in invoked:
+                invoked.append(name)
+        return invoked</code></pre>
+</div>
+
+<p>
+  调用点在 <code>build_messages()</code>（<code>context.py:238-241</code>）：只有当前消息
+  <code>role == "user"</code> 时才扫描。点名的 skill 全文进
+  <code># Active Skills</code>；其余 skill 只出现在摘要里。
+</p>
+
+<div class="callout why">
+  <div class="t">? 为什么不全文塞进每一次请求</div>
+  <p>
+    内置 skills 有 cron、github、image-generation、weather……全部正文会吃掉几千 token。
+    摘要告诉模型「有这个技能、描述是什么、文件在哪」，模型需要细节时用
+    <code>read_file</code> 去读 <code>SKILL.md</code>。这就是注释里说的
+    <em>progressive loading</em>（<code>skills.py:132-133</code>）。
+  </p>
+</div>
+
+<p>
+  不可用的 skill（缺二进制、缺环境变量）仍会出现在摘要里，但带
+  <code>(unavailable: …)</code> 后缀，避免模型去调用做不到的能力。
+</p>
+
+<h2 id="messages">四、拼成 messages 列表</h2>
+
+<p>
+  <code>build_messages()</code> 把 system + history + 当前用户消息拼在一起。
+  若 history 最后一条已经是 user，就把当前内容<strong>合并</strong>进去，而不是再 append——
+  防止 OpenAI 兼容接口拒绝「连续两条 user」。
+  这和第 04 章 Runner 注入队列时的合并是同一条不变量。
+</p>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    想看某一轮真正送给模型的 system prompt：在
+    <code>AgentLoop._build_initial_messages</code>（<code>loop.py:721</code>）下断点，
+    打印 <code>initial_messages[0]["content"][:2000]</code>。
+    比猜「配置里哪一项生效了」快得多。
+  </p>
+</div>
+
+<h2 id="quiz">五、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>用户工作区里的 <code>AGENTS.md</code> 还是安装时拷出来的默认模板，一字未改。它会进入 system prompt 吗？</p>
+  </div>
+  <div class="ans">
+    <p><strong>不会。</strong></p>
+    <p>
+      <code>AGENTS.md</code> 在 <code>_SKIPPABLE_DEFAULTS</code> 里。
+      <code>_is_template_content(content, "AGENTS.md")</code> 为真时 <code>continue</code>。
+      改一个字就会注入。这是为了省 token，不是 bug。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>用户发「帮我看看 $cron 和 $cron」。Active Skills 里会出现几次 cron 全文？</p>
+  </div>
+  <div class="ans">
+    <p><strong>一次。</strong></p>
+    <p>
+      <code>get_explicitly_invoked_skills</code> 用 <code>name not in invoked</code> 去重，
+      再交给 <code>load_skills_for_context</code>。always 列表里若已有 cron，
+      <code>build_system_prompt</code> 的 extend 循环也会跳过重复名。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>为什么 <code>AGENTS.md</code> 从 <code>project_root</code> 读，而 <code>SOUL.md</code> 从 <code>self.workspace</code> 读？如果两个路径相同会发生什么？</p>
+  </div>
+  <div class="ans">
+    <p>
+      多项目 / 多工作区时，agent 全局人格（SOUL、USER、Dream 维护的 MEMORY）应跨项目稳定；
+      当前项目的操作手册（AGENTS.md）应随 <code>WorkspaceScope.project_path</code> 变化。
+    </p>
+    <p>
+      默认单工作区时两者相同，三个文件都从 <code>~/.nanobot/workspace/</code> 读，行为退化成「一堆 markdown 进 prompt」。
+      这是有意的：简单部署零配置，复杂部署才显现路径分叉。
+    </p>
+  </div>
+</div>
+
+<div class="callout key" id="chapter-summary">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    提示词工程在 nanobot 里主要是<strong>文件布局</strong>：identity 模板 + 工作区 markdown + 渐进式 skills。
+    下一章看这些东西是在哪个进程里被装起来的——Gateway。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 记忆与上下文压缩 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 07 章 · 能力层</div>
+<h1>记忆与上下文压缩</h1>
+<p class="lede">
+  第 03 章的 <code>build</code> 阶段会在调 LLM 前压缩会话；第 04 章的 Runner 只消费
+  <code>get_history()</code> 返回的消息列表。这一章我们读<strong>记忆到底存在哪、怎么写盘、
+  怎么压缩、压缩后 LLM 还能看到什么</strong>——横跨 <code>memory.py</code>、
+  <code>session/manager.py</code>、<code>autocompact.py</code> 与 <code>goal_state.py</code>。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="layers">一、三层存储：活会话、归档、长期知识</h2>
+
+<p>
+  nanobot 不把"记忆"塞进一个巨型文件。它按<strong>生命周期</strong>分成三层，
+  每层有不同的读写模式和崩溃语义：
+</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>层</th><th>路径</th><th>格式</th><th>职责</th></tr></thead>
+<tbody>
+<tr>
+  <td>会话 transcript</td>
+  <td><code>{workspace}/sessions/{base64url(session_key)}.jsonl</code></td>
+  <td>JSONL</td>
+  <td>当前会话的完整消息流 + metadata + 可选 provider_state</td>
+</tr>
+<tr>
+  <td>压缩归档</td>
+  <td><code>{workspace}/memory/history.jsonl</code></td>
+  <td>append-only JSONL（带 cursor）</td>
+  <td>Consolidator 把旧消息摘要后追加到这里</td>
+</tr>
+<tr>
+  <td>长期知识</td>
+  <td><code>SOUL.md</code> / <code>USER.md</code> / <code>memory/MEMORY.md</code></td>
+  <td>Markdown</td>
+  <td>Dream 阶段二编辑的 durable memory，Git 跟踪变更</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<p>
+  默认 workspace 是 <code>~/.nanobot/workspace/</code>（<code>config/paths.py:51-54</code>）。
+  会话文件名的编码逻辑在 <code>JsonlSessionStore.storage_key()</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/session/manager.py" data-start="532">
+<pre><code>    def storage_key(key: str) -> str:
+        return base64.urlsafe_b64encode(key.encode()).decode().rstrip("=")</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么不能直接用 session_key 当文件名</div>
+  <p>
+    典型 session_key 形如 <code>telegram:123456:topic:7</code>，含冒号 <code>:</code>。
+    在 Windows 上冒号是非法文件名字符；在 POSIX 上虽然合法，但路径解析和 shell 转义都会踩坑。
+    base64url 编码把任意 UTF-8 字符串映射成文件名安全字符，且<strong>可逆</strong>——
+    <code>decode_storage_key()</code> 能从文件名还原原始 key。
+  </p>
+  <p style="margin-bottom:0">
+    同文件里还有一个 <code>safe_key()</code>（把 <code>:</code> 替换成 <code>_</code>），
+    那是<strong>遗留路径</strong>的兼容方案；新写入一律走 base64url。
+  </p>
+</div>
+
+<h2 id="jsonl">二、JSONL 会话文件结构</h2>
+
+<p>
+  每个 <code>.jsonl</code> 文件的第一行<strong>固定</strong>是 metadata 记录，
+  可选第二行是 provider_state，之后才是消息行。写入逻辑在 <code>JsonlSessionStore.save()</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/session/manager.py" data-start="728">
+<pre><code>    def save(self, session: Session, *, fsync: bool = False) -> None:
+        path = self.get_session_path(session.key)
+        tmp_path = path.with_suffix(".jsonl.tmp")
+
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "key": session.key,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                    "last_consolidated": session.last_consolidated,
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                if session.provider_state is not None:
+                    provider_state_line = {
+                        "_type": _PROVIDER_STATE_RECORD_TYPE,
+                        "state": session.provider_state.to_private_record(),
+                    }
+                    f.write(json.dumps(provider_state_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                if fsync:
+                    f.flush()
+                    os.fsync(f.fileno())
+
+            os.replace(tmp_path, path)
+
+            if fsync:
+                with suppress(PermissionError):
+                    fd = os.open(str(path.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    except OSError as exc:
+                        if exc.errno != errno.EINVAL:
+                            raise
+                    finally:
+                        os.close(fd)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise</code></pre>
+</div>
+
+<p>
+  注意 <code>last_consolidated</code> 写在 metadata 行里——它是<strong>归档进度指针</strong>，
+  不是"删掉了多少条消息"的计数器。后面第七节会讲它如何影响 <code>get_history()</code>。
+</p>
+
+<h2 id="atomic">三、原子写入 + fsync：本章核心机制</h2>
+
+<p>
+  会话和归档文件都走同一套模式：<strong>写临时文件 → flush + fsync → os.replace</strong>。
+  归档侧的完整实现在 <code>MemoryStore._write_entries()</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/memory.py" data-start="510">
+<pre><code>    def _write_entries(self, entries: list[dict[str, Any]]) -> None:
+        """Overwrite history.jsonl with the given entries (atomic write)."""
+        tmp_path = self.history_file.with_suffix(self.history_file.suffix + ".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.history_file)
+
+            # fsync the directory so the rename is durable.
+            # On Windows, opening a directory with O_RDONLY raises
+            # PermissionError — skip the dir sync there (NTFS
+            # journals metadata synchronously).
+            with suppress(PermissionError):
+                fd = os.open(str(self.history_file.parent), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise</code></pre>
+</div>
+
+<p>四个要点，缺一不可：</p>
+
+<ol>
+  <li>
+    <strong>写 tmp → <code>os.replace</code>。</strong>
+    崩溃时读者要么看到旧版完整文件，要么看到新版完整文件——
+    不会出现"写到一半"的损坏 JSONL。异常时 <code>tmp_path.unlink(missing_ok=True)</code> 清理垃圾。
+  </li>
+  <li>
+    <strong><code>f.flush()</code> + <code>os.fsync(f.fileno())</code>。</strong>
+    <code>flush</code> 只把 Python 缓冲推到 OS 页缓存；<code>fsync</code> 才保证数据真正落盘。
+    没有 fsync，进程被 kill 后可能丢最后几 KB。
+  </li>
+  <li>
+    <strong>目录 fsync。</strong>
+    POSIX 下 <code>rename</code> 本身不保证跨崩溃可见——目录项更新也需要 fsync。
+    这是 SQLite、LevelDB 等成熟存储的通用做法。
+  </li>
+  <li>
+    <strong>Windows 例外。</strong>
+    目录 O_RDONLY 会 <code>PermissionError</code>，用 <code>suppress</code> 跳过；
+    NTFS 对元数据日志同步写入，实践中可接受。
+  </li>
+</ol>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：性能与耐久性的权衡</div>
+  <p>
+    会话侧 <code>save(session, fsync=False)</code> 是<strong>默认热路径</strong>——
+    每个回合可能写盘多次，每次都 fsync 会显著拖慢响应。
+    关机时 <code>SessionManager.flush_all()</code> 才强制 <code>fsync=True</code>：
+  </p>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/session/manager.py" data-start="1134">
+<pre><code>    def flush_all(self) -> int:
+        """Re-save every cached session with fsync for durable shutdown.
+
+        Returns the number of sessions flushed.  Errors on individual
+        sessions are logged but do not prevent other sessions from being
+        flushed.
+        """
+        flushed = 0
+        cached = dict(self._overflow_cache.items())
+        cached.update(self._cache)
+        for key, session in cached.items():
+            try:
+                self.save(session, fsync=True)
+                flushed += 1
+            except Exception:
+                logger.warning("Failed to flush session {}", key, exc_info=True)
+        return flushed</code></pre>
+</div>
+
+<p>
+  设计取舍：<strong>正常运行时容忍"最后一秒"的数据丢失风险，优雅关机时补齐耐久性。</strong>
+  第 03 章调试技巧里提到 <code>save</code> 阶段慢通常是 fsync——
+  如果你在生产环境强制每次 fsync，latency 会明显上升。
+</p>
+
+<h2 id="dream">四、Dream 两阶段记忆整合</h2>
+
+<p>
+  AGENTS.md 称这套机制为 "Dream two-phase memory consolidation"。
+  文档详见 <code>docs/memory.md:28-63</code>。数据流如下：
+</p>
+
+<div class="ascii">阶段一 Consolidator（热路径，回合内/回合后触发）
+  session.messages[0 .. last_consolidated)
+       │  LLM 摘要（失败则 raw_archive 降级）
+       ▼
+  memory/history.jsonl  ← append-only，每条带 cursor
+       │  推进 session.last_consolidated 指针
+       ▼
+  session.messages 文件里消息仍在，但 get_history() 不再回放旧段
+
+阶段二 Dream（冷路径，cron 默认每 2h / 手动 /dream）
+  history.jsonl（cursor &gt; .dream_cursor）
+       │  build_dream_prompt() 嵌入 SOUL/USER/MEMORY 当前内容
+       │  受限工具集：Read / Edit / Write / ApplyPatch
+       ▼
+  编辑 SOUL.md / USER.md / memory/MEMORY.md
+       │  set_last_dream_cursor() 推进
+       │  Git 提交 + compact_history() 裁剪旧归档
+       ▼
+  长期知识文件更新完毕</div>
+
+<h3>4.1 阶段一：Consolidator.archive()</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/memory.py" data-start="992">
+<pre><code>    async def archive(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        runtime: LLMRuntime,
+        session_key: str | None = None,
+        summary_messages: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Summarize messages and append the result to history.jsonl.
+
+        ``summary_messages`` adds context but is excluded from raw fallback.
+        """
+        if not messages:
+            return None
+        messages_to_summarize = public_history_messages(
+            summary_messages if summary_messages is not None else messages
+        )
+        formatted = MemoryStore._format_messages(messages_to_summarize)
+        formatted = self._truncate_to_token_budget(formatted, runtime=runtime)
+        system_prompt = render_template(
+            "agent/consolidator_archive.md",
+            strip=True,
+        )
+        try:
+            response = await runtime.provider.chat_with_retry(
+                model=runtime.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {"role": "user", "content": formatted},
+                ],
+                tools=None,
+                tool_choice=None,
+                temperature=runtime.generation.temperature,
+                max_tokens=runtime.generation.max_tokens,
+                reasoning_effort=runtime.generation.reasoning_effort,
+            )
+        except Exception:
+            logger.warning("Consolidation provider call failed, raw-dumping to history")
+            self.store.raw_archive(messages, session_key=session_key)
+            return None
+        if response.finish_reason == "error":
+            logger.warning("Consolidation provider returned an error, raw-dumping to history")
+            self.store.raw_archive(messages, session_key=session_key)
+            return None
+        summary = response.content or "[no summary]"
+        self.store.append_history(
+            summary,
+            max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+            session_key=session_key,
+        )
+        return summary</code></pre>
+</div>
+
+<p>
+  LLM 失败时不会丢消息——<code>raw_archive</code> 把原文 dump 进 history.jsonl。
+  触发点有三处： <code>_build_turn</code> 里调 <code>maybe_consolidate_by_tokens</code>（<code>loop.py:1743-1748</code>）、
+  回合结束后台再跑一次（<code>loop.py:1919-1927</code>）、以及 TTL 空闲压缩（第八节）。
+</p>
+
+<h3>4.2 阶段二：Dream prompt 与完成判定</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/memory.py" data-start="582">
+<pre><code>    def build_dream_prompt(self, *, max_entries: int = 20) -> tuple[str, int] | None:
+        """Build the Dream prompt with unprocessed history context.
+
+        Returns ``(prompt, last_cursor)`` or ``None`` if nothing to process.
+
+        The current contents of the durable memory files (SOUL.md, USER.md,
+        memory/MEMORY.md) are embedded so the model edits the real files rather
+        than a stale mental model — eliminating a class of failed/out-of-bounds
+        edits that previously produced hallucinated audit records.
+        """
+        last_cursor = self.get_last_dream_cursor()
+        entries = self.read_unprocessed_history(since_cursor=last_cursor)
+        if not entries:
+            return None
+
+        batch = entries[:max_entries]
+        history_text = "\n".join(
+            f"[{e['timestamp']}] {truncate_text(e['content'], 1000)}"
+            for e in batch
+        )
+        template = self._dream_template()
+        files_section = self._render_current_memory_files()
+        prompt = (
+            f"{template}\n\n{files_section}\n\n"
+            f"## Conversation History\n{history_text}"
+        )
+        return (prompt, batch[-1]["cursor"])</code></pre>
+</div>
+
+<p>
+  docstring 里那句 "edits the real files rather than a stale mental model" 是关键设计决策——
+  Dream 必须把<strong>当前文件内容</strong>嵌进 prompt，否则模型会基于过时的 mental model 做无效编辑。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/memory.py" data-start="685">
+<pre><code>    @staticmethod
+    def dream_run_completed(
+        resp: object | None,
+        *,
+        had_tool_errors: bool = False,
+    ) -> bool:
+        """Return True only when a Dream turn completed without tool failures."""
+        metadata = getattr(resp, "metadata", None)
+        if had_tool_errors or not isinstance(metadata, dict):
+            return False
+        return cast(dict[str, Any], metadata).get("_stop_reason") == "completed"</code></pre>
+</div>
+
+<p>
+  Dream 默认每 2 小时由 cron 触发（<code>DreamConfig.interval_h</code>，<code>schema.py:59</code>），
+  也可手动 <code>/dream</code> 或 gateway cron 回调（<code>cli/gateway_runtime.py:507-562</code>）。
+</p>
+
+<h2 id="triggers">五、五个压缩触发器</h2>
+
+<p>
+  五个触发器共用同一个 <code>Consolidator</code> 引擎，但入口和条件不同：
+</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>触发器</th><th>条件</th><th>位置</th></tr></thead>
+<tbody>
+<tr>
+  <td>Token 预算</td>
+  <td>估算 prompt tokens ≥ <code>context_window - max_tokens - 1024</code>，目标压到 <code>budget × consolidation_ratio</code>（默认 0.5）；最多 <code>_MAX_CONSOLIDATION_ROUNDS = 5</code> 轮</td>
+  <td><code>maybe_consolidate_by_tokens</code>（<code>memory.py:1047</code> 起）</td>
+</tr>
+<tr>
+  <td>Replay 窗口溢出</td>
+  <td>未归档消息数 &gt; <code>replay_max_messages</code>（= <code>context_window // 100</code>，最小 120 最大 2000）</td>
+  <td><code>manager.py:74-80</code>、Consolidator 内部</td>
+</tr>
+<tr>
+  <td>Idle TTL</td>
+  <td>空闲 ≥ N 分钟（配置键 <code>idleCompactAfterMinutes</code>，默认 15，0=禁用）</td>
+  <td><code>autocompact.py</code>（第八节）</td>
+</tr>
+<tr>
+  <td>文件消息上限</td>
+  <td><code>FILE_MAX_MESSAGES = 2000</code></td>
+  <td><code>manager.py:36</code>、<code>enforce_file_cap()</code></td>
+</tr>
+<tr>
+  <td>history.jsonl 上限</td>
+  <td>1000 条（<code>_DEFAULT_MAX_HISTORY</code>）</td>
+  <td><code>memory.py:76</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1743">
+<pre><code>        if not ctx.ephemeral:
+            await self.consolidator.maybe_consolidate_by_tokens(
+                session,
+                runtime=runtime,
+                replay_max_messages=replay_max_messages,
+            )</code></pre>
+</div>
+
+<h2 id="boundary">六、压缩边界只在 user turn 处切</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/memory.py" data-start="838">
+<pre><code>    def pick_consolidation_boundary(
+        self,
+        session: Session,
+        tokens_to_remove: int,
+    ) -> tuple[int, int] | None:
+        """Pick a user-turn boundary that removes enough old prompt tokens."""
+        start = session.last_consolidated
+        if start >= len(session.messages) or tokens_to_remove &lt;= 0:
+            return None
+
+        removed_tokens = 0
+        last_boundary: tuple[int, int] | None = None
+        for idx in range(start, len(session.messages)):
+            message = session.messages[idx]
+            if idx &gt; start and message.get("role") == "user":
+                last_boundary = (idx, removed_tokens)
+                if removed_tokens &gt;= tokens_to_remove:
+                    return last_boundary
+            removed_tokens += estimate_message_tokens(message)
+
+        return last_boundary</code></pre>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：为什么不能从任意消息处切断</div>
+  <p>
+    OpenAI/Anthropic 的消息序列有合法性约束：每个 <code>assistant</code> 消息的
+    <code>tool_calls</code> 必须紧跟着对应数量的 <code>role="tool"</code> 结果。
+    如果在 tool-call 序列中间切断并归档前半段，剩余消息的序列就<strong>非法</strong>——
+    API 直接 400 拒绝。
+  </p>
+  <p style="margin-bottom:0">
+    所以边界只能选在 <code>role == "user"</code> 处——那是自然的新回合起点。
+    第 03 章注入队列的"安全注入点"也是同一类约束的不同侧面。
+  </p>
+</div>
+
+<h2 id="replay">七、压缩后「给 LLM 看什么」</h2>
+
+<p>
+  关键洞察：<strong>压缩不是删掉 JSONL 里的消息，而是移动 <code>last_consolidated</code> 指针 +
+  保留最小可回放后缀。</strong>
+  核心逻辑在 <code>Session.get_history()</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/session/manager.py" data-start="197">
+<pre><code>    def get_history(
+        self,
+        max_messages: int = FILE_MAX_MESSAGES,
+        *,
+        max_tokens: int = 0,
+        extend_to_user: bool = False,
+        include_runtime_context: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return recent replayable messages for LLM input.
+
+        History is sliced by message count first (``max_messages``), then by
+        token budget from the tail (``max_tokens``) when provided.
+        """
+        replay_start = self.last_consolidated
+        if replay_start:
+            # ``last_consolidated`` is archive progress, not a replay boundary.
+            # Keep a small raw suffix for continuity, extending back to the user
+            # that started an assistant/tool sequence when necessary.
+            recent_start = recent_message_start_index(
+                self.messages,
+                MIN_COMPACTED_REPLAY_MESSAGES,
+                extend_to_user=True,
+            )
+            replay_start = min(replay_start, recent_start)
+
+        replayable = self.messages[replay_start:]
+        max_messages = max_messages if max_messages &gt; 0 else FILE_MAX_MESSAGES
+        unarchived_count = len(self.messages) - self.last_consolidated
+        if replay_start &lt; self.last_consolidated and unarchived_count &lt; max_messages:
+            # The archived replay suffix can exceed the nominal count when one
+            # tool-heavy turn spans the boundary. Preserve that complete turn.
+            start_idx = 0
+        else:
+            start_idx = recent_message_start_index(
+                replayable,
+                max_messages,
+                extend_to_user=extend_to_user,
+            )
+        sliced = replayable[start_idx:]</code></pre>
+</div>
+
+<p>读这段代码的三个要点：</p>
+
+<ol>
+  <li>
+    <strong><code>last_consolidated</code> 是归档进度指针，不是 replay 边界。</strong>
+    即使已归档，也至少保留 <code>MIN_COMPACTED_REPLAY_MESSAGES = 8</code> 条尾部消息（<code>manager.py:39</code>）。
+  </li>
+  <li>
+    <strong><code>recent_message_start_index(..., extend_to_user=True)</code></strong>
+    会回溯到起始 user 消息，避免从 assistant/tool 序列中间开始回放。
+  </li>
+  <li>
+    后续还有 <code>find_legal_message_start(sliced)</code>（<code>manager.py:247-250</code>）
+    清理开头的孤立 tool result。
+  </li>
+</ol>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p style="margin-bottom:0">
+    文件里 2000 条消息，LLM 可能只看到最后 120 条——
+    但中间被"跳过"的消息已经摘要进了 <code>history.jsonl</code>，
+    Dream 阶段二会进一步提炼进 Markdown 长期知识。
+    <strong>三层存储 + 指针语义</strong>让"压缩"对上层透明。
+  </p>
+</div>
+
+<h2 id="ttl">八、TTL 自动压缩的真实位置</h2>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：不在 session/manager.py</div>
+  <p style="margin-bottom:0">
+    空闲压缩实现在 <code>nanobot/agent/autocompact.py</code>，
+    由 <code>AgentLoop._check_expired_sessions_if_due()</code>（<code>loop.py:1142-1152</code>）
+    在调度循环的 1 秒超时心跳里周期调用——和第 03 章讲的"心跳设计"是同一套机制。
+  </p>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1142">
+<pre><code>    def _check_expired_sessions_if_due(self) -> None:
+        """Scan idle sessions no more often than the configured interval."""
+        now = time.monotonic()
+        if now &lt; self._next_idle_compact_check_at:
+            return
+        self._next_idle_compact_check_at = now + self._idle_compact_check_interval_s
+        self.auto_compact.check_expired(
+            self.schedule_background,
+            self.runtime_for_session,
+            active_session_keys=self._pending_queues.keys(),
+        )</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/autocompact.py" data-start="30">
+<pre><code>    def _is_expired(self, ts: datetime | str | None,
+                    now: datetime | None = None) -> bool:
+        if self._ttl &lt;= 0 or not ts:
+            return False
+        try:
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts)
+            current = now or datetime.now()
+            if getattr(ts, "tzinfo", None) is not None or current.tzinfo is not None:
+                idle_seconds = current.timestamp() - ts.timestamp()
+            else:
+                idle_seconds = (current - ts).total_seconds()
+        except (OSError, OverflowError, TypeError, ValueError):
+            # list_sessions() forwards raw persisted metadata; an unusable value
+            # must not escape the idle scan and stop the agent loop.
+            return False
+        return idle_seconds &gt;= self._ttl * 60</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/autocompact.py" data-start="60">
+<pre><code>    def check_expired(
+        self,
+        schedule_background: Callable[[Coroutine[Any, Any, None]], None],
+        resolve_runtime: Callable[[Session], LLMRuntime],
+        active_session_keys: Collection[str] = (),
+    ) -> None:
+        """Schedule archival for idle sessions, skipping those with in-flight agent tasks."""
+        now = datetime.now()
+        for info in self.sessions.list_sessions():
+            key = info.get("key", "")
+            if not key or self._is_internal_session(key) or key in self._archiving:
+                continue
+            if key in active_session_keys:
+                continue
+            updated_at = info.get("updated_at")
+            if self._is_expired(updated_at, now) and self._has_unarchived_messages(key):
+                session = self.sessions.get_or_create(key)
+                try:
+                    runtime = resolve_runtime(session)
+                except (KeyError, ValueError):
+                    # Invalid session selections remain recoverable through /model.
+                    continue
+                self._archiving.add(key)
+                schedule_background(self._archive(key, runtime=runtime))</code></pre>
+</div>
+
+<p>
+  <code>check_expired</code> 会跳过三类 session：<code>dream:</code> 前缀的内部会话、
+  正在归档中的（<code>_archiving</code> 集合）、以及有活跃 agent task 的（<code>active_session_keys</code>
+  来自 <code>_pending_queues.keys()</code>）。
+  配置项 <code>idleCompactAfterMinutes</code> 默认 15 分钟（<code>schema.py:150-155</code>），
+  设 0 禁用。
+</p>
+
+<h2 id="goal">九、持续目标状态机（sustained goal）</h2>
+
+<p>
+  除了对话记忆，session metadata 里还存<strong>持续目标</strong>状态，
+  键名 <code>goal_state</code>。创建时结构如下（<code>long_task.py:222-227</code>）：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/long_task.py" data-start="222">
+<pre><code>        blob = {
+            "status": "active",
+            "objective": objective_text,
+            "ui_summary": summary,
+            "started_at": _iso_now(),
+        }</code></pre>
+</div>
+
+<p>状态转换（<code>long_task.py:348-364</code>）：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/long_task.py" data-start="348">
+<pre><code>        ended = _iso_now()
+        status = {
+            "complete": "completed",
+            "cancel": "cancelled",
+            "block": "blocked",
+        }[normalized]
+        blob = {
+            **prior,
+            "status": status,
+            "ended_at": ended,
+            "recap": (recap or "").strip(),
+        }
+        if normalized == "complete":
+            blob["completed_at"] = ended
+        self._save_goal_state(sess, blob)
+        revoke_goal_mutation_permission()
+        await self._publish_goal_state_changed(sess.metadata)</code></pre>
+</div>
+
+<p>运行时影响：</p>
+
+<ul>
+  <li>
+    <code>sustained_goal_active()</code>（<code>goal_state.py:41-44</code>）判定是否 active
+  </li>
+  <li>
+    active 时 <code>runner_wall_llm_timeout_s()</code> 返回 <code>0.0</code>，禁用墙钟超时——
+    长任务不应被 arbitrary timeout 截断
+  </li>
+  <li>
+    <code>turn_continuation</code> 最多 12 轮续跑
+  </li>
+  <li>
+    非 <code>/goal</code> 回合不能直接 <code>create_goal</code>——需用户显式 opt-in
+  </li>
+</ul>
+
+<div class="code" data-lang="python" data-file="nanobot/session/goal_state.py" data-start="115">
+<pre><code>def runner_wall_llm_timeout_s(
+    sessions: SessionManager,
+    session_key: str | None,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    message_metadata: Mapping[str, Any] | None = None,
+) -> float | None:
+    """Wall-clock cap for :class:`~nanobot.agent.runner.AgentRunner` when streaming an LLM.
+
+    Returns ``0.0`` to disable ``asyncio.wait_for`` around the request when this is a
+    sustained-goal turn; ``None`` means use ``NANOBOT_LLM_TIMEOUT_S``. Pass in-memory
+    ``metadata`` when the caller already holds :attr:`~nanobot.session.manager.Session.metadata`
+    for this turn.
+    """
+    meta: Mapping[str, Any] | None = metadata
+    if meta is None and session_key:
+        meta = sessions.get_or_create(session_key).metadata
+    return 0.0 if sustained_goal_turn(meta, message_metadata=message_metadata) else None</code></pre>
+</div>
+
+<h2 id="quiz">十、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>会话 JSONL 默认 <code>save(fsync=False)</code>，关机时才 <code>flush_all(fsync=True)</code>。如果进程被 <code>kill -9</code> 强杀，可能丢失什么？为什么日常热路径不强制 fsync？</p>
+  </div>
+  <div class="ans">
+    <p><strong>可能丢失：</strong>最后一次 <code>save()</code> 写入的数据——通常是当前回合尚未 fsync 的消息和 metadata 更新。</p>
+    <p>
+      因为 <code>fsync</code> 是同步磁盘 IO，每个回合可能写盘 2-3 次（早持久化用户消息、
+      save 阶段、压缩后更新 <code>last_consolidated</code>），每次都 fsync 会把
+      <code>save</code> 阶段 latency 从毫秒级拉到 tens of ms。
+    </p>
+    <p>
+      设计取舍：<strong>正常运行容忍最后一秒的丢失，优雅关机补齐耐久性。</strong>
+      源码位置：<code>manager.py:728</code>（<code>fsync</code> 参数）和
+      <code>manager.py:1134-1150</code>（<code>flush_all</code>）。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>某会话 <code>last_consolidated = 100</code>，<code>messages</code> 共 150 条。
+    调用 <code>get_history(max_messages=20)</code> 时，实际回放从哪条开始？为什么不是从第 130 条？</p>
+  </div>
+  <div class="ans">
+    <p><strong>不是简单从 130 开始。</strong>流程如下：</p>
+    <ol>
+      <li><code>replay_start = min(100, recent_start)</code>，其中 <code>recent_start</code> 至少保留尾部 8 条（<code>MIN_COMPACTED_REPLAY_MESSAGES</code>），所以 <code>replay_start</code> 可能是 142。</li>
+      <li><code>replayable = messages[142:]</code>，共 8 条未归档 + 可能更多已归档后缀。</li>
+      <li><code>recent_message_start_index(replayable, 20, extend_to_user=...)</code> 从尾部数 20 条，并回溯到起始 user 消息。</li>
+      <li><code>find_legal_message_start</code> 清理孤立 tool result。</li>
+    </ol>
+    <p>
+      关键：<code>last_consolidated</code> 是归档指针，不是"从这儿开始回放"。
+      即使消息 0-99 已归档进 history.jsonl，文件里它们仍在——只是 <code>get_history()</code> 跳过。
+      源码：<code>manager.py:197-250</code>。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>假设 Consolidator 在 assistant 消息的 tool result 还没回填时就切了边界（绕过了 <code>pick_consolidation_boundary</code>）。描述一条具体的非法消息序列，以及 API 会返回什么错误。</p>
+  </div>
+  <div class="ans">
+    <p><strong>非法序列示例：</strong></p>
+    <div class="ascii">[0] user: "查一下天气"
+[1] assistant: { tool_calls: [{ id: "call_1", name: "web_search", ... }] }
+[2] tool: { tool_call_id: "call_1", content: "..." }   ← 被归档切掉
+[3] assistant: "今天上海晴..."                         ← 留在 replay 里</div>
+    <p>
+      归档后 <code>get_history()</code> 可能从 [3] 开始——
+      但 [3] 前面缺少 [1] 的 tool result [2]，消息序列不完整。
+      OpenAI API 典型报错：<code>400 Invalid parameter: messages with role 'tool' must be a response to a preceding message with 'tool_calls'</code>，
+      或 Anthropic 的 <code>tool_use blocks must be followed by tool_result blocks</code>。
+    </p>
+    <p>
+      这正是 <code>pick_consolidation_boundary</code>（<code>memory.py:838-858</code>）
+      只在 <code>role == "user"</code> 处切的原因——user 消息是自然回合边界，
+      其前的 assistant/tool 序列已经闭合。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    记忆 = <strong>三层存储</strong>（JSONL 会话 / history 归档 / Markdown 长期知识）+
+    <strong>原子写入</strong>（tmp + replace + fsync）+
+    <strong>指针式压缩</strong>（<code>last_consolidated</code> + 最小回放后缀）+
+    <strong>Dream 两阶段整合</strong>。
+    下一章进入边缘层：18 个聊天平台如何通过渠道适配层接入
+    <a href="02-bus.html">第 02 章</a> 的消息总线。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

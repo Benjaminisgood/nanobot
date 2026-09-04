@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 OpenAI 兼容 HTTP API · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 16 章 · 接入</div>
+<h1>OpenAI 兼容 HTTP API</h1>
+<p class="lede">
+  把 nanobot 接到现有 Chat Completions 客户端（Cursor、脚本、别的 bot）时，
+  走的是 <code>nanobot/api/server.py</code>：还是同一个 <code>AgentLoop</code>，
+  只是入口从 <code>publish_inbound</code> 换成了 <code>process_direct</code>。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="app">一、三件路由 + 可选 Bearer</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/api/server.py" data-start="450">
+<pre><code>def create_app(
+    agent_loop: "AgentLoop",
+    model_name: str = "nanobot",
+    request_timeout: float = 120.0,
+    api_key: str = "",
+) -&gt; web.Application:
+    """Create the aiohttp application.
+
+    Args:
+        agent_loop: An initialized AgentLoop instance.
+        model_name: Model name reported in responses.
+        request_timeout: Per-request timeout in seconds.
+        api_key: Optional API key for Bearer-token authentication on API routes.
+    """
+    app = web.Application(client_max_size=20 * 1024 * 1024)  # 20MB for base64 images
+    app[_AGENT_LOOP_KEY] = agent_loop
+    app[_MODEL_NAME_KEY] = model_name
+    app[_REQUEST_TIMEOUT_KEY] = request_timeout
+    app[_SESSION_LOCKS_KEY] = {}  # per-user locks, keyed by session_key</code></pre>
+</div>
+
+<p>注册的路径：<code>POST /v1/chat/completions</code>、<code>GET /v1/models</code>、<code>GET /health</code>。</p>
+
+<div class="code" data-lang="python" data-file="nanobot/api/server.py" data-start="470">
+<pre><code>    @web.middleware
+    async def auth_middleware(
+        request: web.Request,
+        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    ) -&gt; web.StreamResponse:
+        # Allow unauthenticated health checks.
+        if request.path == "/health":
+            return await handler(request)
+        if not api_key:
+            return await handler(request)
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return _error_json(401, "Missing Authorization header. Use: Bearer &lt;api_key&gt;")
+        if not hmac.compare_digest(auth[len("Bearer "):], api_key):
+            return _error_json(401, "Invalid API key")
+        return await handler(request)</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    <code>hmac.compare_digest</code> 做常量时间比较，避免 API key 被计时攻击逐字节猜。
+    <code>api_key</code> 为空则<strong>整站不鉴权</strong>——只适合本机。
+    健康检查永远免密，方便编排探测。
+  </p>
+</div>
+
+<h2 id="direct">二、不进 inbound 队列：process_direct</h2>
+
+<p>
+  HTTP 请求已经占着一个协程，没必要再绕 <code>MessageBus.inbound</code>
+  （那会和聊天渠道抢调度循环）。<code>handle_chat_completions</code> 解析 body 后：
+</p>
+
+<ul>
+  <li>会话键：<code>api:{session_id}</code> 或默认 <code>api:default</code></li>
+  <li>渠道名写死 <code>"api"</code>，<code>chat_id</code> 为 <code>API_CHAT_ID</code></li>
+  <li>每把 session 一把 <code>asyncio.Lock</code>，存在 <code>app[_SESSION_LOCKS_KEY]</code></li>
+  <li>调用 <code>agent_loop.process_direct(...)</code>，可带 <code>on_stream</code></li>
+</ul>
+
+<div class="code" data-lang="python" data-file="nanobot/api/server.py" data-start="306">
+<pre><code>        return _error_json(400, f"Only configured model '{model_name}' is available")
+
+    session_key = f"api:{session_id}" if session_id else API_SESSION_KEY
+    session_locks: dict[str, asyncio.Lock] = _app_value(
+        request.app,
+        _SESSION_LOCKS_KEY,
+        "session_locks",
+    )
+    session_lock = session_locks.setdefault(session_key, asyncio.Lock())</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 API 还要自己的锁</div>
+  <p>
+    <code>process_direct</code> 仍会进 <code>_process_message</code>，用 loop 里的会话锁。
+    HTTP 层这把锁是为了<strong>同一个 api session 的两次 POST 不要交错写 SSE</strong>——
+    客户端连发两个 stream=true 时，先完成的那个才写 resp。
+    和聊天侧「pending 注入队列」是不同的产品语义：HTTP 调用通常期望请求/响应对齐。
+  </p>
+</div>
+
+<h2 id="sse">三、SSE：队列桥接回调与 HTTP 写出</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/api/server.py" data-start="320">
+<pre><code>    # -- streaming path --
+    if stream:
+        resp = web.StreamResponse()
+        resp.content_type = "text/event-stream"
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Connection"] = "keep-alive"
+        await resp.prepare(request)
+
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        stream_failed = False
+        emitted_content = False
+
+        async def _on_stream(token: str) -&gt; None:
+            nonlocal emitted_content
+            if token:
+                emitted_content = True
+            await queue.put(token)</code></pre>
+</div>
+
+<p>
+  <code>_on_stream_end</code> <strong>故意什么都不做</strong>：注释写明工具回合之后生成还会继续，
+  HTTP SSE 只能在 <code>process_direct</code> 返回时关闭。
+  这和第 14 章渠道侧「segment end ≠ 整轮结束」是同一事实的 HTTP 表述。
+</p>
+
+<p>
+  若整轮没流出任何 token（模型直接给完整 content），finally 前会把
+  <code>_response_text(response)</code> 补进队列，避免 stream=true 的客户端拿到空流。
+</p>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：model 字段不能随便填</div>
+  <p>
+    body 里的 <code>model</code> 若存在且不等于网关配置的 <code>model_name</code>，直接 400。
+    这个 API 不是多模型路由器，只是「当前 AgentLoop 的外壳」。
+    换模型走 nanobot 自己的 preset / <code>/model</code>，不是 OpenAI 的 <code>model:</code> 参数。
+  </p>
+</div>
+
+<h2 id="quiz">四、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>不配 API key 时，局域网里别人能不能打你的 <code>/v1/chat/completions</code>？</p>
+  </div>
+  <div class="ans">
+    <p>
+      中间件在 <code>if not api_key: return await handler(request)</code>。
+      绑定 <code>0.0.0.0</code> 且无 key = 谁都能驱动你的 agent（含 exec）。
+      本机试用可以；暴露到网络必须设 key，并配合防火墙。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>为什么 API 不 <code>publish_inbound</code> 再等 outbound？列两条理由。</p>
+  </div>
+  <div class="ans">
+    <p>
+      <strong>1. 请求/响应要对齐。</strong> HTTP 调用方阻塞在这一次 POST 上，需要这次的最终文本/SSE。
+      总线是多生产者多消费者，把「第 N 个 inbound」和「第 M 个 outbound」配对容易配错。
+    </p>
+    <p>
+      <strong>2. 避免和聊天调度搅在一起。</strong> <code>AgentLoop.run()</code> 的 1 秒超时心跳、
+      优先命令、注入队列都是为 IM 设计的。API 用 <code>process_direct</code> 同步跑完七阶段，语义更简单。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>客户端 <code>stream: true</code>，模型先吐 20 个 token，再调用 <code>exec</code> 30 秒，再吐结尾。SSE 连接何时结束？工具期间连接上会怎样？</p>
+  </div>
+  <div class="ans">
+    <p>
+      连接在 <code>process_direct</code> <strong>整段返回</strong>后才结束（<code>_on_stream_end</code> 不关流）。
+      工具那 30 秒客户端可能暂时收不到 data 行（或只有心跳，若有的话——这段实现主要靠 TCP 挂着）。
+      前 20 个 token 已经作为 SSE chunk 发出；结尾再发。
+      这与 Chat Completions 常见「工具期间静默」行为一致，不要误判为超时就掐掉——
+      真正的超时是外层 <code>asyncio.wait_for(..., timeout_s)</code>。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    HTTP API 证明核心循环与传输无关：IM、SSE、SDK 都是外壳。
+    下一章把 01–16 收成练习。读完你应该能自己选一个扩展点（工具 / 渠道 / skill / API 客户端）动手。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

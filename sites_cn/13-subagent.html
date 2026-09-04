@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 子 Agent · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 13 章 · 运行时</div>
+<h1>子 Agent</h1>
+<p class="lede">
+  主 agent 用 <code>spawn</code> 工具把长任务交给另一个 <code>AgentRunner</code> 实例。
+  子 agent <strong>不复用主会话 JSONL</strong>，工具集更窄，完成后把结果当成
+  <code>channel="system"</code> 的 inbound 塞回主会话——常常走进第 03 章讲过的注入队列。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="tool">一、入口：spawn 工具</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/spawn.py" data-start="76">
+<pre><code>    async def execute(
+        self,
+        task: str,
+        label: str | None = None,
+        temperature: float | None = None,
+        wait: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        """Spawn a subagent to execute the given task."""
+        running = self._manager.get_running_count()
+        limit = self._manager.max_concurrent_subagents
+        if running &gt;= limit:
+            return (
+                f"Cannot spawn subagent: concurrency limit reached "
+                f"({running}/{limit} running). Wait for a running subagent "
+                f"to complete before spawning a new one."
+            )
+        request_ctx = current_request_context()
+        if request_ctx is None or request_ctx.runtime is None:
+            return ToolResult.error("Error: spawn requires an active model runtime")
+        origin_channel = request_ctx.channel
+        origin_chat_id = request_ctx.chat_id
+        session_key = request_ctx.session_key or f"{origin_channel}:{origin_chat_id}"
+        method = self._manager.run_inline if wait else self._manager.spawn
+        return await method(</code></pre>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>参数</th><th>行为</th></tr></thead>
+<tbody>
+<tr><td><code>wait=false</code>（默认）</td><td><code>SubagentManager.spawn</code>：立刻返回「已启动」，后台跑</td></tr>
+<tr><td><code>wait=true</code></td><td><code>run_inline</code>：当前工具调用阻塞到子任务结束，结果当 tool result 返回</td></tr>
+<tr><td>并发上限</td><td>全局 <code>max_concurrent_subagents</code>，满了返回普通错误字符串（喂回模型，不抛）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+  起点渠道 / chat / session 全部来自 <code>RequestContext</code>（第 06 章的 ContextVar），
+  所以子 agent 知道「结果该通知谁」，而不需要 LLM 把 chat_id 当参数传来传去。
+</p>
+
+<h2 id="isolate">二、隔离：自己的工具注册表</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/subagent.py" data-start="209">
+<pre><code>    def _build_tools(
+        self,
+        workspace: Path | None = None,
+        tools_config: ToolsConfig | None = None,
+    ) -&gt; ToolRegistry:
+        """Build an isolated subagent tool registry via ToolLoader."""
+        root = self.workspace if workspace is None else workspace
+        registry = ToolRegistry()
+        cfg = tools_config if tools_config is not None else self._subagent_tools_config()
+        ctx = ToolContext(
+            config=cfg,
+            workspace=str(root.resolve()),
+            exec_session_manager=self._exec_session_manager,
+            file_state_store=FileStates(),
+            workspace_sandbox=workspace_sandbox_status(
+                restrict_to_workspace=cfg.restrict_to_workspace,
+                workspace=root,
+            ),
+        )
+        ToolLoader().load(ctx, registry, scope="subagent")
+        return registry</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：scope=&quot;subagent&quot; 切断递归</div>
+  <p>
+    <code>Tool._scopes</code> 默认只有 <code>{"core"}</code>。
+    文件系统、shell、web、search、apply_patch 显式加入了 <code>"subagent"</code>；
+    <code>spawn</code> / <code>message</code> / <code>cron</code> / <code>long_task</code> 没有。
+    因此<strong>子 agent 不能再 spawn</strong>，也不能给用户发消息或改持续目标。
+    这是用发现范围做的权限模型，不必在 Runner 里写特殊 if。
+  </p>
+</div>
+
+<p>
+  提示词也更瘦：<code>_build_subagent_prompt</code> 渲染
+  <code>agent/subagent_system.md</code>，只附 skills <strong>摘要</strong>，
+  不走主 agent 那套完整 identity + bootstrap + MEMORY 栈。
+</p>
+
+<h2 id="run">三、执行：还是同一个 AgentRunner</h2>
+
+<p>子任务的消息从空白开始：一条 system + 一条 user（任务描述）。</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/subagent.py" data-start="384">
+<pre><code>            system_prompt = self._build_subagent_prompt(workspace=root)
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": task},
+            ]
+
+            sess_key = origin.get("session_key")
+            llm_timeout = (
+                self._llm_wall_timeout_for_session(sess_key)
+                if self._llm_wall_timeout_for_session
+                else None
+            )
+            request_token = bind_request_context(RequestContext(
+                channel=origin["channel"],
+                chat_id=origin["chat_id"],
+                message_id=origin_message_id,
+                session_key=sess_key,
+                runtime=runtime,
+            ))
+            token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
+            try:
+                result = await self.runner.run(AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    runtime=runtime,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    hook=_SubagentHook(task_id, status),
+                    max_iterations_message="Task completed but no final response was generated.",
+                    finalize_on_max_iterations=False,
+                    error_message=None,
+                    fail_on_tool_error=self.fail_on_tool_error,
+                    checkpoint_callback=_on_checkpoint,
+                    session_key=sess_key,
+                    workspace=root,
+                    llm_timeout_s=llm_timeout,
+                ))</code></pre>
+</div>
+
+<p>
+  <code>finalize_on_max_iterations=False</code>：子任务撞到迭代上限就停，
+  不会再「不带工具问一句总结」——避免后台任务悄悄再烧一轮 token。
+  状态通过 <code>_SubagentHook</code> 写进 <code>SubagentStatus</code>，WebUI 可以展示进度。
+</p>
+
+<h2 id="announce">四、回报：system inbound + session_key_override</h2>
+
+<p>后台 spawn（<code>announce=True</code>）结束后：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/subagent.py" data-start="489">
+<pre><code>        # Inject as system message to trigger main agent.
+        # Use session_key_override to align with the main agent's effective
+        # session key (which accounts for unified sessions) so the result is
+        # routed to the correct pending queue (mid-turn injection) instead of
+        # being dispatched as a competing independent task.
+        override = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
+        metadata: dict[str, Any] = {
+            "injected_event": "subagent_result",
+            "subagent_task_id": task_id,
+        }
+        if origin_message_id:
+            metadata["origin_message_id"] = origin_message_id
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id=f"{origin['channel']}:{origin['chat_id']}",
+            content=announce_content,
+            session_key_override=override,
+            metadata=metadata,
+        )
+
+        await self.bus.publish_inbound(msg)</code></pre>
+</div>
+
+<p>
+  注释写尽了第 03 章的不变量：必须用<strong>有效 session key</strong> 覆盖，
+  否则统一会话模式下结果会变成另一个 <code>_dispatch</code>，和主回合并发写同一份历史。
+</p>
+
+<p>
+  主 loop 的 <code>_build_turn</code> 看到 <code>TurnKind.SYSTEM</code> 且
+  <code>sender_id == "subagent"</code> 时，会把结果早持久化，但喂给模型时当成新输入
+  （<code>loop.py:1763</code> 那段注释）——因为很多 provider 会丢掉末尾 assistant 消息。
+</p>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：wait=true 不走这条 inbound</div>
+  <p>
+    <code>run_inline(..., announce=False)</code>。结果只作为 spawn 工具的返回值出现在
+    <strong>当前</strong> ReAct 循环的 tool 消息里。不会再触发一轮「系统消息回合」。
+    适合「我必须先知道子任务结论才能继续」的咨询场景。
+  </p>
+</div>
+
+<h2 id="cancel">五、取消与会话绑定</h2>
+
+<p>
+  <code>_session_tasks</code> 记录「这个主会话养了哪些 task_id」。
+  <code>/stop</code> 或丢弃会话时 <code>cancel_by_session</code> 会
+  <code>task.cancel()</code> 并关掉该会话名下的 exec 会话。
+  子 agent 不是孤儿进程——生命周期挂在主会话上。
+</p>
+
+<h2 id="quiz">六、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>子 agent 能不能再调用 <code>spawn</code>？依据是哪条机制？</p>
+  </div>
+  <div class="ans">
+    <p><strong>不能。</strong> <code>ToolLoader().load(..., scope="subagent")</code>
+    会跳过 <code>_scopes</code> 不含 <code>subagent</code> 的类。
+    <code>SpawnTool</code> 使用基类默认 <code>{"core"}</code>，因此不会被注册。
+    这比在 <code>execute</code> 里写 <code>if is_subagent: return error</code> 更干净——未注册的工具模型根本看不到。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>主 agent 正在跑（持有会话锁），后台 subagent 完成并 <code>publish_inbound</code>。这条系统消息会新建 <code>_dispatch</code> 吗？</p>
+  </div>
+  <div class="ans">
+    <p>
+      通常<strong>不会</strong>。有效 key 已在 <code>_pending_queues</code> 里，
+      调度循环第 5 道分流会 <code>put_nowait</code> 进注入队列
+      （<a href="03-loop.html">03 章</a>）。
+      主 Runner 在工具批次结束后的 <code>_try_drain_injections</code> 把它拼进 messages，再进行下一轮 LLM。
+    </p>
+    <p>
+      若主回合已经结束、队列已拆除，这条消息会走正常 <code>_dispatch</code>，成为新的 SYSTEM 回合——
+      这也是 <code>_build_turn</code> 里 subagent 分支必须能独立处理的原因。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>对比 <code>wait=true</code> 与默认后台 spawn：在「主模型上下文窗口」和「用户可见延迟」上各有什么代价？什么时候不该用 wait？</p>
+  </div>
+  <div class="ans">
+    <p><strong>wait=true</strong>：子任务的全部中间 tool 结果<strong>不进入</strong>主会话 JSONL；
+    只有最终字符串作为一条 tool result。主上下文更干净，但用户会感觉当前回合卡住
+    （要等子 Runner 的 <code>max_iterations</code>）。
+    主会话锁一直被占着，<code>/stop</code> 可以取消主任务从而取消这次 inline（同一条 cancel 链）。</p>
+    <p><strong>后台 spawn</strong>：主模型立刻继续想下一件事；用户能先看到「已启动」。
+    代价是稍后多一轮 system 注入，主上下文会再吃一段 announce 文本。
+    多个后台任务还受全局并发上限约束。</p>
+    <p>
+      不该用 wait 的典型情况：任务可能超过主回合墙钟超时、或需要用户同时看到主 agent 的流式输出。
+      该用 wait 的情况：下一步的工具参数严格依赖子任务结论（否则主模型会靠猜继续跑）。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    子 agent = <strong>缩小的 Tool 范围</strong> + <strong>独立 Runner</strong> +
+    <strong>用总线把结果送回有效 session key</strong>。
+    它没有新的循环算法，只是把第 04 章的 Runner 嵌套调用了一次。
+    下一章看 token 如何变成用户看见的流式更新：TurnDelivery。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

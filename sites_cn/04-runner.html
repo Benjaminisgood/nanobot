@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 AgentRunner：ReAct 循环 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 04 章 · 核心链路</div>
+<h1>04 AgentRunner：ReAct 循环</h1>
+<p class="lede">
+  1670 行，全项目 ReAct（Reason + Act，推理—行动）循环的<strong>唯一实现</strong>。
+  第 03 章的 <code>AgentLoop</code> 负责"什么时候、以什么上下文"启动一轮对话；
+  这一章我们读 <code>AgentRunner</code>——它只认 <code>AgentRunSpec</code>，
+  在消息列表上反复"问模型 → 执行工具 → 回填结果"，直到给出最终答案或触达终止条件。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="scope">一、职责边界：AgentRunner 做什么、不做什么</h2>
+
+<p>类的 docstring 只有一句话，但边界非常清晰：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="137">
+<pre><code>class AgentRunner:
+    """Run a tool-capable LLM loop without product-layer concerns."""</code></pre>
+</div>
+
+<p>
+  翻译过来：<strong>跑一个能调工具的 LLM 循环，但不碰产品层的事。</strong>
+  它不知道 Telegram 还是 WebUI，不知道会话 JSONL 存在哪，
+  也不知道用户按了 <code>/stop</code> 之后该怎么恢复检查点——
+  那些全是 <code>AgentLoop</code>（第 03 章）和
+  <a href="07-memory.html">Session 持久化</a>（第 07 章）的职责。
+</p>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：Runner 的唯一输入是 AgentRunSpec</div>
+  <p>
+    <code>AgentLoop._run_turn()</code> 在 <code>build</code> 阶段拼好
+    <code>initial_messages</code>、工具注册表、运行时配置，
+    然后构造一个 <code>AgentRunSpec</code> 交给 <code>runner.run(spec)</code>。
+    Runner 返回 <code>AgentRunResult</code>，Loop 再在 <code>save</code> 阶段
+    把 <code>result.messages</code> 里<strong>新增的部分</strong>写盘。
+  </p>
+  <p style="margin-bottom:0">
+    这条边界的好处是：CLI、OpenAI 兼容 API、subagent _spawn 工具
+    都可以复用同一个 Runner，而不必复制 ReAct 逻辑。
+  </p>
+</div>
+
+<h2 id="spec">二、AgentRunSpec 与 AgentRunResult：两个契约</h2>
+
+<p>
+  为什么不把 20 个参数直接传给 <code>run()</code>？
+  因为 ReAct 循环的配置项会随功能增长——注入回调、检查点、持续目标、
+  provider 续传状态……用一个大 <code>dataclass</code> 集中声明，
+  调用方只填自己关心的字段，其余走默认值。
+  两个类都加了 <code>@dataclass(slots=True)</code>：
+  固定字段布局、禁止动态增属性，内存更紧凑，也防止 typo 写成不存在的字段。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="90">
+<pre><code>@dataclass(slots=True)
+class AgentRunSpec:
+    """Configuration for a single agent execution."""
+
+    initial_messages: list[dict[str, Any]]
+    tools: ToolRegistry
+    runtime: LLMRuntime
+    max_iterations: int
+    max_tool_result_chars: int
+    hook: AgentHook | None = None
+    error_message: str | None = _DEFAULT_ERROR_MESSAGE
+    max_iterations_message: str | None = None
+    concurrent_tools: bool = False
+    fail_on_tool_error: bool = False
+    workspace: Path | None = None
+    session_key: str | None = None
+    context_block_limit: int | None = None
+    provider_retry_mode: str = "standard"
+    progress_callback: ProgressCallback | None = None
+    stream_progress_deltas: bool = True
+    retry_wait_callback: RetryWaitCallback | None = None
+    checkpoint_callback: CheckpointCallback | None = None
+    injection_callback: InjectionCallback | None = None
+    llm_timeout_s: float | None = None
+    goal_active_predicate: Callable[[], bool] | None = None
+    goal_continue_message: GoalContinueMessage | None = None
+    finalize_on_max_iterations: bool = True
+    provider_state: ProviderConversationState | None = None</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="120">
+<pre><code>@dataclass(slots=True)
+class AgentRunResult:
+    """Outcome of a shared agent execution."""
+
+    final_content: str | None
+    messages: list[dict[str, Any]]
+    tools_used: list[str] = field(default_factory=list)
+    usage: dict[str, int] = field(default_factory=dict)
+    stop_reason: str = "completed"
+    error: str | None = None
+    tool_events: list[dict[str, str]] = field(default_factory=list)
+    had_injections: bool = False
+    # Terminal tail to emit when the preceding final-content prefix was already streamed.
+    pending_stream_content: str | None = None
+    provider_state: ProviderConversationState | None = field(default=None, repr=False)</code></pre>
+</div>
+
+<h3>重要字段速查</h3>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>字段</th><th>类型 / 默认</th><th>作用</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>max_iterations</code></td>
+  <td><code>int</code>（必填）</td>
+  <td>ReAct 主循环上限。每次迭代 = 一次 LLM 请求（含可能的工具执行）。耗尽时走 <code>stop_reason="max_iterations"</code>。</td>
+</tr>
+<tr>
+  <td><code>concurrent_tools</code></td>
+  <td><code>bool</code>，默认 <code>False</code></td>
+  <td>为真时，同一批 <code>concurrency_safe</code> 工具用 <code>asyncio.gather</code> 并行执行。</td>
+</tr>
+<tr>
+  <td><code>fail_on_tool_error</code></td>
+  <td><code>bool</code>，默认 <code>False</code></td>
+  <td>为真时工具失败会返回 <code>fatal_error</code>，整轮以 <code>tool_error</code> 终止；默认把错误文本喂回模型让它自救。</td>
+</tr>
+<tr>
+  <td><code>injection_callback</code></td>
+  <td>可选回调</td>
+  <td>由 Loop 注入 <code>_drain_pending</code>，在工具序列闭合后的安全点取出用户追加消息（见第 03 章第六节）。</td>
+</tr>
+<tr>
+  <td><code>checkpoint_callback</code></td>
+  <td>可选回调</td>
+  <td>在 <code>awaiting_tools</code> / <code>tools_completed</code> / <code>final_response</code> 等阶段持久化中间状态，供 <code>/stop</code> 恢复。</td>
+</tr>
+<tr>
+  <td><code>goal_active_predicate</code></td>
+  <td><code>Callable[[], bool] | None</code></td>
+  <td>持续目标（sustained goal）是否仍活跃；与 <code>goal_continue_message</code> 配合实现自动续跑。</td>
+</tr>
+<tr>
+  <td><code>provider_state</code></td>
+  <td><code>ProviderConversationState | None</code></td>
+  <td>跨轮 provider 续传状态（如 OpenAI Responses API 的 <code>response_id</code>），由 Loop 在 <code>build</code> 阶段注入。</td>
+</tr>
+<tr>
+  <td><code>llm_timeout_s</code></td>
+  <td><code>float | None</code></td>
+  <td>单次 LLM 请求超时（秒），<code>None</code> 表示不限。</td>
+</tr>
+<tr>
+  <td><code>finalize_on_max_iterations</code></td>
+  <td><code>bool</code>，默认 <code>True</code></td>
+  <td>迭代用尽时是否再发起一次<strong>不带工具</strong>的 LLM 请求，让模型给出总结而非模板兜底。</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 spec 和 result 分开</div>
+  <p>
+    <code>AgentRunSpec</code> 是<strong>输入契约</strong>——只读配置，Runner 不应修改它。
+    <code>AgentRunResult</code> 是<strong>输出契约</strong>——包含可能被 append 了数十条
+    assistant/tool 消息的完整 <code>messages</code> 列表，以及 <code>stop_reason</code>、
+    token 用量、流式尾部等运行时产物。
+  </p>
+  <p style="margin-bottom:0">
+    Loop 拿到 result 后，用 <code>initial_messages</code> 的长度和 result.messages 做差，
+    只持久化新增部分。如果把输入输出揉成一个对象，这个"append 边界"就很难保持清晰。
+  </p>
+</div>
+
+<h2 id="run-hooks">三、run()：钩子生命周期与四段式异常处理</h2>
+
+<p>
+  <code>run()</code> 是 Runner 对外的唯一入口。它做三件事：
+  复制一份 <code>initial_messages</code> 作为可变工作副本；
+  包一层 hook 生命周期；
+  把核心逻辑委托给 <code>_run_core()</code>。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="371">
+<pre><code>    async def run(self, spec: AgentRunSpec) -&gt; AgentRunResult:
+        hook = spec.hook or AgentHook()
+        messages = list(spec.initial_messages)
+        context = AgentRunHookContext(messages=deepcopy(messages))
+
+        try:
+            await hook.before_run(context)
+            result = await self._run_core(spec, hook, messages)
+        except asyncio.CancelledError as exc:
+            context.messages = deepcopy(messages)
+            context.stop_reason = "cancelled"
+            context.error = None
+            context.exception = exc
+            raise
+        except Exception as exc:
+            context.messages = deepcopy(messages)
+            context.stop_reason = "error"
+            context.error = f"Error: {type(exc).__name__}: {exc}"
+            context.exception = exc
+            await hook.on_error(context)
+            raise
+        else:
+            context.messages = deepcopy(result.messages)
+            context.final_content = result.final_content
+            context.tools_used = list(result.tools_used)
+            context.usage = dict(result.usage)
+            context.stop_reason = result.stop_reason
+            context.error = result.error
+            context.tool_events = deepcopy(result.tool_events)
+            context.had_injections = result.had_injections
+            context.exception = None
+            if context.error is not None:
+                await hook.on_error(context)
+            await hook.after_run(context)
+            return result
+        finally:
+            context.messages = deepcopy(messages)
+            if context.exception is None:
+                await hook.on_finally(context)
+            else:
+                try:
+                    await hook.on_finally(context)
+                except Exception:
+                    logger.exception(
+                        "AgentHook.on_finally error after {}",
+                        context.stop_reason or "run exception",
+                    )</code></pre>
+</div>
+
+<p>四个分支各管一类结局：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>分支</th><th>触发条件</th><th>行为</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>except CancelledError</code></td>
+  <td>用户 <code>/stop</code>、任务被取消</td>
+  <td>更新 context 为 <code>cancelled</code>，<strong>直接 <code>raise</code></strong>，不调 <code>on_error</code>。取消不是"错误"。</td>
+</tr>
+<tr>
+  <td><code>except Exception</code></td>
+  <td>未预期的运行时异常</td>
+  <td>调 <code>on_error</code>，再 <code>raise</code> 把异常传给 Loop。</td>
+</tr>
+<tr>
+  <td><code>else</code></td>
+  <td><code>_run_core</code> 正常返回</td>
+  <td>若 result 带 <code>error</code>（如 LLM 返回 <code>finish_reason=error</code>）也调 <code>on_error</code>；然后 <code>after_run</code> 并返回 result。</td>
+</tr>
+<tr>
+  <td><code>finally</code></td>
+  <td>无论成败</td>
+  <td>总是调 <code>on_finally</code>——但异常路径下再套一层 <code>try/except</code>。</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：finally 里为什么要再套 try</div>
+  <p>
+    设想 <code>_run_core</code> 抛了 <code>RuntimeError("provider down")</code>，
+    <code>except Exception</code> 已经记录了原始异常并准备 <code>raise</code>。
+    如果 <code>on_finally</code> 里又抛了 <code>KeyError</code>，
+    没有内层 <code>try</code> 的话，<strong>最终冒泡的是 KeyError，原始 RuntimeError 被覆盖</strong>——
+    调试时完全误导。
+  </p>
+  <p style="margin-bottom:0">
+    内层只记日志、不 re-raise，保证"第一个异常"始终是真相。
+    正常路径（<code>context.exception is None</code>）则不需要这层保护。
+  </p>
+</div>
+
+<h2 id="run-core">四、_run_core()：ReAct 主循环</h2>
+
+<p>
+  主循环的结构就是一个 <code>for iteration in range(spec.max_iterations)</code>。
+  每次迭代：治理上下文 → 调模型 → 观察响应 → 分支（执行工具 / 收尾回答）。
+</p>
+
+<h3>4.1 两份历史：持久化 vs 送给模型</h3>
+
+<p>循环开头这段注释是理解 Runner 与 Memory 分工的关键：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="461">
+<pre><code>        for iteration in range(spec.max_iterations):
+            # Keep the persisted conversation untouched. Context governance
+            # may repair or compact historical messages for the model, but
+            # those synthetic edits must not shift the append boundary used
+            # later when the caller saves only the new turn. A governance
+            # failure must stop the run instead of sending an ungoverned copy.
+            messages_for_model = self.context_governor.prepare_for_model(
+                governance_config,
+                messages,
+                compacted_tool_call_ids,
+            )
+            context = AgentHookContext(
+                iteration=iteration,
+                messages=messages,
+                session_key=spec.session_key,
+            )
+            await hook.before_iteration(context)
+            provider_context = conversation_state.prepare_request(
+                messages,
+                context_window_tokens=spec.runtime.context_window_tokens,
+                model_messages=messages_for_model,
+            )
+            response = await self._request_model(
+                spec,
+                messages_for_model,
+                hook,
+                context,
+                conversation_state=conversation_state,
+                provider_context=provider_context,
+            )
+            conversation_state.observe_response(response, messages)</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：messages 与 messages_for_model</div>
+  <p>
+    <code>messages</code> 是<strong>权威 transcript</strong>——所有 append 都发生在这里，
+    Loop 最终拿它去持久化。
+    <code>messages_for_model</code> 是<strong>治理后的副本</strong>——可能被压缩、
+    截断工具结果、修复非法角色交替，只用于本次 API 请求。
+  </p>
+  <p style="margin-bottom:0">
+    如果不分离，一次 context 压缩就会改写持久化边界，
+    下次读会话历史会看到"被合成过的"消息——用户和 Consolidator 都会困惑。
+    注释还强调：治理失败必须<strong>中止运行</strong>，不能悄悄 fallback 到未治理副本
+    （那会绕过 token 预算和安全截断）。
+  </p>
+</div>
+
+<h3>4.2 工具分支：should_execute_tools 门控</h3>
+
+<p>
+  模型返回后，Runner 先看 <code>response.should_execute_tools</code>，
+  而不是裸看 <code>has_tool_calls</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/providers/base.py" data-start="281">
+<pre><code>    @property
+    def should_execute_tools(self) -&gt; bool:
+        """Tools execute only when has_tool_calls AND finish_reason is a tool-capable stop.
+        Blocks gateway-injected calls under ``refusal`` / ``content_filter`` / ``error`` (#3220)."""
+        if not self.has_tool_calls:
+            return False
+        return self.finish_reason in ("tool_calls", "function_call", "stop")</code></pre>
+</div>
+
+<p>门控通过后，工具分支的时序如下：</p>
+
+<div class="ascii">should_execute_tools == True
+  → build_assistant_message + append 到 messages
+  → _emit_checkpoint(phase="awaiting_tools")
+  → _execute_tools
+  → 每个结果 append 为 role="tool" 消息
+  → _emit_checkpoint(phase="tools_completed")
+  → _try_drain_injections（工具序列已闭合，安全注入点）
+  → continue 下一轮迭代</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="510">
+<pre><code>            if response.should_execute_tools:
+                context.tool_calls = list(response.tool_calls)
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+
+                assistant_message = build_assistant_message(
+                    response.content or "",
+                    tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                )
+                assistant_message = conversation_state.project_response_message(
+                    assistant_message,
+                    response,
+                )
+                messages.append(assistant_message)
+                await self._emit_checkpoint(
+                    spec,
+                    {
+                        "phase": "awaiting_tools",
+                        "iteration": iteration,
+                        "model": spec.runtime.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": [],
+                        "pending_tool_calls": [tc.to_openai_tool_call() for tc in response.tool_calls],
+                    },
+                )
+
+                await hook.before_execute_tools(context)
+
+                results, new_events, fatal_error = await self._execute_tools(
+                    spec,
+                    response.tool_calls,
+                    external_lookup_counts,
+                    workspace_violation_counts,
+                    hook,
+                    context,
+                )</code></pre>
+</div>
+
+<p>
+  如果模型<strong>带了 tool_calls 但 finish_reason 不对</strong>（比如 content filter 或 refusal），
+  Runner 只打 warning、不执行工具——避免在模型已拒绝的场景下误跑副作用操作：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="625">
+<pre><code>            if response.has_tool_calls:
+                logger.warning(
+                    "Ignoring tool calls under finish_reason='{}' for {}",
+                    response.finish_reason,
+                    spec.session_key or "default",
+                )</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 finish_reason 也要检查</div>
+  <p>
+    部分 gateway 在 content filter 或 refusal 时仍会在响应体里塞 tool_calls 字段
+    （可能是截断前的中间态，或 provider bug）。
+    如果只看 <code>has_tool_calls</code>，agent 会在模型"已经拒绝回答"的情况下
+    照样执行 <code>exec</code>、写文件——<strong>安全与语义都不对</strong>。
+  </p>
+  <p style="margin-bottom:0">
+    <code>should_execute_tools</code> 把"有调用"和"该执行"拆成两步，
+    是 provider 层（<a href="05-providers.html">第 05 章</a>）和 runner 层之间的明确契约。
+  </p>
+</div>
+
+<h3>4.3 无工具时的收尾：finalize 与空回复重试</h3>
+
+<p>
+  不走工具分支时，Runner 调 <code>hook.finalize_content()</code> 做渠道特定的内容清洗，
+  然后处理空回复——最多重试 <code>_MAX_EMPTY_RETRIES</code>（值为 2）次，
+  仍空则走 <code>_request_finalization_retry</code> 再要一次不带工具的总结。
+</p>
+
+<p>
+  正常结束时 append assistant 消息、发 <code>final_response</code> 检查点、
+  <code>break</code> 跳出循环。若 <code>fatal_error</code> 来自工具且
+  <code>fail_on_tool_error=True</code>，则 <code>stop_reason="tool_error"</code> 提前 break。
+</p>
+
+<h2 id="execute-tools">五、_execute_tools 与并发分批</h2>
+
+<p>
+  一次 LLM 响应可能包含多个 tool call。Runner 不会无脑 <code>gather</code> 全部——
+  先按工具的安全属性分批：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/base.py" data-start="186">
+<pre><code>    @property
+    def read_only(self) -&gt; bool:
+        """Whether this tool is side-effect free and safe to parallelize."""
+        return False
+
+    @property
+    def concurrency_safe(self) -&gt; bool:
+        """Whether this tool can run alongside other concurrency-safe tools."""
+        return self.read_only and not self.exclusive
+
+    @property
+    def exclusive(self) -&gt; bool:
+        """Whether this tool should run alone even if concurrency is enabled."""
+        return False</code></pre>
+</div>
+
+<p>三个属性的关系：</p>
+
+<ul>
+  <li><code>read_only</code>：无副作用，理论上可并行（如 read_file、web_search）。</li>
+  <li><code>exclusive</code>：即使只读也必须独占（如 <code>exec</code> 工具返回 <code>True</code>，见 <a href="06-tools.html">第 06 章</a>）。</li>
+  <li><code>concurrency_safe</code>：<code>read_only and not exclusive</code>——分批算法的唯一判据。</li>
+</ul>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="1647">
+<pre><code>    def _partition_tool_batches(
+        self,
+        spec: AgentRunSpec,
+        tool_calls: list[ToolCallRequest],
+    ) -&gt; list[list[ToolCallRequest]]:
+        if not spec.concurrent_tools:
+            return [[tool_call] for tool_call in tool_calls]
+
+        batches: list[list[ToolCallRequest]] = []
+        current: list[ToolCallRequest] = []
+        for tool_call in tool_calls:
+            get_tool = cast(Callable[[str], Any] | None, getattr(spec.tools, "get", None))
+            tool = get_tool(tool_call.name) if callable(get_tool) else None
+            can_batch = bool(tool and tool.concurrency_safe)
+            if can_batch:
+                current.append(tool_call)
+                continue
+            if current:
+                batches.append(current)
+                current = []
+            batches.append([tool_call])
+        if current:
+            batches.append(current)
+        return batches</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="1359">
+<pre><code>    async def _execute_tools(
+        self,
+        spec: AgentRunSpec,
+        tool_calls: list[ToolCallRequest],
+        external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
+        hook: AgentHook | None = None,
+        context: AgentHookContext | None = None,
+    ) -&gt; tuple[list[Any], list[dict[str, str]], BaseException | None]:
+        hook = hook or AgentHook()
+        context = context or AgentHookContext(iteration=0, messages=[])
+        batches = self._partition_tool_batches(spec, tool_calls)
+        tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+        for batch in batches:
+            if spec.concurrent_tools and len(batch) &gt; 1:
+                batch_results = await asyncio.gather(*(
+                    self._run_tool(
+                        spec,
+                        tool_call,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                        hook,
+                        context,
+                    )
+                    for tool_call in batch
+                ))
+                tool_results.extend(batch_results)
+            else:
+                batch_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+                for tool_call in batch:
+                    result = await self._run_tool(
+                        spec,
+                        tool_call,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                        hook,
+                        context,
+                    )
+                    tool_results.append(result)
+                    batch_results.append(result)
+
+        results: list[Any] = []
+        events: list[dict[str, str]] = []
+        fatal_error: BaseException | None = None
+        for result, event, error in tool_results:
+            results.append(result)
+            events.append(event)
+            if error is not None and fatal_error is None:
+                fatal_error = error
+        return results, events, fatal_error</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    并发需要<strong>两个条件同时满足</strong>：<code>spec.concurrent_tools=True</code>
+    且当前 batch 里<strong>多于一个</strong>调用。
+    单个 concurrency_safe 工具仍然串行——避免为 batch size 1 付 gather 的开销。
+    写新工具时：只读且无副作用 → <code>read_only=True</code>；
+    会改状态或占全局资源 → 保持默认或设 <code>exclusive=True</code>。
+  </p>
+</div>
+
+<h2 id="run-tool">六、_run_tool：错误分层与"喂回模型"</h2>
+
+<p>
+  单个工具的执行是 ReAct 循环里最复杂的边界——
+  它要在安全、可恢复性和 <code>fail_on_tool_error</code> 之间做分层决策。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="1410">
+<pre><code>    async def _run_tool(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+        external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
+        hook: AgentHook | None = None,
+        context: AgentHookContext | None = None,
+    ) -&gt; tuple[Any, dict[str, str], BaseException | None]:
+        hook = hook or AgentHook()
+        context = context or AgentHookContext(iteration=0, messages=[])
+        hint = "\n\n[Analyze the error above and try a different approach.]"
+        lookup_error = repeated_external_lookup_error(
+            tool_call.name,
+            tool_call.arguments,
+            external_lookup_counts,
+        )
+        if lookup_error:
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": "repeated external lookup blocked",
+            }
+            if spec.fail_on_tool_error:
+                return lookup_error + hint, event, RuntimeError(lookup_error)
+            return lookup_error + hint, event, None
+        prepare_call = cast(
+            Callable[[str, Any], object] | None,
+            getattr(spec.tools, "prepare_call", None),
+        )
+        tool, params, prep_error = None, tool_call.arguments, None
+        if callable(prepare_call):
+            prepared = prepare_call(tool_call.name, tool_call.arguments)
+            if isinstance(prepared, tuple):
+                prepared_tuple = cast(tuple[object, ...], prepared)
+                if len(prepared_tuple) == 3:
+                    tool, params, prep_error = cast(tuple[Any, Any, str | None], prepared_tuple)
+        if prep_error:
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": prep_error.split(": ", 1)[-1][:120],
+            }
+            handled = self._classify_violation(
+                raw_text=prep_error,
+                soft_payload=prep_error + hint,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
+            return prep_error + hint, event, (
+                RuntimeError(prep_error) if spec.fail_on_tool_error else None
+            )
+        await hook.before_execute_tool(context, tool_call, tool, params)
+        try:
+            if tool is not None:
+                result = await tool.execute(**params)
+            else:
+                result = await spec.tools.execute(tool_call.name, params)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": str(exc),
+            }
+            payload = f"Error: {type(exc).__name__}: {exc}"
+            handled = self._classify_violation(
+                raw_text=str(exc),
+                # Preserve legacy exception payloads without the retry hint.
+                soft_payload=payload,
+                event=event,
+                tool_call=tool_call,
+                workspace_violation_counts=workspace_violation_counts,
+            )
+            if handled is not None:
+                return handled
+            if spec.fail_on_tool_error:
+                return payload, event, exc
+            return payload, event, None</code></pre>
+</div>
+
+<p>错误处理的优先级链：</p>
+
+<ol>
+  <li><strong>重复外部查询拦截</strong>——同一 URL/目标短时间内反复 web_fetch，直接返回文本，不真正调用。</li>
+  <li><strong><code>prepare_call</code> 三元组</strong>——<code>(tool, params, prep_error)</code> 在参数校验阶段就能失败（路径非法、JSON 解析错误等）。</li>
+  <li><strong><code>_classify_violation</code></strong>——区分 SSRF 硬边界 vs 工作区软违规，决定是否升级提示。</li>
+  <li><strong>执行期异常 / 工具返回的错误字符串</strong>——默认变成 tool 消息的 <code>content</code>，附带 <code>hint</code> 常量引导模型换思路。</li>
+</ol>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="1568">
+<pre><code>    def _classify_violation(
+        self,
+        *,
+        raw_text: str,
+        soft_payload: str,
+        event: dict[str, str],
+        tool_call: ToolCallRequest,
+        workspace_violation_counts: dict[str, int],
+    ) -&gt; tuple[Any, dict[str, str], BaseException | None] | None:
+        """Classify safety-boundary failures, or return ``None`` to pass through."""
+        if self._is_ssrf_violation(raw_text):
+            logger.warning(
+                "Tool {} blocked by SSRF guard; returning non-retryable tool error: {}",
+                tool_call.name,
+                raw_text.replace("\n", " ").strip()[:200],
+            )
+            event["detail"] = self._event_detail("ssrf_violation: ", raw_text)
+            return self._ssrf_soft_payload(raw_text), event, None
+
+        if self._is_workspace_violation(raw_text):
+            escalation = repeated_workspace_violation_error(
+                tool_call.name,
+                tool_call.arguments,
+                workspace_violation_counts,
+            )
+            event["detail"] = self._event_detail("workspace_violation: ", raw_text)
+            if escalation is not None:
+                logger.warning(
+                    "Tool {} hit workspace boundary repeatedly; escalating hint",
+                    tool_call.name,
+                )
+                event["detail"] = self._event_detail(
+                    "workspace_violation_escalated: ",
+                    raw_text,
+                )
+                return escalation, event, None
+            return soft_payload, event, None
+
+        return None</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：工具错误默认不抛异常</div>
+  <p>
+    返回值三元组 <code>(result_text, event, fatal_error)</code> 里，
+    只有第三个元素非 <code>None</code> 时整轮才会以 <code>tool_error</code> 终止。
+    默认路径：<code>fatal_error=None</code>，错误文本作为 <code>role="tool"</code> 消息
+    append 到 <code>messages</code>，<strong>下一轮 LLM 自己读错误、自己改策略</strong>。
+  </p>
+  <p style="margin-bottom:0">
+    这是 ReAct 范式的核心——模型是控制流，Runner 是执行器。
+    如果每次工具失败都抛异常终止，一个 typo 参数就会让整个回合崩溃；
+    把错误当观测（observation）喂回去，agent 才能"读了报错再试另一种写法"。
+    SSRF 是例外：返回带 <code>_SSRF_BOUNDARY_NOTE</code> 的不可绕过提示（见
+    <a href="10-security.html">第 10 章</a>），但仍不抛 fatal——对话可以继续，只是模型不应再试。
+  </p>
+</div>
+
+<h2 id="termination">七、终止条件汇总</h2>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>stop_reason</th><th>触发点</th><th>典型后果</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>completed</code></td>
+  <td>模型给出最终文本回复，无待执行工具，正常 <code>break</code></td>
+  <td><code>final_content</code> 为 assistant 回复；messages 含完整 transcript</td>
+</tr>
+<tr>
+  <td><code>max_iterations</code></td>
+  <td><code>for</code> 循环走完 <code>else</code> 分支（<code>runner.py:828</code>）</td>
+  <td>可选 finalization 请求 + 模板兜底消息</td>
+</tr>
+<tr>
+  <td><code>tool_error</code></td>
+  <td><code>_execute_tools</code> 返回 <code>fatal_error</code> 且 <code>fail_on_tool_error=True</code></td>
+  <td>整轮中止，<code>error</code> 字段有描述</td>
+</tr>
+<tr>
+  <td><code>error</code></td>
+  <td>LLM <code>finish_reason=="error"</code>，或 <code>run()</code> 捕获未处理异常</td>
+  <td>用户看到 <code>error_message</code>；transcript 可能写入占位 assistant 消息</td>
+</tr>
+<tr>
+  <td><code>cancelled</code></td>
+  <td><code>run()</code> 的 <code>CancelledError</code> 分支（不返回 result，直接 raise）</td>
+  <td>Loop 负责检查点恢复（第 03 章 3.2 节）</td>
+</tr>
+<tr>
+  <td><code>empty_final_response</code></td>
+  <td>多次空回复且 finalization 仍失败</td>
+  <td>写入 <code>EMPTY_FINAL_RESPONSE_MESSAGE</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>迭代用尽时的 finalization</h3>
+
+<p>
+  当 ReAct 循环跑满 <code>max_iterations</code> 还没自然结束时，
+  若 <code>finalize_on_max_iterations=True</code>（默认），Runner 会再发起一次
+  <strong>不带工具</strong> 的 LLM 请求，让模型基于已有 transcript 给出总结：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="1195">
+<pre><code>    async def _try_finalize_after_max_iterations(
+        self,
+        spec: AgentRunSpec,
+        hook: AgentHook,
+        messages: list[dict[str, Any]],
+        usage: dict[str, int],
+        conversation_state: ProviderConversationStateController,
+    ) -&gt; str | None:
+        retry_messages = self._budget_exhausted_finalization_messages(messages)
+        try:
+            response = await self._request_no_tools(
+                spec,
+                retry_messages,
+                provider_context=conversation_state.independent_request_context(
+                    context_window_tokens=spec.runtime.context_window_tokens,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Budget-exhausted finalization failed for {}; using fallback",
+                spec.session_key or "default",
+            )
+            return None
+
+        raw_usage = self._usage_or_estimate(spec, retry_messages, response)
+        self._accumulate_usage(usage, raw_usage)
+        if response.finish_reason == "error" or response.has_tool_calls:
+            logger.warning(
+                "Budget-exhausted finalization returned finish_reason='{}' "
+                "with {} tool call(s) for {}; using fallback",
+                response.finish_reason,
+                len(response.tool_calls),
+                spec.session_key or "default",
+            )
+            return None
+
+        context = AgentHookContext(
+            iteration=spec.max_iterations,
+            messages=messages,
+            response=response,
+            usage=dict(raw_usage),
+            session_key=spec.session_key,
+        )
+        clean = hook.finalize_content(context, response.content)
+        if is_blank_text(clean):
+            return None
+        return clean</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="1243">
+<pre><code>    async def _request_no_tools(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        *,
+        provider_context: ProviderCallContext | None = None,
+    ) -&gt; LLMResponse:
+        kwargs = self._build_request_kwargs(
+            spec,
+            messages,
+            tools=None,
+        )
+        return await spec.runtime.provider.chat_with_retry(
+            **kwargs,
+            provider_context=provider_context,
+        )</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 max_iterations 还要再问一次</div>
+  <p>
+    迭代用尽往往意味着 agent 还在 tool loop 里打转——此时 transcript 里已经有大量
+    工具结果和部分推理，只是没来得及输出面向用户的总结。
+    直接返回模板"已达到最大迭代次数"会让用户<strong>空手而归</strong>。
+  </p>
+  <p style="margin-bottom:0">
+    <code>_request_no_tools</code> 显式传 <code>tools=None</code>，
+    防止 finalization 回合又触发工具调用（若仍返回 tool_calls 则 fallback 到模板）。
+    这是"尽力交付"而不是"静默失败"的设计。
+  </p>
+</div>
+
+<h2 id="goal">八、持续目标（sustained goal）的续跑</h2>
+
+<p>
+  某些长任务需要 agent 在"模型以为已经答完"之后继续工作。
+  Runner 通过 <code>goal_active_predicate</code> 和 <code>goal_continue_message</code>
+  在<strong>最终回复路径</strong>上注入一条 synthetic user 消息，迫使下一轮迭代继续：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="301">
+<pre><code>    def _build_goal_continue_message(self, spec: AgentRunSpec) -&gt; dict[str, str]:
+        custom = spec.goal_continue_message
+        if callable(custom):
+            try:
+                custom = custom()
+            except Exception:
+                logger.exception("goal_continue_message callback failed")
+                custom = None
+        return build_goal_continue_message(custom)</code></pre>
+</div>
+
+<p>
+  触发点在 <code>_try_drain_injections</code>：当没有真实用户注入、但
+  <code>allow_goal_continue=True</code> 且 predicate 返回真时，
+  构造 goal continue 消息 append 到 <code>messages</code> 并 <code>continue</code> 循环。
+  Loop 层负责维护 predicate（读 session goal state），Runner 只负责"收到继续信号就再跑一轮"。
+</p>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：goal continue 与 injection 共用配额</div>
+  <p>
+    真实注入走 <code>injection_callback</code>，受 <code>_MAX_INJECTION_CYCLES</code>（5）限制；
+    goal continue 不计入 injection_cycles，但在
+    <code>finish_reason in {refusal, content_filter}</code> 时会被禁用——
+    模型已明确拒绝时不应强行续跑。
+  </p>
+  <p style="margin-bottom:0">
+    续跑前若已有 <code>assistant_message</code>，会先 append 并打
+    <code>final_response</code> 检查点，保证中途停止时 partial 答案不丢。
+  </p>
+</div>
+
+<h2 id="quiz">九、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>模型返回了 3 个 tool_calls，<code>finish_reason="content_filter"</code>。Runner 会执行这些工具吗？为什么？</p>
+    <ul class="opts">
+      <li><b>A</b> 会，因为有 tool_calls</li>
+      <li><b>B</b> 不会，<code>should_execute_tools</code> 为 False</li>
+      <li><b>C</b> 会，但只执行 read_only 工具</li>
+    </ul>
+  </div>
+  <div class="ans">
+    <p><strong>答案：B。</strong></p>
+    <p>
+      <code>should_execute_tools</code> 要求 <code>finish_reason in ("tool_calls", "function_call", "stop")</code>。
+      <code>content_filter</code> 不在其中，因此整个工具分支被跳过。
+      若 <code>has_tool_calls</code> 仍为真，会打 warning（<code>runner.py:625</code>）后忽略。
+    </p>
+    <p>
+      后果：若错误地只看 <code>has_tool_calls</code> 就执行，
+      agent 可能在内容已被平台过滤的场景下仍运行 <code>write_file</code> 或 <code>exec</code>——
+      既违反 provider 语义，也可能产生用户未授权的副作用。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span><code>concurrent_tools=True</code>，模型一次返回 4 个调用：<code>read_file(a)</code>、<code>read_file(b)</code>、<code>exec(cmd)</code>、<code>web_search(q)</code>。描述 <code>_partition_tool_batches</code> 的分批结果和执行时序。</p>
+  </div>
+  <div class="ans">
+    <p><strong>分批结果（3 个 batch）：</strong></p>
+    <div class="ascii">Batch 1（并发 gather）: read_file(a), read_file(b), web_search(q)
+  — 三者 read_only 且非 exclusive → concurrency_safe
+
+Batch 2（串行）: exec(cmd)
+  — exclusive=True，flush 掉前面积累的 batch 后单独成批</div>
+    <p><strong>执行时序：</strong></p>
+    <ol>
+      <li>Batch 1 三个工具 <code>asyncio.gather</code> 并行，各自走完整 <code>_run_tool</code> 流程。</li>
+      <li>Batch 2 的 <code>exec</code> 单独 await，不会与任何工具重叠。</li>
+      <li>四个结果按<strong>原始 tool_calls 顺序</strong> zip 回 tool 消息（gather 保序）。</li>
+    </ol>
+    <p>
+      若 <code>exec</code> 和 <code>write_file</code> 被放进同一 batch 并行，
+      可能出现 shell 读到半写入的文件——这就是 <code>exclusive</code> 存在的原因。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span><code>fail_on_tool_error=False</code>（默认）时，<code>read_file</code> 因路径越界返回 workspace violation 文本。请构造从工具失败到模型可能纠正的完整消息时序，并说明若改成 <code>fail_on_tool_error=True</code> 时序如何变化。</p>
+  </div>
+  <div class="ans">
+    <p><strong>默认路径时序：</strong></p>
+    <div class="ascii">iter 0  LLM → tool_calls: read_file("/etc/passwd")
+        Runner append assistant (含 tool_calls)
+        _run_tool → prepare_call 或 execute 返回 violation 文本
+        _classify_violation → soft_payload + hint append 为 role="tool"
+        fatal_error=None → 不 break
+        checkpoint tools_completed → continue
+
+iter 1  LLM 读到 tool 消息里的 "outside the configured workspace"
+        + "[Analyze the error above and try a different approach.]"
+        → 可能改调 read_file("./workspace/...") 或 ask user</div>
+    <p>
+      关键点：错误从未抛到 <code>run()</code> 的 <code>except Exception</code>；
+      transcript 里保留了完整的 assistant→tool 对，模型在下一轮有完整观测。
+    </p>
+    <p><strong><code>fail_on_tool_error=True</code> 时：</strong></p>
+    <div class="ascii">iter 0  同上，但 _run_tool 返回 fatal_error=RuntimeError(violation)
+        _execute_tools 汇总 fatal_error
+        stop_reason="tool_error"，append 错误 final_content，break
+        不会进入 iter 1</div>
+    <p>
+      用户看到硬错误而非 agent 自救。此模式适合测试/CI 或需要严格失败语义的 API 调用方。
+      生产对话默认 False，因为大多数参数错误都值得给模型一次纠正机会。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    <code>AgentRunner</code> = <strong>AgentRunSpec 契约</strong> +
+    <strong>ReAct 主循环</strong>（治理副本 / 权威 transcript 分离）+
+    <strong>工具并发分批与错误喂回</strong> +
+    <strong>多路径终止与 max_iterations finalization</strong>。
+    它刻意不碰渠道和持久化，所以读源码时始终问一个问题：
+    "这段逻辑该在 Runner 里，还是该在 Loop 传给 spec 的回调里？"
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

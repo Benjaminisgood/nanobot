@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 渠道适配层 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 08 章 · 边缘层</div>
+<h1>渠道适配层</h1>
+<p class="lede">
+  <a href="02-bus.html">第 02 章</a> 定义了 <code>InboundMessage</code> 的统一出口；
+  这一章读<strong>18 个聊天平台怎么各自实现这个出口</strong>——
+  从 <code>BaseChannel</code> 契约、两段式插件发现、Telegram 消息规范化，
+  到 <code>ChannelManager</code> 的生命周期与重试策略。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="base">一、BaseChannel：三个抽象方法 + 类属性默认值</h2>
+
+<p>
+  每个渠道继承 <code>BaseChannel</code>（<code>channels/base.py</code>，ABC）。
+  类属性定义了渠道在进度/UI 层的默认行为：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/base.py" data-start="29">
+<pre><code>    name: str = "base"
+    display_name: str = "Base"
+    send_progress: bool = True
+    send_tool_hints: bool = True
+    show_reasoning: bool = True</code></pre>
+</div>
+
+<p>
+  三个<strong>抽象方法</strong>构成最小运行时契约——
+  子类必须实现 <code>start</code> / <code>stop</code> / <code>send</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/base.py" data-start="74">
+<pre><code>    @abstractmethod
+    async def start(self) -> None:
+        """
+        Start the channel and begin listening for messages.
+
+        This should be a long-running async task that:
+        1. Connects to the chat platform
+        2. Listens for incoming messages
+        3. Forwards messages to the bus via _handle_message()
+        """
+        pass
+
+    @abstractmethod
+    async def stop(self) -> None:
+        """Stop the channel and clean up resources."""
+        pass
+
+    @abstractmethod
+    async def send(self, msg: OutboundMessage) -> None:
+        """
+        Send a message through this channel.
+
+        Args:
+            msg: The message to send.
+
+        Implementations should raise on delivery failure so the channel manager
+        can apply any retry policy in one place.
+        """
+        pass</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点：重试集中化的契约</div>
+  <p style="margin-bottom:0">
+    <code>send</code> 的 docstring 明确要求：<strong>"Implementations should raise on delivery failure
+    so the channel manager can apply any retry policy in one place."</strong>
+    渠道只负责"尽力发送 + 失败抛异常"，指数退避重试全在
+    <code>ChannelManager._send_with_retry()</code> 一处——
+    避免 18 个渠道各写一套 retry 逻辑。
+  </p>
+</div>
+
+<p>
+  渠道还可覆写 <code>should_retry_send_error()</code> 来标记"业务错误不可重试"
+  （比如 Telegram 的 chat not found），Manager 会尊重这个 hook。
+</p>
+
+<h2 id="discovery">二、两段式发现：manifest 与 runtime 分离</h2>
+
+<p>
+  这是本章<strong>最核心的设计</strong>。nanobot 不把 18 个平台的 SDK 绑死在核心依赖里——
+  可选依赖通过 <code>scripts/install_channel_dependencies.py</code> 按需安装。
+  如果在发现阶段就 import Telegram SDK，没装依赖的用户 gateway 直接崩。
+</p>
+
+<h3>2.1 第一阶段：pkgutil 扫描 + manifest 判定</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/registry.py" data-start="20">
+<pre><code>def _channel_package_names() -> list[str]:
+    import nanobot.channels as package
+
+    return [
+        name
+        for _, name, is_package in pkgutil.iter_modules(package.__path__)
+        if is_package and has_channel_package(name)
+    ]
+
+
+def discover_plugins(
+    enabled_names: set[str] | None = None,
+) -> dict[str, ChannelPlugin]:
+    """Load dependency-free descriptors from self-contained channel packages."""
+    plugins: dict[str, ChannelPlugin] = {}
+    for name in _channel_package_names():
+        if enabled_names is not None and name not in enabled_names:
+            continue
+        try:
+            plugin = load_channel_package(name)
+            if plugin is not None:
+                plugins[name] = plugin
+        except Exception as exc:
+            logger.warning("Failed to load channel package descriptor '{}': {}", name, exc)
+    return plugins</code></pre>
+</div>
+
+<p>判定规则在 <code>plugin.py</code>——子目录须是 package 且存在 <code>manifest.py</code>：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/plugin.py" data-start="127">
+<pre><code>def has_channel_package(name: str) -> bool:
+    """Return whether *name* owns a dependency-free package manifest."""
+    if _CHANNEL_PACKAGE_NAME.fullmatch(name) is None:
+        return False
+    return files("nanobot.channels").joinpath(name, "manifest.py").is_file()</code></pre>
+</div>
+
+<p>
+  <code>load_channel_package()</code> 只 import <code>manifest.py</code>，读其中的
+  <code>PLUGIN: ChannelPlugin</code> 描述符——<strong>不触碰 runtime 模块</strong>。
+</p>
+
+<h3>2.2 Telegram manifest 示例</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/telegram/manifest.py" data-start="20">
+<pre><code>PLUGIN = ChannelPlugin(
+    name="telegram",
+    display_name="Telegram",
+    runtime=f"{__package__}.runtime:TelegramChannel",
+    setup=SETUP_SPEC,
+    dependencies=(
+        "python-telegram-bot[socks,webhooks]>=22.6,&lt;23.0",
+        "socksio>=1.0.0,&lt;2.0.0",
+        "python-socks[asyncio]>=2.8.0,&lt;3.0.0; sys_platform != 'win32'",
+    ),
+    webui="webui/index.ts",
+)</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 manifest 是 dependency-free descriptor</div>
+  <p>
+    manifest 只声明"这个渠道叫什么、runtime 在哪、需要什么 pip 包"——
+    全是字符串和元数据，import 它不会触发 <code>python-telegram-bot</code> 的加载。
+  </p>
+  <p style="margin-bottom:0">
+    只有用户<strong>真正启用</strong> Telegram 时，<code>ChannelManager._init_channels()</code>
+    才调用 <code>plugin.load_channel_class()</code> 懒加载 runtime。
+    没装 SDK 的用户：manifest 扫描成功，但启动时报清晰的 dependency error——
+    而不是 import 阶段的 ImportError 雪崩。
+  </p>
+</div>
+
+<h3>2.3 第二阶段：Manager 读配置、检测冲突、懒加载 runtime</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/manager.py" data-start="212">
+<pre><code>    def _init_channels(self) -> None:
+        """Initialize enabled runtimes from dependency-free channel descriptors."""
+        from nanobot.channels.registry import discover_plugins
+        from nanobot.optional_features import ensure_enabled_channel_dependencies
+
+        plugins = discover_plugins()
+        default_sections: dict[str, Any] = {}
+        activations: dict[str, tuple[Any, list[tuple[str, Any]]]] = {}
+        enabled_names: set[str] = set()
+        for name, plugin in plugins.items():
+            section = self._channel_section(
+                name,
+                default_sections=default_sections,
+                default_enabled=plugin.default_enabled,
+            )
+            if section is None:
+                continue
+            try:
+                channel_setup_spec(name, plugin=plugin)
+                specs = channel_instance_specs(plugin, section)
+                runtime_specs = [
+                    (channel_runtime_name(plugin, spec.instance_id), spec)
+                    for spec in specs
+                ]
+            except Exception as exc:
+                logger.warning("Could not inspect {} channel activation: {}", name, exc)
+                continue
+            if not runtime_specs:
+                continue
+            collisions = sorted(
+                set(self._channel_runtime_specs)
+                & {runtime_name for runtime_name, _spec in runtime_specs}
+            )
+            if collisions:
+                logger.warning(
+                    "{} channel runtime name(s) are already claimed: {}",
+                    name,
+                    ", ".join(collisions),
+                )
+                continue
+            for runtime_name, spec in runtime_specs:
+                self._channel_runtime_specs[runtime_name] = (name, spec.instance_id)
+            activations[name] = (plugin, runtime_specs)
+            enabled_names.add(name)</code></pre>
+</div>
+
+<p>
+  注意 <code>collisions</code> 检测——同一 runtime name 不能被两个实例抢占。
+  之后 <code>ensure_enabled_channel_dependencies</code> 批量检查已启用渠道的 pip 依赖。
+</p>
+
+<h2 id="normalize">三、消息规范化：以 Telegram 为例</h2>
+
+<p>
+  渠道的核心职责之一：把平台富媒体消息<strong>降维</strong>成
+  <a href="02-bus.html">第 02 章</a> 定义的 <code>InboundMessage</code>。
+  Telegram 的数据流：
+</p>
+
+<div class="ascii">MessageHandler
+  → _on_message (runtime.py:1496)
+  → _process_message_update (1505)
+  → 提取 text / caption / location / media
+  → _build_message_metadata (1222)
+  → _sender_id (1195，格式 id|username)
+  → _derive_topic_session_key
+  → 基类 _handle_message → publish_inbound</div>
+
+<p>内容拼装的核心片段：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/telegram/runtime.py" data-start="1525">
+<pre><code>        # Build content from text and/or media
+        content_parts: list[str] = []
+        media_paths: list[str] = []
+
+        # Text content
+        if message.text:
+            content_parts.append(message.text)
+        if message.caption:
+            content_parts.append(message.caption)
+
+        # Location content
+        if message.location:
+            lat = message.location.latitude
+            lon = message.location.longitude
+            content_parts.append(f"[location: {lat}, {lon}]")
+
+        # Download current message media
+        current_media_paths, current_media_parts = await self._download_message_media(
+            message, add_failure_content=True
+        )
+        media_paths.extend(current_media_paths)
+        content_parts.extend(current_media_parts)</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    位置被文本化为 <code>[location: 31.2, 121.5]</code>，图片下载到本地路径放进
+    <code>media</code>——核心层和 LLM 完全不需要理解 Telegram 的
+    <code>Message.location</code> 或 <code>file_id</code> 结构。
+    第 02 章练习里讨论过 <code>media</code> 为什么是本地路径而非 URL。
+  </p>
+</div>
+
+<h2 id="handle">四、基类的统一出口：鉴权 + 配对 + publish</h2>
+
+<p>
+  各渠道在规范化完成后，都调用基类 <code>_handle_message()</code>——
+  这是进入总线前的<strong>最后一道门</strong>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/base.py" data-start="274">
+<pre><code>        permission_id = authorization_id if authorization_id is not None else sender_id
+        if not self.is_allowed(permission_id):
+            if is_dm:
+                try:
+                    code = generate_code(self.name, str(sender_id))
+                except OSError:
+                    # Transient pairing-store I/O failure: skip the pairing
+                    # reply for this message rather than crash the handler.
+                    self.logger.warning(
+                        "Pairing store unavailable; dropping DM from {}", sender_id
+                    )
+                    return
+                await self.send(
+                    OutboundMessage(
+                        channel=self.name,
+                        chat_id=str(chat_id),
+                        content=format_pairing_reply(code),
+                        metadata={PAIRING_CODE_META_KEY: code},
+                    )
+                )
+                self.logger.info(
+                    "Sent pairing code {} to sender {} in chat {}",
+                    code, sender_id, chat_id,
+                )
+            else:
+                self.logger.warning(
+                    "Access denied for sender {}. "
+                    "Add them to allowFrom list in config to grant access.",
+                    sender_id,
+                )
+            return
+
+        meta = metadata or {}
+        if self.supports_streaming:
+            meta = {**meta, "_wants_stream": True}
+
+        msg = InboundMessage(
+            channel=self.name,
+            sender_id=str(sender_id),
+            chat_id=str(chat_id),
+            content=content,
+            media=media or [],
+            metadata=meta,
+            session_key_override=session_key,
+            require_existing_session=require_existing_session,
+        )
+
+        await self.bus.publish_inbound(msg)</code></pre>
+</div>
+
+<p>三个细节：</p>
+
+<ol>
+  <li>
+    <strong>私聊未授权 → 配对码。</strong>
+    <code>generate_code</code> / <code>format_pairing_reply</code> 给用户一个码，
+    用户在 config 里批准后才能对话。群聊只记 warning，不发码——
+    避免在群里泄露 pairing code。
+  </li>
+  <li>
+    <strong>配对存储 I/O 失败不崩处理器。</strong>
+    <code>except OSError</code> 后 warning + return——
+    磁盘满或权限问题时，宁可丢一条消息也不让整个 channel task 退出。
+  </li>
+  <li>
+    <strong>流式渠道注入 <code>_wants_stream: True</code>。</strong>
+    下游 <code>AgentLoop</code> 据此决定是否走流式 delivery 路径。
+  </li>
+</ol>
+
+<p>
+  鉴权细节见 <a href="10-security.html">第 10 章</a> 的 pairing 机制。
+</p>
+
+<h2 id="lifecycle">五、生命周期与重试</h2>
+
+<h3>5.1 启动与停止</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/manager.py" data-start="568">
+<pre><code>    async def start_all(self) -> None:
+        """Start all channels and the outbound dispatcher."""
+        if not self.channels:
+            logger.warning("No channels enabled")
+            return
+
+        self._started = True
+        # Start outbound dispatcher
+        self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
+
+        # Start channels
+        tasks: list[asyncio.Task[None]] = []
+        for name, channel in self.channels.items():
+            tasks.append(self._start_channel_task(name, channel))
+
+        self._notify_restart_done_if_needed()
+
+        # Wait for all to complete (they should run forever)
+        await asyncio.gather(*tasks, return_exceptions=True)</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/manager.py" data-start="632">
+<pre><code>    async def stop_all(self) -> None:
+        """Stop all channels and the dispatcher."""
+        logger.info("Stopping all channels...")
+        self._started = False
+
+        # Stop dispatcher
+        if self._dispatch_task:
+            self._dispatch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._dispatch_task
+
+        # Stop all channels
+        for name in list(self.channels):
+            await self._stop_channel(name)</code></pre>
+</div>
+
+<p>
+  <code>start_all</code> 先起 outbound dispatcher（消费 <code>bus.outbound</code>），
+  再起每个 channel 的监听 task。两者并行运行，通过总线解耦——
+  和第 02 章 44 行总线的设计一脉相承。
+</p>
+
+<h3>5.2 Outbound dispatcher：pending 缓冲 + 流式合并</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/manager.py" data-start="674">
+<pre><code>    async def _dispatch_outbound(self) -> None:
+        """Dispatch outbound messages to the appropriate channel."""
+        logger.info("Outbound dispatcher started")
+
+        # Buffer for messages that couldn't be processed during delta coalescing
+        # (since asyncio.Queue doesn't support push_front)
+        pending: list[OutboundMessage] = []
+
+        while True:
+            try:
+                # First check pending buffer before waiting on queue
+                if pending:
+                    msg = pending.pop(0)
+                else:
+                    msg = await asyncio.wait_for(
+                        self.bus.consume_outbound(),
+                        timeout=1.0
+                    )</code></pre>
+</div>
+
+<p>
+  <code>asyncio.Queue</code> 不支持 <code>push_front</code>——
+  流式 delta 合并时如果有消息暂时不能处理，就放进 <code>pending</code> 列表，
+  下一轮循环优先弹出。这是用<strong>应用层缓冲</strong>弥补队列 API 限制的典型做法。
+</p>
+
+<h3>5.3 指数退避重试</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/manager.py" data-start="905">
+<pre><code>    async def _send_with_retry(
+        self,
+        channel: BaseChannel,
+        msg: OutboundMessage,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        """Send a message with retry on failure using exponential backoff.
+
+        When deadline is provided, retry until that monotonic time instead of
+        stopping at the configured attempt limit.
+
+        Note: CancelledError is re-raised to allow graceful shutdown.
+        """
+        max_attempts = max(self.config.channels.send_max_retries, 1)
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                await self._send_once(channel, msg)
+                return  # Send succeeded
+            except asyncio.CancelledError:
+                raise  # Propagate cancellation for graceful shutdown
+            except Exception as e:
+                if not channel.should_retry_send_error(e):
+                    logger.error(
+                        "Send to {} failed with a non-retryable {}: {}",
+                        msg.channel,
+                        type(e).__name__,
+                        e,
+                    )
+                    return
+                loop = asyncio.get_running_loop()
+                exhausted = (
+                    attempt &gt;= max_attempts
+                    if deadline is None
+                    else loop.time() &gt;= deadline
+                )
+                if exhausted:
+                    logger.exception(
+                        "Failed to send to {} after {} attempts",
+                        msg.channel, attempt,
+                    )
+                    return
+                delay = _SEND_RETRY_DELAYS[min(attempt - 1, len(_SEND_RETRY_DELAYS) - 1)]
+                if deadline is not None:
+                    delay = min(delay, max(0.0, deadline - loop.time()))
+                attempt_label = str(attempt)
+                if deadline is None:
+                    attempt_label = f"{attempt}/{max_attempts}"
+                logger.warning(
+                    "Send to {} failed (attempt {}): {}, retrying in {}s",
+                    msg.channel, attempt_label, type(e).__name__, delay,
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise  # Propagate cancellation during sleep</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 CancelledError 必须 re-raise</div>
+  <p style="margin-bottom:0">
+    和第 03 章 <code>run()</code> 的 CancelledError 处理是同一类问题：
+    shutdown 时 <code>stop_all()</code> cancel dispatcher task，
+    如果重试循环吞掉 CancelledError，进程永远关不干净。
+  </p>
+</div>
+
+<h2 id="duplication">六、「宁可重复，不要过早抽象」</h2>
+
+<p>
+  <code>.agent/design.md</code> 有一条明确的架构约束：
+</p>
+
+<div class="callout">
+  <div class="t">原文 · Prefer duplication over premature abstraction</div>
+  <p style="margin-bottom:0">
+    "Channels and providers are allowed to repeat similar logic (send retries, media handling,
+    message splitting). Do not introduce complex base classes or shared helpers just to eliminate
+    duplication across channel files. Each channel file should remain self-contained and readable
+    on its own."
+  </p>
+</div>
+
+<p>
+  这意味着 Telegram 的发送重试逻辑<strong>不会</strong>被抽成 <code>BaseChannel.send_with_split()</code>——
+  尽管飞书和微信也有类似需求。代价是：
+</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>文件</th><th>行数</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>channels/feishu/runtime.py</code></td><td>2887</td><td>飞书富文本、卡片、话题、@mention 全在单文件</td></tr>
+<tr><td><code>channels/weixin/runtime.py</code></td><td>2590</td><td>微信企业号消息格式、回调验签、媒体上传</td></tr>
+<tr><td><code>channels/telegram/runtime.py</code></td><td>1784</td><td>相对"轻量"，但仍有独立的 media download、topic 路由</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>收益</strong>：</p>
+<ul>
+  <li>改 Telegram 不会意外破坏飞书——没有共享基类耦合</li>
+  <li>新人读一个渠道文件就能理解该平台的全链路，不用跳 5 个 abstract class</li>
+  <li>平台 SDK 差异太大（Webhook vs Long Polling vs Matrix sync），抽象层很快变成 Leaky Abstraction</li>
+</ul>
+
+<p><strong>代价</strong>：</p>
+<ul>
+  <li>修一个通用 bug（比如 media path 处理）可能要在 N 个文件各改一遍</li>
+  <li>单文件 2000+ 行，IDE 跳转和 code review 负担重</li>
+</ul>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p style="margin-bottom:0">
+    重试、鉴权、流式合并这些<strong>跨渠道不变量</strong>集中在 Manager 和 BaseChannel；
+    媒体处理、消息切分、平台特有交互<strong>允许重复</strong>。
+    判断标准：<em>如果抽象消除了真实复杂度，就抽象；如果只是消除行数重复，就复制。</em>
+  </p>
+</div>
+
+<h2 id="quiz">七、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>为什么渠道发现阶段只读 <code>manifest.py</code>，而不直接 <code>import telegram.runtime</code>？</p>
+    <ul class="opts">
+      <li><b>A</b> manifest 文件更小，加载更快</li>
+      <li><b>B</b> runtime 模块会 import 平台 SDK，没装依赖的用户会在 gateway 启动时崩溃</li>
+      <li><b>C</b> Python 不允许动态 import 子包</li>
+      <li><b>D</b> manifest 包含加密凭证，runtime 不含</li>
+    </ul>
+  </div>
+  <div class="ans">
+    <p><strong>答案：B。</strong></p>
+    <p>
+      18 个渠道的 SDK 是<strong>可选依赖</strong>（见 <code>scripts/install_channel_dependencies.py</code>）。
+      <code>discover_plugins()</code>（<code>registry.py:30-44</code>）在扫描阶段只 load manifest——
+      纯字符串描述符，零 SDK import。
+      只有用户启用 Telegram 且依赖已安装时，<code>load_channel_class()</code> 才 import runtime。
+    </p>
+    <p>
+      A 不对：速度不是主因。C 不对：Python 完全支持动态 import。
+      D 不对：凭证在 config.json，不在 manifest 里。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span><code>_dispatch_outbound</code> 为什么需要 <code>pending</code> 列表？如果流式合并时把暂不能处理的消息直接 <code>put</code> 回 <code>asyncio.Queue</code> 会怎样？</p>
+  </div>
+  <div class="ans">
+    <p>
+      <strong>原因：</strong><code>asyncio.Queue</code> 是 FIFO，没有 <code>push_front</code>。
+      流式 delta 合并（<code>_coalesce_stream_deltas</code>）可能产生"当前 msg 要合并、
+      下一条 msg 暂时不能处理"的情况——需要<strong>优先处理</strong>被推迟的消息。
+    </p>
+    <p>
+      <strong>如果 put 回队列：</strong>消息跑到队列尾部，顺序被打乱——
+      比如 StreamEnd 先于最后一个 StreamDelta 被发送，用户看到流式输出闪烁或截断。
+      更糟的是，合并窗口内的 delta 可能永远等不到配对。
+    </p>
+    <p>
+      <code>pending</code> 列表实现 LIFO 优先：<code>pop(0)</code> 在下一轮循环最先被消费。
+      源码：<code>manager.py:674-691</code>。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>假设你要给 Discord 加"消息已编辑"事件支持。请判断：该改 <code>BaseChannel</code>、
+    <code>InboundMessage</code>、还是只在 <code>channels/discord/runtime.py</code> 本地处理？说明理由。</p>
+  </div>
+  <div class="ans">
+    <p><strong>结论：主要在 <code>discord/runtime.py</code> 本地处理，必要时扩展 <code>metadata</code>。</strong></p>
+    <p><strong>判断依据</strong>（和第 02 章"已读回执"练习同一套框架）：</p>
+    <ol>
+      <li>
+        <strong>所有平台都有吗？</strong> 没有。Telegram 有 edit，邮件没有。→ 不是统一抽象。
+      </li>
+      <li>
+        <strong>agent 决策会影响它吗？</strong> 编辑事件的处理方式（更新 transcript vs 追加新消息）
+        可能需要 agent 层配合，但事件检测本身在渠道层。
+      </li>
+      <li>
+        <strong>需要平台 SDK 吗？</strong> 需要 Discord gateway 的 MESSAGE_UPDATE 事件。→ 渠道层。
+      </li>
+    </ol>
+    <p>
+      <strong>具体做法：</strong>在 Discord runtime 的 event handler 里捕获 edit 事件，
+      构造新的 <code>InboundMessage</code>（或在 <code>metadata</code> 里塞
+      <code>edited_message_id</code>），调 <code>_handle_message()</code>。
+      <strong>不要</strong>给 <code>InboundMessage</code> 加 <code>is_edit: bool</code> 字段——
+      17 个渠道用不上，违反 design.md 的边界原则。
+    </p>
+    <p>
+      如果 agent 需要区分"新消息"和"编辑"，用 <code>metadata</code> 逃生舱（第 02 章讲过），
+      或在 content 里前缀 <code>[edited]</code> 文本化——和 location 的处理一致。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    渠道层 = <strong>BaseChannel 契约</strong>（三个抽象方法 + 统一出口）+
+    <strong>两段式发现</strong>（manifest 无依赖 / runtime 懒加载）+
+    <strong>Manager 集中重试</strong>（渠道 raise、Manager backoff）+
+    <strong>允许重复</strong>（单文件自包含，不过早抽象）。
+    下一章读 <a href="06-tools.html">工具层</a>：agent 能调用的能力如何从 LLM 的 tool_calls 落到真实执行。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

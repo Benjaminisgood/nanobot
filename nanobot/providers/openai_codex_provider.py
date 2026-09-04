@@ -47,7 +47,7 @@ class OpenAICodexProvider(LLMProvider):
 
     def __init__(
         self,
-        default_model: str = "openai-codex/gpt-5.6-sol",
+        default_model: str = "openai-codex/gpt-5.7-sol",
         proxy: str | None = None,
         extra_body: dict[str, Any] | None = None,
     ):

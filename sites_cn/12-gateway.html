@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 Gateway 启动与定时任务 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 12 章 · 运行时</div>
+<h1>Gateway 启动与定时任务</h1>
+<p class="lede">
+  敲下 <code>nanobot gateway</code> 之后，谁创建了 <code>MessageBus</code>？谁启动了
+  <code>AgentLoop</code> 和 18 个渠道？Dream 又是在哪被定时叫醒的？
+  答案几乎都在 <code>cli/gateway_runtime.py</code> 的 <code>_run_gateway()</code>。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="assemble">一、装配：先接线，再跑循环</h2>
+
+<p>
+  <code>_run_gateway</code> 前半段是同步装配（<code>gateway_runtime.py:286</code> 起）：
+  检查端口占用、准备 WebUI 静态包、把工作区模板同步到 disk，然后：
+</p>
+
+<div class="ascii">load_config()
+    → MessageBus()
+    → SessionManager / CronService / ChannelManager
+    → make_provider() → AgentLoop.from_config(bus, …)
+    → 把 cron 回调、WebUI coordinator 挂到 loop 上
+    → asyncio.run(run())   进入常驻任务组</div>
+
+<p>
+  关键对象共享<strong>同一个</strong> <code>bus</code>。渠道往 inbound 丢消息，
+  loop 消费；loop / cron / 进度回调往 outbound 丢消息，
+  <code>ChannelManager.start_all()</code> 里的 dispatcher 消费。
+  这和第 <a href="02-bus.html">02</a>、<a href="08-channels.html">08</a> 章画的图是同一条线，
+  只是现在能看见<strong>谁 new 了这些对象</strong>。
+</p>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    Gateway <strong>不是</strong> 第三种 agent 实现。它是「把已有零件拧在一起的进程主函数」。
+    Python SDK（<code>nanobot/nanobot.py</code>）可以只拧 AgentLoop，不拧渠道；
+    Gateway 则把渠道、cron、健康检查、配置热更新全部拧上。
+  </p>
+</div>
+
+<h2 id="tasks">二、run()：一个事件循环里的任务组</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/cli/gateway_runtime.py" data-start="843">
+<pre><code>            await cron.start()
+            # Re-read once on first admission to close the watcher subscription window.
+            agent.runtime_resolver.invalidate()
+            tasks = [
+                asyncio.create_task(
+                    watch_config_file(
+                        Path(config_path),
+                        lambda: agent.invalidate_runtime_config(),
+                    ),
+                    name="nanobot-config-watcher",
+                ),
+                asyncio.create_task(agent.run(), name="nanobot-agent-loop"),
+                asyncio.create_task(channels.start_all(), name="nanobot-channels"),
+                asyncio.create_task(
+                    run_local_trigger_queue(
+                        store=trigger_store,
+                        submit_turn=agent.submit_local_trigger_turn,
+                        is_channel_enabled=lambda name: channels.get_channel(name) is not None,
+                    ),
+                    name="nanobot-local-triggers",
+                ),
+            ]</code></pre>
+</div>
+
+<p>默认常驻任务：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>任务名</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td><code>nanobot-config-watcher</code></td><td>配置文件变更 → <code>invalidate_runtime_config()</code>，下一轮用新模型/工具开关</td></tr>
+<tr><td><code>nanobot-agent-loop</code></td><td>第 03 章的 <code>AgentLoop.run()</code></td></tr>
+<tr><td><code>nanobot-channels</code></td><td>启动所有渠道 + outbound dispatcher</td></tr>
+<tr><td><code>nanobot-local-triggers</code></td><td>本地 trigger 队列（<code>/trigger</code> 创建的那种）</td></tr>
+<tr><td><code>nanobot-health-server</code></td><td>可选 HTTP 健康检查（默认开）</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+  关闭策略：<code>asyncio.wait(..., FIRST_COMPLETED)</code> 等「运行时任务组」或「shutdown 事件」先完成。
+  任一常驻任务异常退出，整个 Gateway 进入 <code>finally</code>：停 cron、停 agent、
+  关 MCP/exec，然后 <code>sessions.flush_all()</code> 强制 fsync——呼应第
+  <a href="07-memory.html">07 章</a> 的耐久写入。
+</p>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：热更新不是热替换进程</div>
+  <p>
+    配置 watcher 只调用 <code>invalidate_runtime_config()</code>。
+    已经在跑的 LLM 请求、已经 <code>start()</code> 的渠道不会被杀掉重来。
+    渠道 token 这类「启动期」配置通常仍需要重启 Gateway。
+    模型 preset、工具开关这类 loop 每轮会重新解析的项，改完就能在下一回合生效。
+  </p>
+</div>
+
+<h2 id="cron">三、Cron：Dream 不走普通回合</h2>
+
+<p>
+  <code>CronService</code> 到期后回调 <code>on_cron_job</code>。
+  大多数 job 会变成一条 inbound 消息交给 AgentLoop；
+  <strong>名为 <code>dream</code> 的内部 job 例外</strong>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/cli/gateway_runtime.py" data-start="496">
+<pre><code>        # Dream is an internal job — run directly, not through the agent loop.
+        if job.name == "dream":
+            from nanobot.agent.memory import DreamRunProgress, MemoryStore
+
+            dream_session_key = MemoryStore.dream_session_key
+            prune_dream_sessions = MemoryStore.prune_dream_sessions
+
+            store = agent.context.memory
+            progress = DreamRunProgress()
+            resp = None
+            diff_body = ""
+            try:
+                result = store.build_dream_prompt()
+                if result is None:
+                    logger.info("Dream: nothing to process")
+                    return None
+                prompt, last_cursor = result
+                key = dream_session_key()
+                dream_runtime = agent.dream_runtime()
+                resp = await agent.process_direct(
+                    prompt,
+                    session_key=key,
+                    ephemeral=True,
+                    tools=store.build_dream_tools(),
+                    on_progress=progress,
+                    runtime=dream_runtime,
+                )</code></pre>
+</div>
+
+<p>对照第 <a href="07-memory.html">07 章</a> 的两阶段图：</p>
+<ul>
+  <li>Consolidator 在用户回合的 <code>build</code> / <code>save</code> 里跑</li>
+  <li>Dream 由 Gateway cron 叫醒，走 <code>process_direct</code> + 受限工具集，<code>ephemeral=True</code></li>
+  <li>只有 <code>dream_run_completed</code> 为真才推进 <code>.dream_cursor</code>，然后 Git commit + 裁剪 history</li>
+</ul>
+
+<div class="callout why">
+  <div class="t">? 为什么 Dream 不 publish_inbound</div>
+  <p>
+    若走普通 inbound，它会和用户抢同一把会话锁、污染用户 transcript、
+    还可能被 <code>/stop</code> 误杀。内部 job 用独立 <code>dream:时间戳</code> session key，
+    TTL 扫描也会跳过这个前缀（<code>autocompact.py</code>）。
+  </p>
+</div>
+
+<p>
+  同函数稍后处理 <code>heartbeat</code>：读工作区 <code>HEARTBEAT.md</code>，
+  有活跃任务才向某个会话提交系统回合。这是「周期自检待办」而不是又一个聊天渠道。
+</p>
+
+<h2 id="quiz">四、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span><code>nanobot gateway</code> 最少会启动哪三个名为 <code>nanobot-*</code> 的 asyncio 任务？（不含可选健康检查）</p>
+  </div>
+  <div class="ans">
+    <p>
+      配置热更新 <code>nanobot-config-watcher</code>、
+      核心循环 <code>nanobot-agent-loop</code>、
+      渠道 <code>nanobot-channels</code>。
+      另外还有 <code>nanobot-local-triggers</code>。Cron 是 <code>await cron.start()</code> 先启动，不一定叫这个名字的 task，但服务已在跑。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>改 <code>config.json</code> 里的 Telegram bot token 后，热更新会让渠道立刻换 token 吗？</p>
+  </div>
+  <div class="ans">
+    <p><strong>不会。</strong> watcher 只 <code>invalidate_runtime_config()</code>。
+    渠道在 <code>start()</code> 时用当时的 config 连上 SDK，token 属于启动期状态。
+    要换 token 需要重启 Gateway（或走渠道自己的 reload 路径，如果实现了）。
+    改默认模型 preset 则通常下一回合就会用新值。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>Dream cron 失败（工具报错或模型 error）时 cursor 会不会前进？history.jsonl 会不会被裁剪？</p>
+  </div>
+  <div class="ans">
+    <p>
+      cursor <strong>不前进</strong>：<code>set_last_dream_cursor</code> 包在 <code>if completed:</code> 里。
+      同一批 history 下次还会再喂给 Dream。
+    </p>
+    <p>
+      <code>finally</code> 里仍会 <code>_commit_dream_changes</code>、<code>compact_history()</code>、
+      <code>prune_dream_sessions</code>。也就是说：<strong>文件若已被工具改过，仍可能被 Git 记一笔</strong>；
+      但「这批 history 已处理完」这个进度不会谎报。这是「耐久副作用」和「消费游标」分开提交。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    Gateway = 共享 bus 上的任务组 + 关机时 fsync。Dream/heartbeat 是这条进程里的内部 job，
+    刻意绕开用户会话锁。下一章看用户对话里的「再开一个 agent」——subagent。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

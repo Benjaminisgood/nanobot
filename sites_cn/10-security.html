@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 安全边界 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 10 章 · 边缘层</div>
+<h1>安全边界</h1>
+<p class="lede">
+  nanobot 的 agent 能读文件、跑 shell、抓网页——权力很大，但<strong>没有</strong>
+  WebUI 点选授权的 tool approval 流程。
+  安全靠多层<strong>策略边界</strong>：工作区围栏、SSRF 防护、shell 正则与可选 bwrap 沙箱，
+  加上 runner 侧的「软失败 → 反复违规硬失败」升级策略。
+  这一章把这些边界逐层读透。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="workspace">一、工作区围栏</h2>
+
+<p>
+  <code>nanobot/security/workspace_policy.py</code> 提供路径解析与 containment 检查。
+  文件头写得很诚实：这是<strong>应用层守卫</strong>，不是 OS 级沙箱（进程隔离见 bwrap）。
+</p>
+
+<h3>1.1 两种 resolve 的区别（关键易错点）</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/security/workspace_policy.py" data-start="24">
+<pre><code>def resolve_path(path: str | Path, workspace: str | Path | None = None, *, strict: bool = False) -> Path:
+    """Resolve *path*, interpreting relative paths against *workspace* when set."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() and workspace is not None:
+        candidate = Path(workspace).expanduser() / candidate
+    return candidate.resolve(strict=strict)
+
+
+def _resolve_logical_path(path: str | Path, workspace: str | Path | None = None) -> Path:
+    """Return an absolute normalized path without following symlinks."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() and workspace is not None:
+        candidate = Path(workspace).expanduser() / candidate
+    return Path(os.path.abspath(candidate))</code></pre>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点</div>
+  <p>
+    <strong><code>resolve_path()</code> 用 <code>Path.resolve()</code>——会跟随符号链接。</strong>
+    <strong><code>_resolve_logical_path()</code> 用 <code>os.path.abspath()</code>——不跟随符号链接。</strong>
+  </p>
+  <p style="margin-bottom:0">
+    攻击场景：允许列表里有一个「看起来安全」的单文件路径，实际是 symlink 指向
+    <code>/etc/passwd</code>。如果只比较 resolved 路径，检查会通过；
+    <code>_is_path_exactly_allowed()</code> 要求 logical 与 resolved 的 normcase 键一致才放行。
+  </p>
+</div>
+
+<h3>1.2 包含检查与硬拒绝</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/security/workspace_policy.py" data-start="44">
+<pre><code>def is_path_within(path: str | Path, root: str | Path) -> bool:
+    """Return True when *path* resolves to *root* or a descendant of *root*."""
+    try:
+        resolved_path = Path(path).expanduser().resolve(strict=False)
+        resolved_root = Path(root).expanduser().resolve(strict=False)
+        resolved_path.relative_to(resolved_root)
+        return True
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/security/workspace_policy.py" data-start="79">
+<pre><code>def require_path_within(
+    path: str | Path,
+    root: str | Path,
+    *,
+    message: str | None = None,
+) -> Path:
+    """Resolve *path* and require it to be inside *root*."""
+    resolved = Path(path).expanduser().resolve(strict=False)
+    if not is_path_within(resolved, root):
+        raise WorkspaceBoundaryError(
+            message
+            or f"Path {path} is outside allowed directory {Path(root).expanduser()}"
+            + WORKSPACE_BOUNDARY_NOTE
+        )
+    return resolved</code></pre>
+</div>
+
+<p>
+  <code>WORKSPACE_BOUNDARY_NOTE</code>（<code>workspace_policy.py:13-17</code>）会附在错误信息末尾，
+  明确告诉 LLM「这是硬策略边界，不要用 shell 技巧重试」——runner 靠这些 marker 识别违规类型。
+</p>
+
+<p>
+  <code>_path_key()</code>（<code>workspace_policy.py:40-41</code>）用
+  <code>os.path.normcase</code>，在 macOS/Windows 大小写不敏感文件系统上避免
+  <code>/Workspace/foo</code> 与 <code>/workspace/foo</code> 被当成不同路径。
+</p>
+
+<h2 id="ssrf">二、SSRF 防护</h2>
+
+<p>
+  所有 agent 出站 HTTP 必须经 <code>nanobot/security/network.py</code> 的 URL 守卫。
+  默认拦截 loopback、RFC1918、CGNAT（100.64.0.0/10）、link-local 和云元数据地址。
+</p>
+
+<h3>2.1 私有地址判定</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/security/network.py" data-start="71">
+<pre><code>def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    normalized = _normalize_addr(addr)
+    if _allowed_networks and any(normalized in net for net in _allowed_networks):
+        return False
+    return any(normalized in net for net in _BLOCKED_NETWORKS)</code></pre>
+</div>
+
+<p>
+  <code>configure_ssrf_whitelist()</code>（加载配置时由 <code>loader._apply_ssrf_whitelist</code> 调用）
+  可以把特定 CIDR（如 Tailscale 的 100.64.0.0/10）从拦截列表中豁免。
+  <code>is_loopback_host()</code>（<code>network.py:34-44</code>）单独处理字面 loopback 主机名。
+</p>
+
+<h3>2.2 URL 校验管线</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/security/network.py" data-start="148">
+<pre><code>def validate_url_target(url: str, *, allow_loopback: bool = False) -> tuple[bool, str]:
+    """Validate a URL is safe to fetch: scheme, hostname, and resolved IPs."""
+    ok, error, _ = resolve_url_target(url, allow_loopback=allow_loopback)
+    return ok, error</code></pre>
+</div>
+
+<p>
+  完整逻辑在 <code>resolve_url_target()</code>（<code>network.py:78-145</code>）：
+  限制 scheme 为 http/https → 解析 DNS → 对每个 A/AAAA 记录跑 <code>_is_private</code>。
+  返回的 <code>resolved_ips</code>  tuple 供后续 DNS 钉扎使用。
+</p>
+
+<h3>2.3 DNS 重绑定防护（最精彩的部分）</h3>
+
+<p><strong>攻击模型</strong>：校验时 DNS 解析到公网 IP（通过检查），实际 HTTP 连接时
+DNS 再次解析到 <code>127.0.0.1</code>——经典 DNS rebinding。</p>
+
+<div class="code" data-lang="python" data-file="nanobot/security/network.py" data-start="214">
+<pre><code>@contextmanager
+def pin_resolved_url_dns(url: str, resolved_ips: tuple[str, ...]):
+    """Pin DNS lookups for the URL hostname to previously validated IPs.
+
+    This temporarily overrides process-global resolver state. Do not use it
+    directly across awaits unless the caller serializes access; prefer
+    PinnedDNSAsyncTransport for HTTP requests.
+    """
+    try:
+        hostname = urlparse(url).hostname
+    except Exception:
+        hostname = None
+    if not hostname or not resolved_ips:
+        yield
+        return
+
+    pinned_host = hostname.rstrip(".").lower()
+    original_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo(
+        host: Any,
+        port: Any,
+        family: int = 0,
+        type: int = 0,  # noqa: A002
+        proto: int = 0,
+        flags: int = 0,
+    ) -> list[Any]:
+        if str(host).rstrip(".").lower() != pinned_host:
+            return original_getaddrinfo(host, port, family, type, proto, flags)
+        infos: list[Any] = []
+        for ip in resolved_ips:
+            addr = ipaddress.ip_address(ip)
+            addr_family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+            if family not in (0, socket.AF_UNSPEC, addr_family):
+                continue
+            sockaddr = (ip, port or 0, 0, 0) if addr_family == socket.AF_INET6 else (ip, port or 0)
+            infos.append((addr_family, type or socket.SOCK_STREAM, proto, "", sockaddr))
+        return infos
+
+    socket.getaddrinfo = cast(Any, _getaddrinfo)
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/security/network.py" data-start="264">
+<pre><code>class PinnedDNSAsyncTransport(httpx.AsyncBaseTransport):
+    """HTTPX transport that pins each request to the IPs validated for its URL."""
+
+    _resolver_lock = asyncio.Lock()
+
+    def __init__(
+        self,
+        *,
+        allow_loopback: bool = False,
+        inner: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._allow_loopback = allow_loopback
+        self._inner = inner or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        ok, error, resolved_ips = resolve_url_target(url, allow_loopback=self._allow_loopback)
+        if not ok:
+            raise UnsafeURLRequestError(error, request=request)
+        async with self._resolver_lock:
+            with pin_resolved_url_dns(url, resolved_ips):
+                return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p style="margin-bottom:0">
+    校验与连接<strong>必须使用同一组 IP</strong>。
+    <code>PinnedDNSAsyncTransport</code> 每次请求重新校验 + 钉扎；
+    <code>_resolver_lock</code> 防止并发请求互相覆盖全局 <code>socket.getaddrinfo</code>。
+  </p>
+</div>
+
+<h3>2.4 重定向与 shell 扫描</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/security/network.py" data-start="291">
+<pre><code>def validate_resolved_url(url: str) -> tuple[bool, str]:
+    """Validate an already-fetched URL (e.g. after redirect). Only checks the IP, skips DNS."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return True, ""
+
+    hostname = p.hostname
+    if not hostname:
+        return True, ""
+
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if _is_private(addr):
+            return False, f"Redirect target is a private address: {addr}"
+    except ValueError:
+        # hostname is a domain name, resolve it
+        try:
+            infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            return True, ""
+        for info in infos:
+            try:
+                addr = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                continue
+            if _is_private(addr):
+                return False, f"Redirect target {hostname} resolves to private address {addr}"
+
+    return True, ""</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/security/network.py" data-start="323">
+<pre><code>def contains_internal_url(command: str, *, allow_loopback: bool = False) -> bool:
+    """Return True if the command string contains a URL targeting an internal/private address."""
+    for m in _URL_RE.finditer(command):
+        url = m.group(0)
+        ok, _ = validate_url_target(url, allow_loopback=allow_loopback)
+        if not ok:
+            return True
+    return False</code></pre>
+</div>
+
+<p>
+  代理场景：<code>env_proxy_applies_to_url()</code>（<code>network.py:154-172</code>）判断进程代理是否接管该 URL；
+  <code>httpx_env_proxy_mounts()</code>（<code>network.py:174-196</code>）构建 HTTPX mount，
+  同时尊重 <code>NO_PROXY</code> 直连路由。
+</p>
+
+<h2 id="shell">三、shell 工具的三道闸</h2>
+
+<p><code>ExecTool._guard_command()</code>（<code>shell.py:769</code>）在 spawn 前运行：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/shell.py" data-start="769">
+<pre><code>    def _guard_command(
+        self,
+        command: str,
+        cwd: str,
+        *,
+        restrict_to_workspace: bool | None = None,
+        workspace_root: str | None = None,
+    ) -> str | None:
+        """Best-effort safety guard for potentially destructive commands."""
+        cmd = command.strip()
+        lower = cmd.lower()
+
+        # allow_patterns take priority over deny_patterns so that users can
+        # exempt specific commands (e.g. "rm -rf" inside a build directory)
+        # from the hardcoded deny list via configuration. A chained command is
+        # only explicitly allowed when every top-level shell segment matches.
+        segments = self._split_shell_segments(lower)
+        explicitly_allowed = bool(self.allow_patterns) and bool(segments) and all(
+            any(re.fullmatch(pattern, segment) for pattern in self.allow_patterns)
+            for segment in segments
+        )
+        if not explicitly_allowed:
+            for pattern in self.deny_patterns:
+                if re.search(pattern, lower):
+                    return ToolResult.error("Error: Command blocked by deny pattern filter")
+
+            if self.allow_patterns:
+                return ToolResult.error("Error: Command blocked by allowlist filter (not in allowlist)")
+
+        from nanobot.security.network import contains_internal_url
+        if contains_internal_url(
+            cmd,
+            allow_loopback=current_scope_allows_loopback(
+                enabled=self.webui_allow_local_service_access,
+            ),
+        ):
+            # The runner turns this marker into a non-retryable security hint.
+            return ToolResult.error("Error: Command blocked by safety guard (internal/private URL detected)")</code></pre>
+</div>
+
+<p><strong>三道闸</strong>：</p>
+<ol>
+  <li><strong>deny/allow 正则</strong>——allow 优先于 deny；链式命令要求每个 segment 都匹配 allow</li>
+  <li><strong>内部 URL 检测</strong>——<code>contains_internal_url</code> 扫描命令文本里的 http(s) URL</li>
+  <li><strong>工作区路径检查</strong>（<code>restrict_to_workspace</code> 启用时，<code>shell.py:808</code> 起）——
+  拒绝 <code>../</code> 遍历和 cwd 外的绝对路径</li>
+</ol>
+
+<h3>3.1 超时</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/shell.py" data-start="331">
+<pre><code>            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=prepared.timeout,
+                )
+            except asyncio.TimeoutError:
+                await self._kill_process(process)
+                return ToolResult.error(f"Error: Command timed out after {prepared.timeout} seconds")</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/shell.py" data-start="408">
+<pre><code>    def _resolve_timeout(self, timeout: int | None) -> int | None:
+        """Resolve the effective hard timeout in seconds (None = no limit).
+
+        A per-call timeout supplied by the model stays capped at _MAX_TIMEOUT so
+        the LLM cannot request unbounded execution. The config-level default
+        (self.timeout) may exceed that cap, and 0 disables the limit entirely
+        for trusted long-running tasks (#3595).
+        """
+        if timeout:
+            return min(timeout, self._MAX_TIMEOUT)
+        if self.timeout and self.timeout > 0:
+            return self.timeout
+        return None</code></pre>
+</div>
+
+<p>
+  默认配置 60 秒；LLM 单次请求上限 600 秒（<code>_MAX_TIMEOUT</code>）；
+  配置 <code>timeout: 0</code> 表示不限（trusted 场景）。
+</p>
+
+<h2 id="bwrap">四、bwrap 沙箱</h2>
+
+<p>
+  <code>nanobot/agent/tools/sandbox.py</code> 全文很短——可选进程级隔离，与上一节的应用层围栏互补。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/sandbox.py" data-start="48">
+<pre><code>def _bwrap(
+    command: str,
+    workspace: str,
+    cwd: str,
+    *,
+    sandbox_ro_binds: Iterable[str] | None = None,
+    sandbox_rw_binds: Iterable[str] | None = None,
+) -> str:
+    """Wrap command in a bubblewrap sandbox (requires bwrap in container).
+
+    Only the workspace is bind-mounted read-write; its parent dir (which holds
+    config.json) is hidden behind a fresh tmpfs.  The media directory is
+    bind-mounted read-only so exec commands can read uploaded attachments.
+    """
+    ws = Path(workspace).resolve()
+    media = get_media_dir().resolve()
+
+    try:
+        sandbox_cwd = str(ws / Path(cwd).resolve().relative_to(ws))
+    except ValueError:
+        sandbox_cwd = str(ws)
+
+    required = ["/usr"]
+    optional = [
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/etc/alternatives",
+        "/etc/ssl/certs",
+        "/etc/pki/tls/certs",
+        "/etc/pki/ca-trust",
+        "/etc/crypto-policies",
+        "/etc/resolv.conf",
+        "/etc/ld.so.cache",
+    ]
+
+    args = ["bwrap", "--new-session", "--die-with-parent", "--setenv", "HOME", str(ws)]
+    for p in required:
+        args += ["--ro-bind", p, p]
+    for p in optional:
+        args += ["--ro-bind-try", p, p]
+    args += [
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--tmpfs", str(ws.parent),        # mask config dir
+        "--dir", str(ws),                 # recreate workspace mount point
+        "--bind", str(ws), str(ws),
+        "--ro-bind-try", str(media), str(media),  # read-only access to media
+    ]
+    for p in _normalize_bind_paths(sandbox_ro_binds, workspace=ws):
+        args += ["--ro-bind-try", p, p]
+    for p in _normalize_bind_paths(sandbox_rw_binds, workspace=ws):
+        args += ["--bind-try", p, p]
+    args += ["--chdir", sandbox_cwd, "--", "sh", "-c", command]
+    return shlex.join(args)</code></pre>
+</div>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/sandbox.py" data-start="104">
+<pre><code>_BACKENDS = {"bwrap": _bwrap}
+
+
+def wrap_command(
+    sandbox: str,
+    command: str,
+    workspace: str,
+    cwd: str,
+    *,
+    sandbox_ro_binds: Iterable[str] | None = None,
+    sandbox_rw_binds: Iterable[str] | None = None,
+) -> str:
+    """Wrap *command* using the named sandbox backend."""
+    if backend := _BACKENDS.get(sandbox):
+        return backend(
+            command,
+            workspace,
+            cwd,
+            sandbox_ro_binds=sandbox_ro_binds,
+            sandbox_rw_binds=sandbox_rw_binds,
+        )
+    raise ValueError(f"Unknown sandbox backend {sandbox!r}. Available: {list(_BACKENDS)}")</code></pre>
+</div>
+
+<p>
+  扩展方式见文件头注释（<code>sandbox.py:3-5</code>）：实现
+  <code>_wrap_&lt;name&gt;(command, workspace, cwd) -&gt; str</code> 并注册到 <code>_BACKENDS</code>。
+</p>
+
+<h3>4.1 调用点与 Windows 诚实声明</h3>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/shell.py" data-start="467">
+<pre><code>        if self.sandbox:
+            if _IS_WINDOWS:
+                logger.warning(
+                    "Sandbox '{}' is not supported on Windows; running unsandboxed",
+                    self.sandbox,
+                )
+            else:
+                workspace = workspace_root or cwd
+                command = wrap_command(
+                    self.sandbox,
+                    command,
+                    workspace,
+                    cwd,
+                    sandbox_ro_binds=[str(p) for p in self.sandbox_ro_binds],
+                    sandbox_rw_binds=[str(p) for p in self.sandbox_rw_binds],
+                )
+                cwd = str(Path(workspace).resolve())</code></pre>
+</div>
+
+<p>
+  额外 bind 配置在 <code>ExecToolConfig</code>（<code>shell.py:87-89</code>）：
+  <code>sandbox_ro_binds</code> / <code>sandbox_rw_binds</code>。
+  <code>_normalize_bind_paths</code> 会拒绝 bind workspace 父目录（防止 tmpfs 遮罩被覆盖）。
+</p>
+
+<h2 id="escalation">五、违规升级策略（runner 侧）</h2>
+
+<p>
+  工具返回错误文本后，<code>AgentRunner._classify_violation()</code> 决定如何处理：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="1568">
+<pre><code>    def _classify_violation(
+        self,
+        *,
+        raw_text: str,
+        soft_payload: str,
+        event: dict[str, str],
+        tool_call: ToolCallRequest,
+        workspace_violation_counts: dict[str, int],
+    ) -> tuple[Any, dict[str, str], BaseException | None] | None:
+        """Classify safety-boundary failures, or return ``None`` to pass through."""
+        if self._is_ssrf_violation(raw_text):
+            logger.warning(
+                "Tool {} blocked by SSRF guard; returning non-retryable tool error: {}",
+                tool_call.name,
+                raw_text.replace("\n", " ").strip()[:200],
+            )
+            event["detail"] = self._event_detail("ssrf_violation: ", raw_text)
+            return self._ssrf_soft_payload(raw_text), event, None
+
+        if self._is_workspace_violation(raw_text):
+            escalation = repeated_workspace_violation_error(
+                tool_call.name,
+                tool_call.arguments,
+                workspace_violation_counts,
+            )
+            event["detail"] = self._event_detail("workspace_violation: ", raw_text)
+            if escalation is not None:
+                logger.warning(
+                    "Tool {} hit workspace boundary repeatedly; escalating hint",
+                    tool_call.name,
+                )
+                event["detail"] = self._event_detail(
+                    "workspace_violation_escalated: ",
+                    raw_text,
+                )
+                return escalation, event, None
+            return soft_payload, event, None
+
+        return None</code></pre>
+</div>
+
+<p>
+  计数器在 <code>nanobot/utils/runtime.py</code>：
+  <code>repeated_external_lookup_error()</code>（<code>runtime.py:121-142</code>）限制重复 web 查询；
+  <code>repeated_workspace_violation_error()</code>（<code>runtime.py:185</code> 起）对同一越界目标计数。
+</p>
+
+<div class="callout key">
+  <div class="t">◆ 核心洞察</div>
+  <p>
+    <strong>第一次违规 = 软失败</strong>：错误文本喂回模型，让它换方法继续对话。
+    <strong>反复违规 = 硬失败</strong>：返回带明确「停止重试」指令的长文本（<code>runtime.py:204-212</code>）。
+  </p>
+  <p style="margin-bottom:0">
+    这平衡了「不要让 agent 卡死」和「不要让它无限重试攻击向量」。
+    SSRF 第一次就附带 <code>_SSRF_BOUNDARY_NOTE</code>（<code>runner.py:1609-1611</code>），
+    因为内网探测没有「合法替代路径」。
+  </p>
+</div>
+
+<h2 id="no-approval">六、没有人工审批（重要澄清）</h2>
+
+<div class="callout trap">
+  <div class="t">▲ 避免误解</div>
+  <p>
+    nanobot 工具系统<strong>没有</strong> WebUI 点击授权式的 tool approval 流程。
+    不存在「模型请求执行 rm -rf，用户点允许/拒绝」这种交互。
+  </p>
+  <p>实际安全控制来自：</p>
+  <ul style="margin-bottom:0">
+    <li><strong>配置开关</strong>：<code>Tool.enabled(ctx)</code> / <code>ToolsConfig.*.enable</code></li>
+    <li><strong>工作区限制</strong>：<code>restrict_to_workspace</code> + 路径 resolver</li>
+    <li><strong>Shell 正则</strong>：deny/allow patterns</li>
+    <li><strong>SSRF</strong>：URL 校验 + DNS 钉扎</li>
+    <li><strong>MyTool 写权限</strong>：<code>tools.my.allow_set</code></li>
+    <li><strong>Goal 变更</strong>：<code>goal_mutation_permission</code> ContextVar opt-in</li>
+  </ul>
+</div>
+
+<h2 id="pth">七、PTH 文件守卫</h2>
+
+<p>
+  <code>AGENTS.md</code> 与 <code>docs/architecture.md</code> 把「PTH file guard」列为
+  <code>nanobot/security/</code> 与 CLI 入口的安全措施之一——
+  防止恶意 <code>.pth</code> 文件在 Python 启动时注入代码到 <code>sys.path</code>。
+</p>
+
+<p>
+  截至当前源码树，<code>nanobot/security/__init__.py</code> 为空模块，
+  PTH 守卫的具体实现可能在后续版本落地或位于 CLI 启动链的其他位置。
+  阅读时请以<strong>实际 CLI 入口</strong>（<code>nanobot/__main__.py</code> →
+  <code>cli/commands.py</code>）的最新代码为准；
+  安全边界文档见 <code>.agent/security.md</code> 与 <code>SECURITY.md</code>。
+</p>
+
+<h2 id="quiz">八、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>工作区允许精确访问单文件 <code>/workspace/README.md</code>，
+    该文件是 symlink 指向 <code>/etc/passwd</code>。为什么 <code>_is_path_exactly_allowed()</code> 会拒绝？</p>
+  </div>
+  <div class="ans">
+    <p>
+      <code>_is_path_exactly_allowed()</code>（<code>workspace_policy.py:60-76</code>）比较
+      <code>_path_key(logical_path)</code> 与 <code>_path_key(resolved_path)</code>：
+    </p>
+    <ul>
+      <li>logical = <code>abspath("README.md")</code> → 不跟随 symlink → 键为 workspace 内的 README 路径</li>
+      <li>resolved = <code>resolve()</code> → 跟随 symlink → 键为 <code>/etc/passwd</code></li>
+    </ul>
+    <p>
+      两者 normcase 键不等 → 函数返回 False → 即使 resolved 路径「看起来」在允许列表里也不放行。
+      这正是防 symlink 逃逸的设计。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>解释 DNS 重绑定攻击，以及 <code>PinnedDNSAsyncTransport</code> 如何缓解。</p>
+  </div>
+  <div class="ans">
+    <p><strong>攻击</strong>：恶意域名 TTL 极短。T1 时刻 DNS 返回公网 IP → 通过
+    <code>resolve_url_target</code> 校验。T2 时刻实际 TCP 连接再次 DNS 解析 → 返回 127.0.0.1 → 访问内网服务。</p>
+    <p><strong>缓解</strong>（<code>network.py:278-285</code>）：</p>
+    <ol>
+      <li>请求前 <code>resolve_url_target</code> 得到 <code>resolved_ips</code></li>
+      <li><code>pin_resolved_url_dns</code> 临时替换 <code>socket.getaddrinfo</code>，对该 hostname 只返回已校验 IP</li>
+      <li><code>_resolver_lock</code> 串行化，避免并发请求互相污染全局 resolver 状态</li>
+    </ol>
+    <p>重定向场景另用 <code>validate_resolved_url()</code>（<code>network.py:291</code>）二次检查目标 IP。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>agent 连续三次用不同工具尝试读取 <code>/etc/shadow</code>（均在
+    <code>restrict_to_workspace=true</code> 下）。描述每次 runner 的响应差异，并给出源码位置。</p>
+  </div>
+  <div class="ans">
+    <p><strong>第 1–2 次</strong>：工具返回带 <code>outside allowed directory</code> 或
+    <code>path outside working dir</code> 的 <code>ToolResult.error</code>。
+    <code>_is_workspace_violation()</code>（<code>runner.py:1559</code>）命中 →
+    <code>_classify_violation</code> 返回 <code>soft_payload</code>（原始错误 + boundary note）喂回模型。
+    <code>repeated_workspace_violation_error()</code>（<code>runtime.py:185</code>）计数但未超阈值（<code>_MAX_REPEAT_WORKSPACE_VIOLATIONS=2</code>，前 2 次软失败）。</p>
+    <p><strong>第 3+ 次</strong>：同一目标签名（<code>workspace_violation_signature</code>，<code>runtime.py:150</code>）
+    计数超过 <code>_MAX_REPEAT_WORKSPACE_VIOLATIONS</code> → 返回 escalated 长文本（<code>runtime.py:204-212</code>），
+    明确「切换工具/shell 技巧不会改变答案，停止重试」。</p>
+    <p><strong>对比 SSRF</strong>：内网 URL 第一次就附带 <code>_SSRF_BOUNDARY_NOTE</code>（<code>runner.py:1609</code>），
+    不给予多次试错预算。</p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    安全 = <strong>应用层围栏</strong>（路径 + SSRF + shell 正则）+
+    <strong>可选 bwrap 进程隔离</strong> +
+    <strong>runner 软/硬失败升级</strong>。
+    没有人工审批——策略在配置和代码边界里预先定好。
+    下一章进入运行时：系统提示是怎么拼出来的。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

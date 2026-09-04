@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 架构总览与数据流 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 01 章 · 入门</div>
+<h1>架构总览与数据流</h1>
+<p class="lede">
+  这一章不看具体实现，只做一件事：<strong>建立一张能装进脑子的地图</strong>。
+  读完你应该能回答——一条用户消息从进入进程到发出回复，一共经过哪几个所有权边界？
+</p>
+
+<div id="toc"></div>
+
+<h2 id="layers">一、五层结构与依赖方向</h2>
+
+<p>
+  nanobot 的目录不是按"功能"划分的，而是按<strong>依赖方向</strong>划分的。理解这一点，你就知道该往哪个目录找代码：
+</p>
+
+<div class="ascii">┌─────────────────────────────────────────────────────────────────┐
+│  边缘层 (edges)        channels/  ·  api/  ·  webui/  ·  cli/    │
+│  外部世界的适配器：平台 SDK、HTTP 路由、WebSocket、终端           │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ 只通过 bus 事件通信
+┌───────────────────────────────▼─────────────────────────────────┐
+│  总线层 (bus)          bus/queue.py  ·  bus/events.py            │
+│  两个 asyncio.Queue + 两个 dataclass。整个项目最薄的一层          │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────────┐
+│  核心层 (core)         agent/loop.py  ·  agent/runner.py         │
+│  ★ 受保护的关键路径：回合编排 + ReAct 循环。改动需充分理由        │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────────┐
+│  能力层 (capabilities) providers/  ·  agent/tools/  ·  session/  │
+│  LLM 后端、工具实现、会话与记忆。核心通过抽象接口调用它们         │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────────┐
+│  基础层 (foundation)   config/  ·  security/  ·  utils/          │
+│  配置模型、安全策略、通用工具。被上面所有层引用                   │
+└─────────────────────────────────────────────────────────────────┘</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    <strong>渠道不知道 agent 的存在，agent 也不知道渠道的存在。</strong>
+    它们之间唯一的接触面是 <code>bus/events.py</code> 里的两个 dataclass。
+    这就是为什么这个项目能支持 18 个聊天平台，而 <code>loop.py</code> 里几乎没有任何平台专属代码。
+  </p>
+</div>
+
+<h3>关键目录职责表</h3>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>路径</th><th>职责</th><th>本站章节</th></tr></thead>
+<tbody>
+<tr><td><code>nanobot/bus/</code></td><td>异步消息队列与事件类型</td><td><a href="02-bus.html">02</a></td></tr>
+<tr><td><code>nanobot/agent/loop.py</code></td><td><code>AgentLoop</code>：会话键、调度、钩子、上下文装配</td><td><a href="03-loop.html">03</a></td></tr>
+<tr><td><code>nanobot/agent/runner.py</code></td><td><code>AgentRunner</code>：多轮 LLM 对话 + 工具执行</td><td><a href="04-runner.html">04</a></td></tr>
+<tr><td><code>nanobot/providers/</code></td><td>LLM 后端实现，共享 <code>base.py</code> 抽象</td><td><a href="05-providers.html">05</a></td></tr>
+<tr><td><code>nanobot/agent/tools/</code></td><td>暴露给 LLM 的能力：文件、shell、web、MCP……</td><td><a href="06-tools.html">06</a></td></tr>
+<tr><td><code>nanobot/agent/memory.py</code></td><td>记忆持久化 + Dream 两阶段整合</td><td><a href="07-memory.html">07</a></td></tr>
+<tr><td><code>nanobot/session/</code></td><td>会话历史、压缩、TTL、持续目标状态</td><td><a href="07-memory.html">07</a></td></tr>
+<tr><td><code>nanobot/channels/</code></td><td>平台集成，自包含包，<code>pkgutil</code> 自动发现</td><td><a href="08-channels.html">08</a></td></tr>
+<tr><td><code>nanobot/config/</code></td><td>Pydantic 配置模型与加载器</td><td><a href="09-config.html">09</a></td></tr>
+<tr><td><code>nanobot/command/</code></td><td>斜杠命令路由与内置命令</td><td><a href="09-config.html">09</a></td></tr>
+<tr><td><code>nanobot/security/</code></td><td>路径围栏、SSRF 防护、网络策略</td><td><a href="10-security.html">10</a></td></tr>
+<tr><td><code>nanobot/gateway/</code>、<code>webui/</code></td><td>HTTP 网关与 WebUI 后端（WebSocket 多路复用）</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="journey">二、一条消息的完整旅程</h2>
+
+<p>
+  这是全站最重要的一张图。下面每一步都标注了真实的文件与函数名，你可以按顺序在编辑器里逐个跳转验证。
+</p>
+
+<div class="flow">
+  <div class="step">
+    <div class="idx">1</div>
+    <div class="body">
+      <b>平台 SDK 收到消息</b>
+      <span>以 Telegram 为例：<code>python-telegram-bot</code> 的 <code>MessageHandler</code> 触发
+      <code>TelegramChannel._on_message</code>，随后进入 <code>_process_message_update</code>，
+      在这里把 text、caption、location、下载好的媒体文件路径拼成统一的 <code>content</code> 字符串。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">2</div>
+    <div class="body">
+      <b>规范化 + 鉴权 → 发布到总线</b>
+      <span>所有渠道最终都调用基类的 <code>BaseChannel._handle_message()</code>。
+      它先做发送者鉴权（不在白名单的私聊会收到配对码），再构造 <code>InboundMessage</code>，
+      最后 <code>await self.bus.publish_inbound(msg)</code>。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">3</div>
+    <div class="body">
+      <b>AgentLoop.run() 取出消息并做路由决策</b>
+      <span>核心调度循环。取到消息后依次判断：是否运行时控制指令？是否优先命令（如 <code>/stop</code>）？
+      是否要延后自动化回合？该会话是否已有任务在跑（则塞进注入队列）？都不是才
+      <code>asyncio.create_task(self._dispatch(msg))</code>。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">4</div>
+    <div class="body">
+      <b>_dispatch()：按会话串行、跨会话并发</b>
+      <span>拿到该 session 的 <code>asyncio.Lock</code> 和全局并发闸门，创建 <code>maxsize=20</code>
+      的注入队列，然后调用 <code>_process_message()</code>。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">5</div>
+    <div class="body">
+      <b>_process_message()：七阶段流水线</b>
+      <span><code>restore → compact → command → build → run → save → respond</code>。
+      所有中间状态都挂在一个 <code>TurnContext</code> 数据类上传递。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">6</div>
+    <div class="body">
+      <b>AgentRunner.run()：真正的 ReAct 循环</b>
+      <span><code>build</code> 阶段装配好 <code>initial_messages</code> 后，<code>run</code> 阶段把它包装成
+      <code>AgentRunSpec</code> 交给 runner。runner 在 <code>for iteration in range(max_iterations)</code>
+      里反复：调 LLM → 有工具调用就执行 → 结果回填 → 再调 LLM。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">7</div>
+    <div class="body">
+      <b>持久化 + 组装回复</b>
+      <span><code>save</code> 阶段把新增消息原子写入会话 JSONL；<code>respond</code> 阶段把最终文本装成
+      <code>OutboundMessage</code>。</span>
+    </div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="step">
+    <div class="idx">8</div>
+    <div class="body">
+      <b>回到渠道</b>
+      <span><code>TurnDelivery.complete()</code> 调 <code>bus.publish_outbound(response)</code>；
+      <code>ChannelManager._dispatch_outbound()</code> 这个常驻任务取出消息，
+      按 <code>msg.channel</code> 找到对应渠道，调用它的 <code>send()</code>（带指数退避重试）。</span>
+    </div>
+  </div>
+</div>
+
+<h3>把它压缩成一行调用链</h3>
+
+<div class="ascii">Platform SDK
+  → TelegramChannel._process_message_update()        channels/telegram/runtime.py:1505
+  → BaseChannel._handle_message()                    channels/base.py:255
+  → MessageBus.publish_inbound()                     bus/queue.py:20
+  → AgentLoop.run()                                  agent/loop.py:1154
+  → AgentLoop._dispatch()                            agent/loop.py:1252
+  → AgentLoop._process_message()                     agent/loop.py:1431
+  → [restore, compact, command, build, run, save, respond]
+  → AgentLoop._run_agent_loop()                      agent/loop.py:861
+  → AgentRunner.run(AgentRunSpec)                    agent/runner.py:371
+  → AgentRunner._run_core()  ←──┐                    agent/runner.py:419
+       → _request_model()       │  循环
+       → _execute_tools()  ─────┘                    agent/runner.py:1359
+  → TurnDelivery.complete()                          agent/turn_delivery.py:233
+  → MessageBus.publish_outbound()                    bus/queue.py:28
+  → ChannelManager._dispatch_outbound()              channels/manager.py:674
+  → TelegramChannel.send()</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p>
+    把上面这段贴到你自己的笔记里。之后读任何一章，先问自己"我现在在这条链的第几步"，
+    就不会在 2000 多行的 <code>loop.py</code> 里迷路。
+  </p>
+</div>
+
+<h2 id="entry">三、入口点：三种启动方式</h2>
+
+<p>同一个 <code>AgentLoop</code>，被三种不同的外壳包装：</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>入口</th><th>文件</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>CLI</td><td><code>nanobot/cli/commands.py</code></td><td>命令行主入口，<code>nanobot gateway</code> 等子命令</td></tr>
+<tr><td>Python SDK</td><td><code>nanobot/nanobot.py</code></td><td><code>Nanobot</code> 类，提供 <code>from_config()</code> / <code>run()</code> / <code>stream()</code> / 异步上下文管理器</td></tr>
+<tr><td>HTTP API</td><td><code>nanobot/api/server.py</code></td><td>OpenAI 兼容接口：<code>/v1/chat/completions</code>、<code>/v1/models</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+  值得注意的是 SDK 入口的形态——它证明了核心层确实与渠道解耦：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/nanobot.py" data-start="64">
+<pre><code>class Nanobot:</code></pre>
+</div>
+
+<p>
+  <code>Nanobot</code> 只持有一个 <code>AgentLoop</code> 和一个 <code>Config</code>
+  （见 <code>nanobot/nanobot.py:74</code> 的 <code>__init__</code>），完全不需要任何渠道。
+  也就是说：<strong>如果你想在自己的程序里嵌入这个 agent，一个渠道都不用启动。</strong>
+</p>
+
+<h2 id="concurrency">四、并发模型：谁和谁能并行</h2>
+
+<p>
+  这是初读时最容易搞混的部分。nanobot 有<strong>四个层次</strong>的并发，边界各不相同：
+</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>层次</th><th>粒度</th><th>机制</th></tr></thead>
+<tbody>
+<tr><td>渠道之间</td><td>完全并行</td><td>每个渠道一个 <code>asyncio.Task</code>，由 <code>ChannelManager.start_all()</code> 启动</td></tr>
+<tr><td>会话之间</td><td>并行（受闸门限制）</td><td><code>_dispatch()</code> 里每个 session 一把 <code>asyncio.Lock</code>，外加一个全局 <code>_concurrency_gate</code></td></tr>
+<tr><td>同一会话内</td><td><strong>严格串行</strong></td><td>同一把会话锁。后来的消息不会新建任务，而是塞进 <code>_pending_queues</code> 做"回合中注入"</td></tr>
+<tr><td>同一轮的工具</td><td>条件并行</td><td><code>_partition_tool_batches()</code> 按 <code>concurrency_safe</code> / <code>exclusive</code> 分批，安全的批用 <code>asyncio.gather</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点</div>
+  <p>
+    "同一会话严格串行"不等于"后来的消息被丢弃"。看 <code>loop.py:1214</code> 附近：
+    如果该会话已有活跃的 pending 队列，消息会被 <code>put_nowait</code> 进去，
+    在当轮的工具执行间隙被 <code>_try_drain_injections</code> 取出并<strong>插入到正在进行的对话中</strong>。
+    这就是"你在 agent 干活时追加一句话，它能立刻反应"的实现原理。
+  </p>
+  <p>
+    而且注意 <code>_dispatch()</code> 的 <code>finally</code> 块（<code>loop.py:1346</code> 起）：
+    回合结束时队列里的残留消息会被<strong>重新 publish 回 inbound 总线</strong>，而不是静默丢失。
+  </p>
+</div>
+
+<h2 id="whyread">五、为什么这个项目值得读</h2>
+
+<p>
+  在读具体代码前，先记住三个"它做对了但很多项目做错了"的地方，这样你在后面几章看到时会更有感觉：
+</p>
+
+<div class="callout why">
+  <div class="t">? 为什么这样设计</div>
+  <p>
+    <strong>1. 宁可重复，也不过早抽象。</strong>
+    <code>.agent/design.md</code> 明确写着：渠道和 provider <em>允许</em> 重复相似逻辑（发送重试、媒体处理、消息切分），
+    不要为了消除重复而引入复杂基类。每个渠道文件必须能<strong>独立阅读</strong>。
+    这是为什么 <code>feishu/runtime.py</code> 有 2887 行却仍然可维护——你读它时不需要同时理解另外 17 个渠道。
+  </p>
+  <p>
+    <strong>2. 动态边界在边缘处做类型化。</strong>
+    wire payload、持久化记录、第三方 SDK 对象都被视为不可信的动态边界，
+    要在<strong>所属边缘</strong>用 parser 或 normalizer 处理一次，内部代码只接收具体类型。
+    <code>typing.cast</code> 不做运行时校验，因此每个新 cast 都必须有同路径的运行时检查支撑。
+  </p>
+  <p style="margin-bottom:0">
+    <strong>3. 显式优于魔法。</strong>
+    配置必须在 <code>config/schema.py</code> 的 Pydantic 模型里显式声明；
+    错误处理应该抛出清晰异常而不是静默纠正坏输入；provider 自动探测存在，
+    但<strong>每条解析路径都必须能从 factory 追踪到具体 provider 类</strong>。
+  </p>
+</div>
+
+<h2 id="quiz">六、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>如果你要新增一个"短信"渠道，需要修改 <code>agent/loop.py</code> 吗？为什么？</p>
+  </div>
+  <div class="ans">
+    <p><strong>不需要。</strong></p>
+    <p>
+      根据 <code>.agent/design.md</code> 的第一条约束，新能力应该在边缘添加。
+      具体做法是在 <code>nanobot/channels/</code> 下新建一个自包含的包（例如 <code>sms/</code>），
+      包含 <code>manifest.py</code>（声明 <code>PLUGIN: ChannelPlugin</code>）和 <code>runtime.py</code>
+      （继承 <code>BaseChannel</code>，实现 <code>start</code> / <code>stop</code> / <code>send</code> 三个抽象方法）。
+    </p>
+    <p>
+      <code>ChannelManager._init_channels()</code> 会通过
+      <code>pkgutil.iter_modules()</code> 自动发现它，无需在任何地方注册。
+      核心层永远只看到 <code>InboundMessage</code>，它完全不关心这条消息来自短信还是 Telegram。
+    </p>
+    <p>
+      细节见第 <a href="08-channels.html">08 章</a>。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>用户在 agent 正在执行一个长任务（比如跑测试）时又发了一条消息。系统有三种可能的处理方式，nanobot 选了哪一种？在哪一行代码里决定的？</p>
+    <ul class="opts">
+      <li><b>A</b> 新建一个并发任务，两条消息同时处理</li>
+      <li><b>B</b> 丢弃新消息，提示"忙碌中"</li>
+      <li><b>C</b> 放入队列，在当轮的执行间隙注入到正在进行的对话里</li>
+    </ul>
+  </div>
+  <div class="ans">
+    <p><strong>答案：C。</strong></p>
+    <p>决策点在 <code>AgentLoop.run()</code> 的调度循环里：</p>
+    <div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="1214">
+<pre><code>                if effective_key in self._pending_queues:
+                    # Non-priority commands must not be queued for injection;
+                    # dispatch them directly (same pattern as priority commands).
+                    if self.commands.is_dispatchable_command(raw):
+                        await self._dispatch_command_inline(
+                            msg, effective_key, raw,
+                            self.commands.dispatch,
+                        )
+                        continue</code></pre>
+    </div>
+    <p>
+      <code>self._pending_queues</code> 只有<strong>持有会话锁的那个任务</strong>才会注册（见
+      <code>loop.py:1265</code> 附近的注释："Only the task that owns the session lock may publish
+      the active mid-turn injection queue for this session"）。所以 <code>effective_key in
+      self._pending_queues</code> 成立，就等价于"这个会话正在被处理中"。
+    </p>
+    <p>
+      注意这里还有一个分支：<strong>非优先级的斜杠命令不能进注入队列</strong>，
+      而要直接 inline 分发。否则你在 agent 干活时敲 <code>/model</code>，
+      这条命令会被当成对话内容喂给 LLM，而不是被执行。
+    </p>
+    <p>为什么不选 A？因为同一会话的历史是共享可变状态，并发写会导致消息顺序错乱和持久化冲突。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>观察这条链：<code>_process_message</code> 返回 <code>OutboundMessage</code>，但真正发送它的是 <code>ChannelManager</code>。为什么不让 <code>AgentLoop</code> 直接持有渠道对象、调用 <code>channel.send()</code>？列出至少三个理由。</p>
+  </div>
+  <div class="ans">
+    <p>这是"用队列而非直接调用"的经典权衡。理由至少有四条：</p>
+    <p>
+      <strong>1. 依赖方向。</strong> 直接调用意味着 <code>AgentLoop</code> 必须 import 渠道类型，
+      核心层就被平台 SDK 污染了。而 SDK 的安装是可选的（见
+      <code>scripts/install_channel_dependencies.py</code>），核心层 import 它会让"不装 Telegram
+      依赖就跑不起来"。
+    </p>
+    <p>
+      <strong>2. 重试策略集中化。</strong> <code>BaseChannel.send()</code> 的文档字符串明确写了
+      "Implementations should raise on delivery failure so the channel manager can apply any retry
+      policy in one place"。重试逻辑统一在 <code>ChannelManager._send_with_retry()</code>
+      （<code>manager.py:905</code>），而不是散落在 agent 里。
+    </p>
+    <p>
+      <strong>3. 多生产者。</strong> 除了回合的最终回复，还有很多地方要往外发消息：
+      进度提示（<code>bus/progress.py</code>）、内置命令的直接回复（<code>command/builtin.py:440</code>）、
+      cron 通知（<code>cli/gateway_runtime.py:484</code>）、<code>message</code> 工具的主动推送
+      （<code>tools/message.py:79</code>）、WebUI 的回合事件（<code>session/webui_turns.py</code>）。
+      它们共用同一个出口，就只需要一套路由与重试。
+    </p>
+    <p>
+      <strong>4. 背压与合并。</strong> <code>_dispatch_outbound()</code> 有一个 <code>pending</code>
+      列表用于流式增量的合并（delta coalescing）——因为 <code>asyncio.Queue</code> 不支持 push_front。
+      这种跨消息的优化只有在集中的分发器里才做得到。
+    </p>
+    <p>
+      代价是：调用栈变得不连续，调试时要靠 <code>session_key</code> 串联日志。这也是为什么
+      <code>TurnContext</code> 里有一个 <code>turn_id</code> 字段。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    五层结构、依赖单向、总线解耦、四层并发。下一章我们把最薄的那一层——总线——完整读完，
+    它只有 44 行，但决定了整个项目的形态。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

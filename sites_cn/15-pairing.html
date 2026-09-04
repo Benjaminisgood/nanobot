@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 配对鉴权 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 15 章 · 接入</div>
+<h1>配对鉴权</h1>
+<p class="lede">
+  工作区围栏挡住的是<strong>工具</strong>；配对挡住的是<strong>谁能跟 bot 说话</strong>。
+  默认不是「网上任何人私聊你都能驱动 exec」。实现只有一个小 JSON 文件加一把线程锁。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="order">一、三道门：星号、白名单、配对库</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/base.py" data-start="237">
+<pre><code>    def is_allowed(self, sender_id: str) -&gt; bool:
+        """Check sender permission: star &gt; allowlist &gt; pairing store &gt; deny."""
+        if isinstance(self.config, dict):
+            config_mapping = cast(dict[str, Any], self.config)
+            allow_list: Any = (
+                config_mapping.get("allow_from") or config_mapping.get("allowFrom") or []
+            )
+        else:
+            allow_list = getattr(self.config, "allow_from", None) or []
+        if "*" in allow_list:
+            return True
+        # allowFrom entries are opaque tokens — must match exactly.
+        if str(sender_id) in allow_list:
+            return True
+        if is_approved(self.name, str(sender_id)):
+            return True
+        return False</code></pre>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>条件</th><th>结果</th></tr></thead>
+<tbody>
+<tr><td><code>allowFrom</code> 含 <code>"*"</code></td><td>全部放行（公开 bot，自行承担风险）</td></tr>
+<tr><td>发送者字符串精确在名单里</td><td>放行。注释强调是 opaque token，不要做模糊匹配</td></tr>
+<tr><td><code>pairing.json</code> 的 approved 集合</td><td>主人批准过的 DM 发送者</td></tr>
+<tr><td>以上都不是</td><td>拒绝。私聊发配对码，群聊只打日志</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+  <code>_handle_message</code> 用 <code>authorization_id or sender_id</code> 做检查。
+  群场景可以把「房间」当作授权主体，同时 inbound 上仍记录真实 sender——身份和权限解耦。
+</p>
+
+<h2 id="dm">二、陌生人私聊：发码，不进总线</h2>
+
+<p>未授权且 <code>is_dm</code> 时，<strong>不会</strong> <code>publish_inbound</code>：</p>
+
+<div class="code" data-lang="python" data-file="nanobot/channels/base.py" data-start="274">
+<pre><code>        permission_id = authorization_id if authorization_id is not None else sender_id
+        if not self.is_allowed(permission_id):
+            if is_dm:
+                try:
+                    code = generate_code(self.name, str(sender_id))
+                except OSError:
+                    # Transient pairing-store I/O failure: skip the pairing
+                    # reply for this message rather than crash the handler.
+                    self.logger.warning(
+                        "Pairing store unavailable; dropping DM from {}", sender_id
+                    )
+                    return</code></pre>
+</div>
+
+<p>用户看到的文案写明两条批准路径：WebUI，或主人发 <code>/pairing approve CODE</code>。</p>
+
+<div class="code" data-lang="python" data-file="nanobot/pairing/store.py" data-start="280">
+<pre><code>def format_pairing_reply(code: str) -&gt; str:
+    """Return the pairing-code message sent to unrecognised DM senders."""
+    return (
+        "Hi there! This assistant only responds to approved users.\n\n"
+        f"Your pairing code is: `{code}`\n\n"
+        "To get access, ask the owner to approve this request in the nanobot WebUI.\n"
+        f"If the WebUI is not available, the owner can also send `/pairing approve {code}`."
+    )</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么群聊不发配对码</div>
+  <p>
+    群是共享空间：把一次性码贴进群等于公开邀请所有人去找主人批准。
+    未授权群消息只 warning，等你把群 id 写进 <code>allowFrom</code>。
+  </p>
+</div>
+
+<h2 id="store">三、pairing.json：小文件 + 线程锁</h2>
+
+<p>
+  路径在数据目录下（默认 <code>~/.nanobot/pairing.json</code>）。
+  用 <code>threading.Lock</code> 而不是 asyncio 锁：CLI 的 <code>/pairing</code> 和异步渠道 handler 都能调。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/pairing/store.py" data-start="113">
+<pre><code>def generate_code(
+    channel: str,
+    sender_id: str,
+    ttl: int = _TTL_DEFAULT_S,
+) -&gt; str:
+    """Create a new pairing code for *sender_id* on *channel*.
+
+    Returns the code (e.g. ``"ABCD-EFGH"``).
+    """
+    with _LOCK:
+        data = _load()
+        _gc_pending(data)
+        raw = "".join(secrets.choice(_ALPHABET) for _ in range(_CODE_LENGTH))
+        code = f"{raw[:4]}-{raw[4:]}"
+
+        data.setdefault("pending", {})[code] = {
+            "channel": channel,
+            "sender_id": str(sender_id),
+            "created_at": time.time(),
+            "expires_at": time.time() + ttl,
+        }
+        _save(data)</code></pre>
+</div>
+
+<p>
+  <code>approve_code</code> 从 pending pop 掉，写入 <code>approved[channel]</code> 集合。
+  <code>is_approved</code> 读失败（OSError）返回 <code>False</code>——<strong>fail closed</strong>，
+  磁盘坏了不会突然变成对全世界开放。
+</p>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点：生成码失败 vs 检查失败</div>
+  <p>
+    <code>generate_code</code> 抛 OSError 时渠道选择「不回配对码、也不崩 handler」——
+    避免 I/O 故障变成对陌生人的拒绝服务放大器（反复崩溃重启）。
+    <code>is_approved</code> 同样 I/O 失败则当未批准。
+    两个方向都偏「宁可少理人，也不要误放行 / 不要把进程打挂」。
+  </p>
+</div>
+
+<h2 id="cmd">四、/pairing 是纯函数式入口</h2>
+
+<p>
+  <code>handle_pairing_command</code> 除了改 store 没有别的副作用，
+  CLI 和 CommandRouter 共用。子命令包括 list / approve / deny / revoke。
+</p>
+
+<h2 id="quiz">五、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>Telegram 配置 <code>allowFrom: ["*"]</code> 时，还需要配对吗？</p>
+  </div>
+  <div class="ans">
+    <p><strong>不需要。</strong> <code>"*"</code> 第一道门直接 True，后面白名单和 pairing store 都不会走到。
+    这适合你明确想做公开 bot 的场合；私人助手请不要用星号。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>未授权用户在<strong>群里</strong> @bot。会不会收到配对码？消息会不会进入 AgentLoop？</p>
+  </div>
+  <div class="ans">
+    <p>都不会（除非该群的 authorization_id 已在白名单）。
+    非 DM 分支只打 warning 然后 return，没有 inbound。
+    配对码只在 <code>is_dm</code> 为真时生成。</p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>攻击者枚举配对码。设计上有哪些减速/失效因素？还缺什么（源码里没有的）？</p>
+  </div>
+  <div class="ans">
+    <p>
+      有的：<code>secrets.choice</code> 字母表随机、<code>ABCD-EFGH</code> 形态、pending TTL、
+      批准后从 pending 删除。approve 用精确字符串，没有「差一位也行」。
+    </p>
+    <p>
+      源码<strong>没有</strong>：按 IP / 发送者的尝试次数上限、验证码字母的混淆（I/O/0/1 是否排除要看 <code>_ALPHABET</code>）、
+      多因素。这是「私人助手规模」的文件库，不是 IdP。
+      真正的防线是码只出现在私聊、且必须由<strong>已授权的主人</strong>执行 approve。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    配对是渠道边缘的身份门；工具围栏是执行边缘的能力门。两者缺一不可。
+    下一章看第三种入口：不经过聊天渠道的 HTTP API。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

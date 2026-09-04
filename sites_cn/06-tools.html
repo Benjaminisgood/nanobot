@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 工具系统 · nanobot 源码精读</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="progress-bar"></div>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <div class="main">
+    <div style="width:100%">
+      <div class="topbar" id="topbar"></div>
+      <div class="content">
+
+<div class="eyebrow">第 06 章 · 能力层</div>
+<h1>工具系统</h1>
+<p class="lede">
+  LLM 决定"要做什么"，工具系统负责"真的去做"。
+  <code>nanobot/agent/tools/</code> 共 26 个文件——从读写到 shell、MCP 桥接、子 agent 派发。
+  这一章读透 <strong>Tool 抽象</strong>、<strong>自动发现</strong>、<strong>三层校验</strong>
+  和 <strong>错误契约</strong>，理解 <code>AgentRunner</code> 如何把 model 的 function call 变成可观测的副作用。
+</p>
+
+<div id="toc"></div>
+
+<h2 id="tool-abc">一、Tool 抽象基类：execute 是唯一入口</h2>
+
+<p>
+  每个工具继承 <code>Tool</code>（<code>base.py:156</code>）。四个抽象成员：
+  <code>name</code>、<code>description</code>、<code>parameters</code>（三个 <code>@property</code>）
+  和 <code>async def execute(self, **kwargs) -> Any</code>。
+  注意统一入口是 <strong><code>execute</code></strong>，不是 <code>run</code>。
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/base.py" data-start="168">
+<pre><code>    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Tool name used in function calls."""
+        ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Description of what the tool does."""
+        ...
+
+    @property
+    @abstractmethod
+    def parameters(self) -> dict[str, Any]:
+        """JSON Schema for tool parameters."""
+        ...
+
+    @property
+    def read_only(self) -> bool:
+        """Whether this tool is side-effect free and safe to parallelize."""
+        return False
+
+    @property
+    def concurrency_safe(self) -> bool:
+        """Whether this tool can run alongside other concurrency-safe tools."""
+        return self.read_only and not self.exclusive
+
+    @property
+    def exclusive(self) -> bool:
+        """Whether this tool should run alone even if concurrency is enabled."""
+        return False
+
+    # --- Plugin metadata ---
+
+    config_key: str = ""
+    _plugin_discoverable: bool = True
+    _scopes: set[str] = {"core"}
+
+    @classmethod
+    def config_cls(cls) -> type[BaseModel] | None:
+        return None
+
+    @classmethod
+    def enabled(cls, ctx: ToolContext) -> bool:
+        return True
+
+    @classmethod
+    def create(cls, ctx: ToolContext) -> Tool:
+        return cls()
+
+    def runtime_context_provider(self) -> RuntimeContextProvider | None:
+        """Return optional per-turn prompt context owned by this tool."""
+        return None
+
+    @abstractmethod
+    async def execute(self, **kwargs: Any) -> Any:
+        """Run the tool; return content, or ``ToolResult.error(...)`` for failures."""
+        ...
+
+    @staticmethod
+    def error(content: str) -> ToolResult:
+        return ToolResult.error(content)</code></pre>
+</div>
+
+<div class="callout key">
+  <div class="t">◆ 核心要点</div>
+  <p>
+    <strong><code>read_only</code> / <code>concurrency_safe</code> / <code>exclusive</code></strong>
+    控制并行执行策略——<code>AgentRunner</code> 可以把多个只读工具（glob、grep）并发跑，
+    但 <code>exclusive</code> 工具（如 shell）必须独占。
+  </p>
+  <p style="margin-bottom:0">
+    <strong><code>_scopes</code> / <code>enabled(ctx)</code> / <code>create(ctx)</code></strong>
+    是插件元数据：<code>ToolLoader</code> 按 scope 过滤、按配置决定是否注册、
+    用工厂方法注入 <code>ToolContext</code>（workspace、bus、cron 等）。
+  </p>
+</div>
+
+<h2 id="errors">二、错误契约：ToolResult 而非异常</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/base.py" data-start="141">
+<pre><code>class ToolResult(str):
+    """String-compatible tool output with structured status."""
+
+    is_error: bool
+
+    def __new__(cls, content: str, *, is_error: bool = False) -> ToolResult:
+        obj = str.__new__(cls, content)
+        obj.is_error = is_error
+        return obj
+
+    @classmethod
+    def error(cls, content: str) -> ToolResult:
+        return cls(content, is_error=True)</code></pre>
+</div>
+
+<p>
+  工具失败<strong>返回</strong> <code>ToolResult.error(...)</code>，不抛异常。
+  <code>ToolRegistry.execute</code> 只在真正意外（代码 bug）时 catch Exception。
+  这样 LLM 总能收到结构化的错误文本，进入"分析错误、换策略"的 ReAct 循环。
+</p>
+
+<div class="callout why">
+  <div class="t">? 为什么不抛异常</div>
+  <p>
+    对 LLM 来说，"文件不存在"和"权限拒绝"是<strong>可恢复的业务错误</strong>，
+    应该变成 tool result 消息喂回模型。抛异常会让 runner 走通用
+    <code>Error executing {name}: ...</code> 路径，丢失工具自己的上下文；
+    更糟的是 uncaught exception 可能中断整个回合。
+  </p>
+  <p style="margin-bottom:0">
+    <code>ToolResult</code> 继承 <code>str</code> 是为了向后兼容——旧工具返回 plain string 仍然有效。
+  </p>
+</div>
+
+<h2 id="discovery">三、pkgutil 自动发现与 entry-point 插件</h2>
+
+<p>
+  内置工具不走手动注册表。<code>ToolLoader.discover()</code> 扫描
+  <code>nanobot/agent/tools/</code> 下所有模块：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/loader.py" data-start="36">
+<pre><code>    def discover(self) -> list[type[Tool]]:
+        if self._test_classes is not None:
+            return list(self._test_classes)
+        if self._discovered is not None:
+            return self._discovered
+        seen: set[int] = set()
+        results: list[type[Tool]] = []
+        for _importer, module_name, _ispkg in pkgutil.iter_modules(self._package.__path__):
+            if module_name.startswith("_") or module_name in _SKIP_MODULES:
+                continue
+            try:
+                module = importlib.import_module(f".{module_name}", self._package.__name__)
+            except Exception:
+                logger.exception("Failed to import tool module: %s", module_name)
+                continue
+            for attr_name in dir(module):
+                attr = getattr(module, attr_name)
+                if (
+                    isinstance(attr, type)
+                    and issubclass(attr, Tool)
+                    and attr is not Tool
+                    and not attr_name.startswith("_")
+                    and not getattr(attr, "__abstractmethods__", None)
+                    and getattr(attr, "_plugin_discoverable", True)
+                    and id(attr) not in seen
+                ):
+                    seen.add(id(attr))
+                    results.append(attr)
+        results.sort(key=lambda cls: cls.__name__)
+        self._discovered = results
+        return results</code></pre>
+</div>
+
+<p>
+  <code>_SKIP_MODULES</code>（<code>loader.py:20</code>）跳过基础设施模块
+  （<code>base</code>、<code>registry</code>、<code>mcp</code> 等）。
+  MCP 工具由 <code>connect_mcp_servers</code> 动态注册，设了
+  <code>_plugin_discoverable = False</code>。
+</p>
+
+<p>
+  <code>load()</code> 检查 <code>_scopes</code> 与 <code>enabled(ctx)</code>，
+  调 <code>tool_cls.create(ctx)</code> 再 <code>registry.register(tool)</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/loader.py" data-start="92">
+<pre><code>    def load(self, ctx: ToolContext, registry: ToolRegistry, *, scope: str = "core") -> list[str]:
+        registered: list[str] = []
+        builtin_names: set[str] = set()
+        sources = [(self.discover(), False), (self._discover_plugins().values(), True)]
+        for source, is_plugin_source in sources:
+            for tool_cls in source:
+                cls_label = tool_cls.__name__
+                try:
+                    if scope not in getattr(tool_cls, "_scopes", {"core"}):
+                        continue
+                    if not tool_cls.enabled(ctx):
+                        continue
+                    tool = tool_cls.create(ctx)
+                    if is_plugin_source:
+                        tool = _LegacyErrorPrefixTool(tool)
+                    if registry.has(tool.name):
+                        if is_plugin_source and tool.name in builtin_names:
+                            logger.warning(
+                                "Plugin %s skipped: conflicts with built-in tool %s",
+                                cls_label, tool.name,
+                            )
+                            continue
+                        logger.warning(
+                            "Tool name collision: %s from %s overwrites existing",
+                            tool.name, cls_label,
+                        )
+                    registry.register(tool)
+                    registered.append(tool.name)
+                    if not is_plugin_source:
+                        builtin_names.add(tool.name)
+                except Exception:
+                    logger.exception("Failed to register tool: %s", cls_label)
+        return registered</code></pre>
+</div>
+
+<p>
+  <code>AgentLoop</code> 侧入口是 <code>_register_default_tools()</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/loop.py" data-start="605">
+<pre><code>    def _register_default_tools(
+        self,
+        *,
+        provider_snapshot_loader: Callable[..., ProviderSnapshot] | None,
+    ) -> None:
+        """Register the default set of tools via plugin loader."""
+        from nanobot.agent.tools.context import ToolContext
+        from nanobot.agent.tools.loader import ToolLoader
+
+        ctx = ToolContext(
+            config=self.tools_config,
+            workspace=str(self.workspace),
+            bus=self.bus,
+            subagent_manager=self.subagents,
+            cron_service=self.cron_service,
+            exec_session_manager=self._exec_session_manager,
+            sessions=self.sessions,
+            provider_snapshot_loader=provider_snapshot_loader,
+            image_generation_provider_configs=self._image_generation_provider_configs,
+            timezone=self.context.timezone or "UTC",
+            workspace_sandbox=self.workspace_scopes.sandbox_status,
+            runtime_events=self.runtime_events,
+        )
+        loader = ToolLoader()
+        registered = loader.load(ctx, self.tools)</code></pre>
+</div>
+
+<h3>entry-point 插件</h3>
+
+<p>
+  第三方工具通过 <code>pyproject.toml</code> 声明：
+</p>
+
+<div class="code" data-lang="python" data-file="pyproject.toml" data-start="112">
+<pre><code># Third-party tool plugins register here.  Built-in tools are discovered
+# automatically via pkgutil scanning in ToolLoader.discover().
+# [project.entry-points."nanobot.tools"]
+# my_plugin = "my_package.plugins:MyTool"</code></pre>
+</div>
+
+<p>
+  插件工具会被 <code>_LegacyErrorPrefixTool</code> 包装，把旧式
+  <code>"Error:"</code> 前缀字符串转成 <code>ToolResult.error()</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/loader.py" data-start="180">
+<pre><code>    async def execute(self, **kwargs: Any) -> Any:
+        result = await self._wrapped.execute(**kwargs)
+        if (
+            isinstance(result, str)
+            and not isinstance(result, ToolResult)
+            and result.startswith("Error:")
+        ):
+            return ToolResult.error(result)
+        return result</code></pre>
+</div>
+
+<h2 id="schema">四、Schema 生成与传给 Provider</h2>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/base.py" data-start="303">
+<pre><code>    def to_schema(self) -> dict[str, Any]:
+        """OpenAI function schema."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }</code></pre>
+</div>
+
+<p>
+  <code>ToolRegistry.get_definitions()</code> 批量导出，内置工具排前、
+  <code>mcp_</code> 前缀排后，结果缓存到 <code>_cached_definitions</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/registry.py" data-start="86">
+<pre><code>    def get_definitions(self) -> list[dict[str, Any]]:
+        """Get tool definitions with stable ordering for cache-friendly prompts.
+
+        Built-in tools are sorted first as a stable prefix, then MCP tools are
+        sorted and appended. The result is cached until the next
+        register/unregister call.
+        """
+        if self._cached_definitions is None:
+            definitions = [tool.to_schema() for tool in self._tools.values()]
+            builtins: list[dict[str, Any]] = []
+            mcp_tools: list[dict[str, Any]] = []
+            for schema in definitions:
+                name = self._schema_name(schema)
+                if name.startswith("mcp_"):
+                    mcp_tools.append(schema)
+                else:
+                    builtins.append(schema)
+
+            builtins.sort(key=self._schema_name)
+            mcp_tools.sort(key=self._schema_name)
+            self._cached_definitions = builtins + mcp_tools
+
+        return self._cached_definitions</code></pre>
+</div>
+
+<p>
+  最终在 <code>AgentRunner._call_provider</code> 里传给 LLM：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/runner.py" data-start="919">
+<pre><code>        kwargs = self._build_request_kwargs(
+            spec,
+            messages,
+            tools=spec.tools.get_definitions(),
+        )</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    稳定排序（builtins 前缀 + MCP 后缀）让 prompt cache 命中率更高——
+    同一套内置工具定义在多次请求间字节级一致，只有 MCP 工具增减时才 invalidate。
+  </p>
+</div>
+
+<h2 id="prepare">五、三层校验管线：prepare_call</h2>
+
+<p>
+  这是本章最有价值的片段之一。模型返回的 tool call 在执行前经过
+  <code>ToolRegistry.prepare_call()</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/registry.py" data-start="110">
+<pre><code>    def prepare_call(
+        self,
+        name: str,
+        params: Any,
+    ) -> tuple[Tool | None, Any, str | None]:
+        """Resolve, cast, and validate one tool call."""
+        tool = self._tools.get(name)
+        if not tool:
+            suggestion = self._suggest_name(str(name))
+            hint = f" Did you mean '{suggestion}'? Tool names must match exactly." if suggestion else ""
+            return None, params, (
+                ToolResult.error(
+                    f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
+                )
+            )
+        # Compatibility for external tools that still implement the legacy
+        # setter protocol. Built-ins read the authoritative ContextVar
+        # directly and never copy routing state.
+        if isinstance(tool, ContextAware) and (ctx := current_request_context()) is not None:
+            tool.set_context(ctx)
+
+        params = self._coerce_params(tool, params)
+        if not isinstance(params, dict):
+            return tool, params, (
+                ToolResult.error(
+                    f"Error: Tool '{name}' parameters must be a JSON object, got "
+                    f"{type(params).__name__}. Use named parameters like "
+                    'tool_name(param1="value1", param2="value2") matching the tool schema.'
+                )
+            )
+
+        cast_params = tool.cast_params(cast(dict[str, Any], params))
+        errors = tool.validate_params(cast_params)
+        if errors:
+            return tool, cast_params, (
+                ToolResult.error(f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors))
+            )
+        return tool, cast_params, None</code></pre>
+</div>
+
+<div class="ascii">prepare_call 三层管线
+
+① 工具名解析 — _tools.get(name) + _suggest_name 拼写建议
+② 参数 JSON coercion — _coerce_params（字符串 → dict、unwrap {"arguments": ...}）
+③ 类型转换 + schema 校验 — cast_params + validate_params</div>
+
+<p>
+  <code>execute()</code> 在 prepare 之后捕获意外异常：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/registry.py" data-start="187">
+<pre><code>    async def execute(self, name: str, params: Any) -> Any:
+        """Execute a tool by name with given parameters."""
+        hint = "\n\n[Analyze the error above and try a different approach.]"
+        tool, params, error = self.prepare_call(name, params)
+        if error:
+            return ToolResult.error(str(error) + hint)
+
+        try:
+            assert tool is not None  # guarded by prepare_call()
+            result = await tool.execute(**params)
+            if is_tool_error_result(result):
+                return ToolResult.error(str(result) + hint)
+            return result
+        except Exception as e:
+            return ToolResult.error(f"Error executing {name}: {str(e)}" + hint)</code></pre>
+</div>
+
+<div class="callout trap">
+  <div class="t">▲ 易错点</div>
+  <p style="margin-bottom:0">
+    模型经常把参数包成 <code>{"arguments": "{\"path\": \"...\"}"}</code> 双层嵌套。
+    <code>_unwrap_arguments_payload</code>（<code>registry.py:176</code>）专门处理这个——
+    但如果 schema 里真的有一个叫 <code>arguments</code> 的参数，就不会 unwrap。
+  </p>
+</div>
+
+<h2 id="timeout">六、超时控制</h2>
+
+<p>
+  Shell 工具用 <code>asyncio.wait_for(process.communicate(), timeout=...)</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/shell.py" data-start="331">
+<pre><code>            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=prepared.timeout,
+                )
+            except asyncio.TimeoutError:
+                await self._kill_process(process)
+                return ToolResult.error(f"Error: Command timed out after {prepared.timeout} seconds")</code></pre>
+</div>
+
+<p>
+  超时解析在 <code>_resolve_timeout</code>：默认 60s、LLM 传入上限 600s、
+  配置 <code>timeout=0</code> 表示不限：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/shell.py" data-start="408">
+<pre><code>    def _resolve_timeout(self, timeout: int | None) -> int | None:
+        """Resolve the effective hard timeout in seconds (None = no limit).
+
+        A per-call timeout supplied by the model stays capped at _MAX_TIMEOUT so
+        the LLM cannot request unbounded execution. The config-level default
+        (self.timeout) may exceed that cap, and 0 disables the limit entirely
+        for trusted long-running tasks (#3595).
+        """
+        if timeout:
+            return min(timeout, self._MAX_TIMEOUT)
+        if self.timeout and self.timeout > 0:
+            return self.timeout
+        return None</code></pre>
+</div>
+
+<p>
+  MCP 工具同样用 <code>asyncio.wait_for(session.call_tool(...))</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/mcp.py" data-start="615">
+<pre><code>                result = await asyncio.wait_for(
+                    self._session.call_tool(self._original_name, arguments=kwargs),
+                    timeout=self._tool_timeout,
+                )</code></pre>
+</div>
+
+<div class="callout why">
+  <div class="t">? 为什么 LLM 传入 timeout 有 600s 上限</div>
+  <p style="margin-bottom:0">
+    模型可能幻觉出 <code>timeout=999999</code>。<code>min(timeout, _MAX_TIMEOUT)</code>
+    （<code>shell.py:417</code>，<code>_MAX_TIMEOUT = 600</code>）防止 agent 被单次工具调用无限挂起。
+    信任的长任务走配置级 <code>timeout=0</code>，不经过 LLM 参数。
+  </p>
+</div>
+
+<h2 id="mcp">七、MCP 桥接</h2>
+
+<p>
+  <code>MCPToolWrapper</code> 把远端 MCP tool 包装成本地 <code>Tool</code>，
+  命名 <code>mcp_{server}_{tool}</code>：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/mcp.py" data-start="578">
+<pre><code>class MCPToolWrapper(_MCPWrapperBase):
+    """Wraps a single MCP server tool as a nanobot Tool."""
+
+    _plugin_discoverable = False
+
+    def __init__(
+        self,
+        session: "ClientSession",
+        server_name: str,
+        tool_def: "MCPToolDefinition",
+        tool_timeout: int = 30,
+    ):
+        self._set_mcp_connection(session, server_name)
+        self._original_name = tool_def.name
+        self._name = _sanitize_mcp_tool_name(f"mcp_{server_name}_{tool_def.name}")
+        self._description = tool_def.description or tool_def.name
+        raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
+        self._parameters = _normalize_schema_for_openai(raw_schema)
+        self._tool_timeout = tool_timeout
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return self._parameters
+
+    async def execute(self, **kwargs: Any) -> str:
+        retried_transient = False
+        refreshed_session = False
+        while True:
+            try:
+                result = await asyncio.wait_for(
+                    self._session.call_tool(self._original_name, arguments=kwargs),
+                    timeout=self._tool_timeout,
+                )</code></pre>
+</div>
+
+<p>
+  名称消毒：非 <code>[a-zA-Z0-9_-]</code> 替换为 <code>_</code>，超长截断 + SHA1 后缀
+  （<code>_MAX_TOOL_NAME_LENGTH = 64</code>）：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/mcp.py" data-start="178">
+<pre><code>def _sanitize_mcp_tool_name(name: str) -> str:
+    """Sanitize and limit an MCP-derived tool name."""
+    return _limit_tool_name(_sanitize_name(name))</code></pre>
+</div>
+
+<p>
+  连接流程 <code>connect_mcp_servers()</code>：按 transport 选 stdio / sse / streamableHttp →
+  HTTP 传输做 URL 安全校验 + OAuth → <code>ClientSession.initialize()</code> →
+  <code>list_tools()</code> 过滤 <code>enabledTools</code> → 注册：
+</p>
+
+<div class="code" data-lang="python" data-file="nanobot/agent/tools/mcp.py" data-start="983">
+<pre><code>async def connect_mcp_servers(
+    mcp_servers: "dict[str, MCPServerConfig]",
+    registry: ToolRegistry,
+    *,
+    oauth_handlers: Mapping[str, "MCPOAuthHandlers"] | None = None,
+) -> dict[str, MCPConnection]:
+    """Connect to configured MCP servers and register their tools, resources, prompts.
+
+    Returns one connection handle per server.  Each handle keeps the task that
+    entered the MCP SDK contexts alive so reconnect and shutdown can close
+    AnyIO cancel scopes from their owning task.
+    """
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.sse import sse_client
+    from mcp.client.stdio import stdio_client
+    from mcp.client.streamable_http import streamable_http_client
+
+    async def open_single_server(
+        name: str, cfg: "MCPServerConfig", server_stack: AsyncExitStack
+    ) -> bool:
+        try:
+            transport_type = cfg.type
+            if not transport_type:
+                if cfg.command:
+                    transport_type = "stdio"
+                elif cfg.url:
+                    transport_type = (
+                        "sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp"
+                    )
+                else:
+                    logger.warning("MCP server '{}': no command or url configured, skipping", name)
+                    return False
+
+            if transport_type in {"sse", "streamableHttp"}:
+                ok, error = validate_url_target(cfg.url)
+                if not ok:
+                    logger.warning(
+                        "MCP server '{}': blocked unsafe URL {} ({})",
+                        name,
+                        _redact_url(cfg.url),
+                        error,
+                    )
+                    return False</code></pre>
+</div>
+
+<div class="callout tip">
+  <div class="t">✓ 实用提示</div>
+  <p style="margin-bottom:0">
+    WebUI 重载 MCP 走运行时控制路径（第 02 章 <code>RUNTIME_CONTROL_MCP_RELOAD</code>），
+    不重启 gateway。HTTP MCP 的 URL 校验与第
+    <a href="10-security.html">10 章</a> SSRF 防护共用 <code>validate_url_target</code>。
+  </p>
+</div>
+
+<h2 id="inventory">八、工具文件清单</h2>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>文件</th><th>一句话说明</th></tr></thead>
+<tbody>
+<tr><td><code>filesystem.py</code></td><td>读/写/编辑/列目录——agent 操作工作区文件的核心工具</td></tr>
+<tr><td><code>apply_patch.py</code></td><td>结构化 patch 应用，比 raw write 更安全地批量改文件</td></tr>
+<tr><td><code>search.py</code></td><td>glob 文件发现 + ripgrep 内容搜索</td></tr>
+<tr><td><code>shell.py</code></td><td>执行 shell 命令，含 sandbox 后端、超时、输出截断</td></tr>
+<tr><td><code>sandbox.py</code></td><td>沙箱执行后端抽象（Docker 等），供 shell 工具选用</td></tr>
+<tr><td><code>exec_session.py</code></td><td>长驻 shell 会话管理，支持 yield/poll 式交互命令</td></tr>
+<tr><td><code>web.py</code></td><td><code>web_search</code> 与 <code>web_fetch</code>，受 SSRF 策略约束</td></tr>
+<tr><td><code>mcp.py</code></td><td>MCP 客户端：连接远端 server、包装 tool/resource/prompt</td></tr>
+<tr><td><code>mcp_oauth.py</code></td><td>MCP HTTP 传输的 OAuth 授权流程</td></tr>
+<tr><td><code>message.py</code></td><td>agent 主动向渠道发消息（非回复路径）</td></tr>
+<tr><td><code>cron.py</code></td><td>定时任务 CRUD，与 <code>CronService</code> 集成</td></tr>
+<tr><td><code>spawn.py</code></td><td>派发后台 subagent，独立会话执行子任务</td></tr>
+<tr><td><code>sessions.py</code></td><td>跨会话读写工具，供 agent 查阅其他会话历史</td></tr>
+<tr><td><code>long_task.py</code></td><td>持续目标（sustained goal）状态跟踪与续跑</td></tr>
+<tr><td><code>image_generation.py</code></td><td>调用配置的 image generation provider 生图</td></tr>
+<tr><td><code>cli_apps.py</code></td><td>声明式 CLI 应用工具（外部命令包装）</td></tr>
+<tr><td><code>self.py</code></td><td>运行时自省：查配置、模型、工具列表等</td></tr>
+<tr><td><code>runtime_control.py</code></td><td>运行时控制辅助（MCP 重载等），非 LLM 可调用工具</td></tr>
+<tr><td><code>file_state.py</code></td><td>文件编辑状态追踪，供 UI 展示 diff 事件</td></tr>
+<tr><td><code>path_utils.py</code></td><td>工作区路径解析、沙箱边界检查</td></tr>
+<tr><td><code>base.py</code></td><td><code>Tool</code> / <code>ToolResult</code> 抽象基类与 schema 辅助</td></tr>
+<tr><td><code>schema.py</code></td><td>JSON Schema 校验与类型解析</td></tr>
+<tr><td><code>registry.py</code></td><td><code>ToolRegistry</code>：注册、schema 导出、prepare/execute</td></tr>
+<tr><td><code>loader.py</code></td><td><code>ToolLoader</code>：pkgutil 扫描 + entry-point 插件加载</td></tr>
+<tr><td><code>context.py</code></td><td><code>ToolContext</code> / <code>RequestContext</code>，注入依赖与路由状态</td></tr>
+<tr><td><code>__init__.py</code></td><td>包入口，供 pkgutil 扫描定位包路径</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="quiz">九、练习</h2>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag">基础</span>为什么工具统一用 <code>execute</code> 而不是 <code>run</code>？失败时应该抛异常还是返回 <code>ToolResult.error</code>？</p>
+  </div>
+  <div class="ans">
+    <p>
+      <strong><code>execute</code></strong> 是 <code>Tool</code> 抽象基类定义的唯一定义入口（<code>base.py:223</code>），
+      <code>ToolRegistry.execute</code> 也只调这个方法——命名一致避免"到底调 run 还是 execute"的分叉。
+    </p>
+    <p>
+      <strong>失败应返回 <code>ToolResult.error(...)</code></strong>（<code>base.py:228</code>）。
+      docstring 写得很清楚："return content, or ``ToolResult.error(...)`` for failures"。
+      这样错误文本作为 <code>role="tool"</code> 消息喂回 LLM，进入正常的 ReAct 纠错循环；
+      抛异常只留给真正的代码 bug，由 <code>registry.execute</code> 的
+      <code>except Exception</code>（<code>registry.py:200</code>）兜底。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag mid">进阶</span>模型调用 <code>exec</code> 工具时传入
+    <code>{"arguments": "{\"command\": \"ls\"}"}</code>（双层嵌套）。
+    <code>prepare_call</code> 如何处理？如果工具的 schema 里真的有一个叫 <code>arguments</code> 的参数呢？</p>
+  </div>
+  <div class="ans">
+    <p><strong>正常情况：unwrap 一层。</strong></p>
+    <p>
+      <code>_coerce_params</code> → <code>_unwrap_arguments_payload</code>（<code>registry.py:176</code>）：
+      当 params 只有唯一 key <code>"arguments"</code>，且 schema 的 <code>properties</code> 里
+      <strong>没有</strong> 名为 <code>arguments</code> 的字段时，把值当作 JSON 字符串再 parse 一次，
+      得到 <code>{"command": "ls"}</code>。
+    </p>
+    <p><strong>例外：schema 真有 <code>arguments</code> 参数。</strong></p>
+    <p>
+      此时 <code>"arguments" in properties</code> 为真，不会 unwrap——
+      双层嵌套会被当作合法的单参数对象传给 <code>cast_params</code>。
+      这是有意设计：不能误伤那些参数名就叫 <code>arguments</code> 的工具。
+    </p>
+    <p>
+      如果 unwrap 后仍不是 dict，<code>prepare_call</code> 第 132 行返回
+      "parameters must be a JSON object" 错误，不会执行工具。
+    </p>
+  </div>
+</div>
+
+<div class="quiz">
+  <div class="q">
+    <p><span class="tag hard">挑战</span>MCP server 注册了一个名叫 <code>my.tool@v2</code> 的工具。
+    说明从 MCP 连接到 LLM 可见 schema 的完整命名/transform 链路，以及为什么要
+    <code>_sanitize_mcp_tool_name</code> + SHA1 截断。</p>
+  </div>
+  <div class="ans">
+    <p><strong>链路：</strong></p>
+    <ol>
+      <li>
+        <code>connect_mcp_servers</code>（<code>mcp.py:983</code>）连接 server →
+        <code>list_tools()</code> 拿到 <code>MCPToolDefinition</code>。
+      </li>
+      <li>
+        <code>MCPToolWrapper.__init__</code>（<code>mcp.py:592</code>）构造本地名：
+        <code>f"mcp_{server_name}_{tool_def.name}"</code> → 如
+        <code>mcp_myserver_my.tool@v2</code>。
+      </li>
+      <li>
+        <code>_sanitize_mcp_tool_name</code>（<code>mcp.py:178</code>）：
+        <code>@</code> 和 <code>.</code> 替换成 <code>_</code> →
+        <code>mcp_myserver_my_tool_v2</code>。
+      </li>
+      <li>
+        若超过 64 字符（<code>_MAX_TOOL_NAME_LENGTH</code>，<code>mcp.py:164</code>），
+        截断前缀 + <code>_</code> + SHA1 前 8 位后缀，保证 OpenAI function name 合法且唯一。
+      </li>
+      <li>
+        <code>registry.register(wrapper)</code> → <code>get_definitions()</code> 排到 MCP 后缀 →
+        传给 provider（<code>runner.py:919</code>）。
+      </li>
+      <li>
+        LLM 返回 tool call 时用 sanitized 名 → <code>prepare_call</code> 解析 →
+        <code>MCPToolWrapper.execute</code> 调 <code>session.call_tool(self._original_name, ...)</code>
+        用<strong>原始 MCP 名</strong> <code>my.tool@v2</code> 调远端。
+      </li>
+    </ol>
+    <p>
+      <strong>为什么必须 sanitize：</strong> OpenAI function calling 只允许
+      <code>[a-zA-Z0-9_-]</code>；MCP 工具名来自第三方，可能含空格、Unicode、特殊符号。
+      不消毒会导致 schema 被 provider 拒收，或不同 MCP 工具映射到同名冲突。
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="t">本章小结</div>
+  <p style="margin-bottom:0">
+    工具系统 = <strong>Tool.execute 统一入口</strong> + <strong>ToolResult 错误契约</strong> +
+    <strong>pkgutil/entry-point 发现</strong> + <strong>prepare_call 三层校验</strong> +
+    <strong>MCP 桥接</strong>。Provider 决定"调什么"，Registry 决定"怎么调、调哪个"——
+    两者在第 <a href="04-runner.html">04 章</a> 的 ReAct 循环里汇合。
+  </p>
+</div>
+
+<div id="done-toggle"></div>
+<div id="pager"></div>
+
+      </div>
+    </div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -28,7 +28,7 @@ _PROVIDER_DISPLAY: dict[str, str] = {
 }
 
 _OAUTH_PROVIDER_DEFAULT_MODELS: dict[str, str] = {
-    "openai_codex": "openai-codex/gpt-5.6-sol",
+    "openai_codex": "openai-codex/gpt-5.7-sol",
     "xai_grok": "xai-grok/grok-4.5",
     "github_copilot": "github-copilot/gpt-5.4-mini",
 }

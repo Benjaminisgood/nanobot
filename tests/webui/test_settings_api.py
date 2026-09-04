@@ -1839,18 +1839,18 @@ def test_provider_models_payload_returns_curated_openai_codex_models() -> None:
 
     assert payload["status"] == "available"
     assert payload["catalog_kind"] == "builtin"
-    assert payload["model_count"] == 7
+    assert payload["model_count"] == 8
     assert payload["models"][0] == {
-        "id": "openai-codex/gpt-5.6-sol",
-        "label": "GPT-5.6-Sol",
+        "id": "openai-codex/gpt-5.7-sol",
+        "label": "GPT-5.7-Sol",
         "description": "Latest frontier agentic coding model.",
         "owned_by": "OpenAI Codex",
         "context_window": 372000,
     }
     assert [model["id"] for model in payload["models"][:3]] == [
+        "openai-codex/gpt-5.7-sol",
         "openai-codex/gpt-5.6-sol",
         "openai-codex/gpt-5.6-terra",
-        "openai-codex/gpt-5.6-luna",
     ]
 
 
