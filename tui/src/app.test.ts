@@ -9,6 +9,7 @@ import {
 } from "@opentui/core"
 import {
   MockTreeSitterClient,
+  TestRecorder,
   createTestRenderer,
   type TestRendererSetup,
 } from "@opentui/core/testing"
@@ -486,6 +487,17 @@ describe("NanobotTui layout", () => {
 
     setup.mockInput.pressArrow("right", { shift: true })
     await waitUntil(() => ui.composer.cursorOffset === 10)
+    await setup.mockInput.typeText("replacement")
+    await waitUntil(() => ui.draft.imageCount === 0)
+    expect(ui.composer.plainText).toContain("replacement")
+    expect(ui.composer.plainText).not.toContain("Image #1")
+
+    ui.composer.setText("")
+    setup.mockInput.pressKey("v", { ctrl: true })
+    await waitUntil(() => ui.composer.plainText === "[Image #1] ")
+    ui.composer.cursorOffset = 10
+    setup.mockInput.pressArrow("left", { shift: true })
+    await waitUntil(() => ui.composer.cursorOffset === 0)
     await setup.mockInput.typeText("replacement")
     await waitUntil(() => ui.draft.imageCount === 0)
     expect(ui.composer.plainText).toContain("replacement")
@@ -2052,6 +2064,86 @@ describe("NanobotTui layout", () => {
     }
   })
 
+  test("keeps streamed fenced code visible while completing the response", async () => {
+    setup = await createRenderer({ width: 100, height: 30, screenMode: "alternate-screen" })
+    const app = mount(setup)
+    const response = [
+      "Commit types:",
+      "",
+      "```text",
+      "feat:",
+      "fix:",
+      "perf:",
+      "docs:",
+      "test:",
+      "refactor:",
+      "chore:",
+      "```",
+      "",
+      "Include the reason in the body.",
+    ].join("\n")
+
+    app.accept({ event: "attached", chat_id: "chat" })
+    app.accept({ event: "delta", chat_id: "chat", text: response })
+    await setup.flush()
+    expect(setup.captureCharFrame()).toContain("feat:")
+
+    const recorder = new TestRecorder(setup.renderer)
+    recorder.rec()
+    app.accept({ event: "stream_end", chat_id: "chat" })
+    app.accept({ event: "turn_end", chat_id: "chat" })
+    await setup.flush()
+    recorder.stop()
+
+    expect(recorder.recordedFrames.length).toBeGreaterThan(0)
+    expect(recorder.recordedFrames.every(({ frame }) => frame.includes("feat:"))).toBeTrue()
+    expect(recorder.recordedFrames.every(({ frame }) => /│\s+feat:/u.test(frame))).toBeTrue()
+    expect(recorder.recordedFrames.every(({ frame }) => (
+      frame.includes("Include the reason in the body.")
+    ))).toBeTrue()
+  })
+
+  test("renders fenced plain text from light-theme history", async () => {
+    setup = await createRenderer({ width: 100, height: 30, screenMode: "alternate-screen" })
+    const app = NanobotTui.mount(
+      setup.renderer,
+      { ...options, theme: "light" },
+      client(),
+      new MockTreeSitterClient({ autoResolveTimeout: 0 }),
+    )
+    const response = [
+      "Commit types:",
+      "",
+      "```text",
+      "feat:",
+      "fix:",
+      "perf:",
+      "docs:",
+      "test:",
+      "refactor:",
+      "chore:",
+      "```",
+      "",
+      "Include the reason in the body.",
+    ].join("\n")
+    const transcript = (app as unknown as { transcript: Transcript }).transcript
+
+    transcript.history([{ role: "assistant", content: response }])
+    await setup.flush()
+
+    const codeLine = setup.captureSpans().lines.find((line) => (
+      line.spans.some((span) => span.text.includes("feat:"))
+    ))
+    const code = codeLine?.spans.find((span) => span.text.includes("feat:"))
+    const rail = codeLine?.spans.find((span) => span.text.includes("│"))
+    const frame = setup.captureCharFrame()
+
+    expect(frame).toContain("feat:")
+    expect(frame).toMatch(/│\s+feat:/u)
+    expect(code?.fg.toInts().slice(0, 3)).toEqual([24, 24, 27])
+    expect(rail?.fg.toInts().slice(0, 3)).toEqual([212, 212, 216])
+  })
+
   test("renders assistant LaTeX as Unicode text without changing code", async () => {
     setup = await createRenderer({ width: 96, height: 24, screenMode: "alternate-screen" })
     const app = mount(setup)
@@ -2102,7 +2194,7 @@ describe("NanobotTui layout", () => {
         syntaxStyle: { getStyle(name: string): { fg?: { toInts(): number[] } } | undefined } | null
       }
       transcript: {
-        markdown: Set<{ syntaxStyle: object }>
+        markdown: Set<{ fg?: { toInts(): number[] }; syntaxStyle: object }>
         frames: Set<{ borderColor: { toInts(): number[] } }>
         userRows: Set<{ backgroundColor: { intent: string; toInts(): number[] } }>
         userMessages: Set<{ renderable: TextRenderable }>
@@ -2136,6 +2228,7 @@ describe("NanobotTui layout", () => {
     expect(internals.composer.textColor.toInts().slice(0, 3)).toEqual([24, 24, 27])
     expect(sessionFrame?.borderColor.toInts().slice(0, 3)).toEqual([212, 212, 216])
     expect(userRow?.backgroundColor.toInts().slice(0, 3)).toEqual([240, 240, 240])
+    expect(markdown?.fg?.toInts().slice(0, 3)).toEqual([24, 24, 27])
     expect(markdown?.syntaxStyle).not.toBe(darkSyntax)
     expect(internals.composer.syntaxStyle).not.toBe(darkComposerSyntax)
     expect(internals.composer.syntaxStyle?.getStyle("image.placeholder")?.fg?.toInts().slice(0, 3))
