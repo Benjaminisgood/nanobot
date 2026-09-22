@@ -301,6 +301,7 @@ class MatrixConfig(Base):
     group_allow_from: list[str] = Field(default_factory=list)
     allow_room_mentions: bool = False
     streaming: bool = False
+    proxy: str | None = None
 
 
 class MatrixChannel(BaseChannel):
@@ -356,10 +357,14 @@ class MatrixChannel(BaseChannel):
         # Replace ':' with '_' to produce a Windows-safe filename
         safe_store_name = self.config.user_id.replace(":", "_") + f"_{self.config.device_id}.db"
 
+        proxy = self.config.proxy.strip() if self.config.proxy else ""
+        if proxy and "://" not in proxy:
+            proxy = f"http://{proxy}"
         self.client = AsyncClient(
             homeserver=self.config.homeserver,
             user=self.config.user_id,
             store_path=str(self.store_path),
+            proxy=proxy or None,
             config=AsyncClientConfig(
                 store_sync_tokens=True,
                 encryption_enabled=self.config.e2ee_enabled,
@@ -531,7 +536,7 @@ class MatrixChannel(BaseChannel):
         try:
             response = await self.client.content_repository_config()
         except Exception:
-            self.logger.error("Failed to fetch server upload limit", exc_info=True)
+            self.logger.opt(exception=True).error("Failed to fetch server upload limit")
             return None
         upload_size = getattr(response, "upload_size", None)
         if isinstance(upload_size, int) and upload_size > 0:
@@ -577,7 +582,7 @@ class MatrixChannel(BaseChannel):
                     filesize=size_bytes,
                 )
         except Exception:
-            self.logger.error("Matrix media upload failed for {}", filename, exc_info=True)
+            self.logger.opt(exception=True).error("Matrix media upload failed for {}", filename)
             return fail
 
         is_tuple_result = isinstance(cast(object, upload_result), tuple)
@@ -602,7 +607,9 @@ class MatrixChannel(BaseChannel):
         try:
             await self._send_room_content(room_id, content)
         except Exception:
-            self.logger.error("Matrix room content send failed for room_id={}", room_id, exc_info=True)
+            self.logger.opt(exception=True).error(
+                "Matrix room content send failed for room_id={}", room_id
+            )
             return fail
         return None
 
@@ -707,7 +714,9 @@ class MatrixChannel(BaseChannel):
                 buf.text = previous_text
                 if created_buf:
                     self._stream_bufs.pop(stream_key, None)
-                self.logger.error("Stream send/edit failed for chat_id={}", chat_id, exc_info=True)
+                self.logger.opt(exception=True).error(
+                    "Stream send/edit failed for chat_id={}", chat_id
+                )
                 await self._stop_typing_keepalive(chat_id, clear_typing=True)
                 raise
 
@@ -1006,7 +1015,9 @@ class MatrixChannel(BaseChannel):
                 ),
             )
         except Exception:
-            self.logger.error("Matrix join request exception for room={}", room_id, exc_info=True)
+            self.logger.opt(exception=True).error(
+                "Matrix join request exception for room={}", room_id
+            )
             return False
         if isinstance(resp, JoinError):
             self.logger.error("Matrix auto-join failed for room={}: {}", room_id, resp)
@@ -1282,7 +1293,7 @@ class MatrixChannel(BaseChannel):
         except _MediaTooLargeError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            self.logger.warning("download failed for {}", mxc_url, exc_info=True)
+            self.logger.opt(exception=True).warning("download failed for {}", mxc_url)
             return None
 
     def _decrypt_media_bytes(self, event: MatrixMediaEvent, ciphertext: bytes) -> bytes | None:

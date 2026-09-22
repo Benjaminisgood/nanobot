@@ -48,11 +48,12 @@ class _DummyTask:
 
 
 class _FakeAsyncClient:
-    def __init__(self, homeserver, user, store_path, config) -> None:
+    def __init__(self, homeserver, user, store_path, config, proxy=None) -> None:
         self.homeserver = homeserver
         self.user = user
         self.store_path = store_path
         self.config = config
+        self.proxy = proxy
         self.user_id: str | None = None
         self.access_token: str | None = None
         self.device_id: str | None = None
@@ -326,11 +327,15 @@ async def test_start_skips_load_store_when_device_id_missing(
         "nanobot.channels.matrix.runtime.asyncio.create_task", _fake_create_task
     )
 
-    channel = MatrixChannel(_make_config(device_id="", e2ee_enabled=True), MessageBus())
+    channel = MatrixChannel(
+        _make_config(device_id="", e2ee_enabled=True, proxy="127.0.0.1:7890"),
+        MessageBus(),
+    )
     await channel.start()
 
     assert len(clients) == 1
     assert clients[0].config.encryption_enabled is True
+    assert clients[0].proxy == "http://127.0.0.1:7890"
     assert clients[0].load_store_called is False
     assert len(clients[0].callbacks) == 3
     assert clients[0].to_device_callbacks == []
@@ -1833,8 +1838,9 @@ async def test_send_handles_upload_exception_and_reports_failure(tmp_path) -> No
         client.room_send_calls[0]["content"]["body"]
         == "Please review.\n[attachment: broken.txt - upload failed]"
     )
-    channel.logger.error.assert_called_once_with(
-        "Matrix media upload failed for {}", "broken.txt", exc_info=True
+    channel.logger.opt.assert_called_once_with(exception=True)
+    channel.logger.opt.return_value.error.assert_called_once_with(
+        "Matrix media upload failed for {}", "broken.txt"
     )
 
 
@@ -1856,10 +1862,10 @@ async def test_attachment_room_send_error_logs_room_id(tmp_path) -> None:
     )
 
     assert failure == "[attachment: report.txt - upload failed]"
-    channel.logger.error.assert_called_once_with(
+    channel.logger.opt.assert_called_once_with(exception=True)
+    channel.logger.opt.return_value.error.assert_called_once_with(
         "Matrix room content send failed for room_id={}",
         "!room:matrix.org",
-        exc_info=True,
     )
 
 
@@ -2504,8 +2510,9 @@ async def test_send_delta_on_error_restores_buffer_and_raises(monkeypatch) -> No
     assert len(client.room_send_calls) == 1
 
     assert len(client.typing_calls) == 1
-    channel.logger.error.assert_called_once_with(
-        "Stream send/edit failed for chat_id={}", "!room:matrix.org", exc_info=True
+    channel.logger.opt.assert_called_once_with(exception=True)
+    channel.logger.opt.return_value.error.assert_called_once_with(
+        "Stream send/edit failed for chat_id={}", "!room:matrix.org"
     )
 
     client.raise_on_send = False
