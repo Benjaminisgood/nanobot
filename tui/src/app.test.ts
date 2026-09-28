@@ -1061,7 +1061,12 @@ describe("NanobotTui layout", () => {
         return Promise.resolve(new Response(JSON.stringify({})))
       }
       return Promise.resolve(new Response(JSON.stringify({
-        messages: [],
+        schemaVersion: 3, projection: "events",
+        events: url.includes("websocket%3Aother") ? [
+          { event: "user_message", chat_id: "other", starts_turn: true, text: "saved question" },
+          { event: "stream_end", chat_id: "other", text: "saved answer" },
+          { event: "turn_end", chat_id: "other" },
+        ] : [],
         page: { has_more_before: false },
       })))
     }) as typeof fetch
@@ -1114,6 +1119,9 @@ describe("NanobotTui layout", () => {
       await waitUntil(() => ui.ready)
       expect(ui.activeTurn).toBe(false)
       expect(ui.queuePreview.root.visible).toBe(false)
+      await setup.flush()
+      expect(setup.captureCharFrame()).toContain("saved question")
+      expect(setup.captureCharFrame()).toContain("saved answer")
 
       ui.composer.setText("/sessions")
       ui.composer.submit()
@@ -1896,14 +1904,15 @@ describe("NanobotTui layout", () => {
       requests.push(url)
       const older = url.includes("before=older-page")
       return Promise.resolve(new Response(JSON.stringify({
-        messages: older
+        schemaVersion: 3, projection: "events",
+        events: older
           ? [
-              { role: "user", content: "oldest question" },
-              { role: "assistant", content: "oldest answer" },
+              { event: "user_message", chat_id: "chat", starts_turn: true, text: "oldest question" },
+              { event: "stream_end", chat_id: "chat", text: "oldest answer" },
             ]
           : [
-              { role: "user", content: "recent question" },
-              { role: "assistant", content: "recent answer" },
+              { event: "user_message", chat_id: "chat", starts_turn: true, text: "recent question" },
+              { event: "stream_end", chat_id: "chat", text: "recent answer" },
             ],
         page: older
           ? { has_more_before: false, before_cursor: null }
@@ -3084,10 +3093,8 @@ describe("NanobotTui layout", () => {
       app.accept({ ...event, phase: "started" })
       app.accept({ ...event, phase: "succeeded" })
       resolveFetch(Response.json({
-        messages: [{
-          role: "assistant", kind: "compaction", content: "",
-          compaction: { id: "idle", phase: "succeeded" },
-        }],
+        schemaVersion: 3, projection: "events",
+        events: [{ event: "context_compaction", chat_id: "chat", compaction_id: "idle", phase: "succeeded" }],
       }))
       await waitUntil(() => (app as unknown as { ready: boolean }).ready)
       await setup.renderOnce()
@@ -3119,7 +3126,8 @@ describe("NanobotTui layout", () => {
       app.accept({ event: "delta", chat_id: "chat", text: "live after reconnect" })
       expect((app as unknown as { activeTurn: boolean }).activeTurn).toBe(false)
       resolveFetch(new Response(JSON.stringify({
-        messages: [{ role: "assistant", content: "persisted before reconnect" }],
+        schemaVersion: 3, projection: "events",
+        events: [{ event: "stream_end", chat_id: "chat", text: "persisted before reconnect" }],
         page: { has_more_before: false },
       })))
       await Bun.sleep(5)
@@ -3146,7 +3154,8 @@ describe("NanobotTui layout", () => {
       request += 1
       if (request === 1) {
         return Promise.resolve(new Response(JSON.stringify({
-          messages: [{ role: "assistant", content: "initial history" }],
+          schemaVersion: 3, projection: "events",
+        events: [{ event: "stream_end", chat_id: "chat", text: "initial history" }],
           page: { has_more_before: false },
         })))
       }
@@ -3180,7 +3189,8 @@ describe("NanobotTui layout", () => {
       expect(ui.status.plainText).toContain("Not sent · press Enter to retry when ready")
 
       resolveReconnect(new Response(JSON.stringify({
-        messages: [{ role: "assistant", content: "restored history" }],
+        schemaVersion: 3, projection: "events",
+        events: [{ event: "stream_end", chat_id: "chat", text: "restored history" }],
         page: { has_more_before: false },
       })))
       await waitUntil(() => ui.ready)

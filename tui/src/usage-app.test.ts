@@ -8,10 +8,11 @@ import type { RecoveryState } from "./protocol"
 
 const originalFetch = globalThis.fetch
 const page = (input = 9000) => ({
-  messages: [{
-    id: "reply", turnId: "turn", role: "assistant", content: "Saved reply",
-    usage: { prompt_tokens: 15000, context_tokens: 9000 }, contextWindowTokens: 262144,
-    roundUsages: [
+  schemaVersion: 3, projection: "events",
+  events: [{
+    event: "turn_end", chat_id: "chat", turn_id: "turn",
+    usage: { prompt_tokens: 15000, context_tokens: 9000 }, context_window_tokens: 262144,
+    round_usages: [
       { prompt_tokens: 3000, completion_tokens: 100, cached_tokens: 0 },
       { prompt_tokens: input, completion_tokens: 200, cached_tokens: 6000 },
     ],
@@ -220,7 +221,7 @@ describe("TUI /usage", () => {
     const { app, ui, client } = await mount((init) => {
       requests++
       // Session hydration is independent of the usage request.
-      if (requests > 1) return Promise.resolve(Response.json({ messages: [] }))
+      if (requests > 1) return Promise.resolve(Response.json({ schemaVersion: 3, projection: "events", events: [] }))
       signal = init?.signal
       return new Promise((_resolve, reject) => {
         signal?.addEventListener("abort", () => reject(signal!.reason), { once: true })
@@ -262,7 +263,7 @@ describe("TUI /usage", () => {
     const { app, ui, client } = await mount(() => {
       requests++
       if (requests === 1) return new Promise((resolve) => { finish = resolve })
-      return Promise.resolve(Response.json({ messages: [] }))
+      return Promise.resolve(Response.json({ schemaVersion: 3, projection: "events", events: [] }))
     })
     await open(ui)
     client.attach("other-chat")

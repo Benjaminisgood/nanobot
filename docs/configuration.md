@@ -42,6 +42,7 @@ the focused guides first and come back here for exact fields and defaults.
 | Add fallback chains | [Model Fallbacks](#model-fallbacks) |
 | Configure voice transcription | [Transcription Settings](#transcription-settings) |
 | Tune channel defaults | [Channel Settings](#channel-settings) |
+| Configure local file search | [File Search](#file-search) |
 | Configure web search and fetch | [Web Tools](#web-tools) |
 | Enable image generation | [Image Generation](#image-generation) |
 | Add MCP servers | [MCP](#mcp-model-context-protocol) |
@@ -1688,6 +1689,10 @@ When a channel `send()` raises, nanobot retries at the channel-manager layer. By
 >
 > If a channel is completely unreachable, nanobot cannot notify the user through that same channel. Watch logs for `Failed to send to {channel} after N attempts` to spot persistent delivery failures.
 
+## File Search
+
+When ripgrep (`rg`) is installed, nanobot automatically uses it in place of the built-in `grep` and `find_files` tools.
+
 ## Web Tools
 
 nanobot incorporates basic tools for accessing the web. These include searching via APIs, and fetching arbitrary web pages in Markdown format. They are enabled by default, and can be configured in `~/.nanobot/config.json` under `tools.web`.
@@ -2273,7 +2278,7 @@ The deprecated `agents.defaults.failOnToolError` field is silently ignored when 
 
 ## Auto Compact
 
-When a user is idle for longer than a configured threshold, nanobot **proactively** compresses the older part of the session context into a summary while keeping a recent legal suffix of live messages. This reduces token cost and first-token latency when the user returns — instead of re-processing a long stale context with an expired KV cache, the model receives a compact summary, the most recent live context, and fresh input.
+When a session is idle for longer than a configured threshold, nanobot summarizes its conversation context. When you return, the model receives that summary and new messages instead of replaying the messages covered by the summary. The original conversation remains in your saved chat history, but even its most recent messages are no longer included verbatim in the model's context after idle compaction.
 
 ```json
 {
@@ -2295,12 +2300,14 @@ When a user is idle for longer than a configured threshold, nanobot **proactivel
 
 How it works:
 1. **Idle detection**: On each idle tick (~1 s), checks whether an idle-session scan is due. By default, the full scan runs at most once per minute.
-2. **Background compaction**: Older context is summarized while the most recent messages remain available.
+2. **Background compaction**: The conversation so far is summarized for the next turn.
 3. **Session preservation**: The complete session history remains stored for later inspection and reuse.
 4. **Restart-safe resume**: The compacted context remains available after a process restart.
 
 > [!NOTE]
 > Auto compact shortens the context sent to the model without deleting the session's structured message history.
+
+Use `/compact` in chat to compact the current session without waiting for the idle threshold.
 
 ## Timezone
 

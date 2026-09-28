@@ -13,6 +13,7 @@ import { hasPendingAgentActivity } from "@/lib/activity-timeline";
 import { deriveTitle } from "@/lib/format";
 import { projectThreadEvents } from "@/lib/thread-event-projection";
 import { webuiThreadCache } from "@/lib/webui-thread-cache";
+import { readReloadSessions, writeReloadCache } from "@/lib/reload-cache";
 import type {
   ChatSummary,
   SessionAutomationJob,
@@ -137,6 +138,7 @@ interface SessionHistoryState {
   messages: UIMessage[];
   loading: boolean;
   loadingOlder: boolean;
+  olderError: string | null;
   error: string | null;
   hasPendingToolCalls: boolean;
   completedTurnIds: string[];
@@ -156,6 +158,7 @@ function emptyHistoryState(key: string | null, loading = false): SessionHistoryS
     messages: [],
     loading,
     loadingOlder: false,
+    olderError: null,
     error: null,
     hasPendingToolCalls: false,
     completedTurnIds: [],
@@ -182,6 +185,7 @@ function cachedHistoryState(
     messages,
     loading: false,
     loadingOlder: false,
+    olderError: null,
     error: null,
     hasPendingToolCalls: hasPendingToolCallsFromThread(body, messages),
     completedTurnIds: completedTurnIdsFromThread(body),
@@ -214,7 +218,7 @@ export function useSessions(): {
   getSessionAutomations: (key: string) => Promise<SessionAutomationJob[]>;
 } {
   const { client, token } = useClient();
-  const [sessions, setSessions] = useState<ChatSummary[]>([]);
+  const [sessions, setSessions] = useState<ChatSummary[]>(readReloadSessions);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const tokenRef = useRef(token);
@@ -222,6 +226,10 @@ export function useSessions(): {
   const refreshPendingRef = useRef(false);
   const refreshInFlightRef = useRef<Promise<void> | null>(null);
   tokenRef.current = token;
+
+  useEffect(() => {
+    if (sessions.length || !loading) writeReloadCache("sessions", sessions.slice(0, 200));
+  }, [sessions, loading]);
 
   const refresh = useCallback((): Promise<void> => {
     refreshPendingRef.current = true;
@@ -379,6 +387,7 @@ export function useSessionHistory(key: string | null): {
   messages: UIMessage[];
   loading: boolean;
   loadingOlder: boolean;
+  olderError: string | null;
   error: string | null;
   refresh: () => void;
   loadOlder: () => Promise<void>;
@@ -487,6 +496,10 @@ export function useSessionHistory(key: string | null): {
             messages: merged.messages,
             loading: false,
             loadingOlder: false,
+            olderError: merged.continuity === "overlap"
+              && (retainedPrefix || prev.beforeCursor === body?.page?.before_cursor)
+              ? prev.olderError
+              : null,
             error: null,
             hasPendingToolCalls: hasPending,
             completedTurnIds,
@@ -527,6 +540,7 @@ export function useSessionHistory(key: string | null): {
               messages: [],
               loading: false,
               loadingOlder: false,
+              olderError: null,
               error: null,
               hasPendingToolCalls: false,
               completedTurnIds: [],
@@ -568,7 +582,7 @@ export function useSessionHistory(key: string | null): {
     const controller = new AbortController();
     olderRequestAbortRef.current = controller;
     setState((prev) => matchesRequest(prev)
-      ? { ...prev, loadingOlder: true, error: null }
+      ? { ...prev, loadingOlder: true, olderError: null }
       : prev);
     try {
       const body = await fetchWebuiThread(getToken(), requestKey, {
@@ -599,7 +613,7 @@ export function useSessionHistory(key: string | null): {
           ...prev,
           messages: nextMessages,
           loadingOlder: false,
-          error: null,
+          olderError: null,
           forkBoundaryMessageCount: olderBoundary ?? shiftedBoundary,
           beforeCursor: body.page?.before_cursor ?? null,
           hasMoreBefore: body.page?.has_more_before === true,
@@ -612,7 +626,7 @@ export function useSessionHistory(key: string | null): {
         ? {
             ...prev,
             loadingOlder: false,
-            error: (e as Error).message,
+            olderError: (e as Error).message || "Could not load earlier messages",
           }
         : prev);
     } finally {
@@ -635,6 +649,7 @@ export function useSessionHistory(key: string | null): {
       messages: EMPTY_MESSAGES,
       loading: false,
       loadingOlder: false,
+      olderError: null,
       error: null,
       refresh,
       loadOlder,
@@ -657,6 +672,7 @@ export function useSessionHistory(key: string | null): {
       messages: EMPTY_MESSAGES,
       loading: true,
       loadingOlder: false,
+      olderError: null,
       error: null,
       refresh,
       loadOlder,
@@ -676,6 +692,7 @@ export function useSessionHistory(key: string | null): {
     messages: state.messages,
     loading: state.loading,
     loadingOlder: state.loadingOlder,
+    olderError: state.olderError,
     error: state.error,
     refresh,
     loadOlder,

@@ -20,12 +20,15 @@ function mockResponses(...responses: Response[]) {
   return fetchMock
 }
 
-function thread(messages: Array<Record<string, unknown>>) {
-  return Response.json({ messages })
+function thread(events: Array<Record<string, unknown>>) {
+  return Response.json({
+    schemaVersion: 3, projection: "events",
+    events: events.map((event) => ({ chat_id: chatId, ...event })),
+  })
 }
 
-function assistant(turnId: string, fields: Record<string, unknown>) {
-  return { role: "assistant", content: "answer", turnId, ...fields }
+function completed(turnId: string, fields: Record<string, unknown>) {
+  return { event: "turn_end", turn_id: turnId, ...fields }
 }
 
 describe("fetchSessionUsage", () => {
@@ -35,11 +38,11 @@ describe("fetchSessionUsage", () => {
       completion_tokens: index + 1,
     }))
     const fetchMock = mockResponses(thread([
-      assistant("first", { id: "first-a", roundUsages: rounds.slice(0, 4) }),
-      assistant("first", { id: "first-b", roundUsages: rounds.slice(0, 4) }),
-      assistant("second", { id: "second-a", roundUsages: rounds.slice(4, 8) }),
-      assistant("second", { id: "second-b", roundUsages: rounds.slice(4, 8) }),
-      assistant("third", { roundUsages: rounds.slice(8) }),
+      completed("first", { projection_id: "first-a", round_usages: rounds.slice(0, 4) }),
+      completed("first", { projection_id: "first-b", round_usages: rounds.slice(0, 4) }),
+      completed("second", { projection_id: "second-a", round_usages: rounds.slice(4, 8) }),
+      completed("second", { projection_id: "second-b", round_usages: rounds.slice(4, 8) }),
+      completed("third", { round_usages: rounds.slice(8) }),
     ]))
 
     expect(await fetchSessionUsage(apiUrl, apiToken, chatId)).toStrictEqual({
@@ -54,11 +57,11 @@ describe("fetchSessionUsage", () => {
 
   test("never substitutes aggregate prompt usage for missing or invalid round samples", async () => {
     mockResponses(thread([
-      assistant("aggregate-only", { usage: { prompt_tokens: 90_000, total_tokens: 91_000 } }),
-      assistant("invalid-rounds", {
+      completed("aggregate-only", { usage: { prompt_tokens: 90_000, total_tokens: 91_000 } }),
+      completed("invalid-rounds", {
         usage: { prompt_tokens: 80_000, context_tokens: 12 },
-        contextWindowTokens: 1_000,
-        roundUsages: [null, {}, { completion_tokens: 2 }, { prompt_tokens: 0 },
+        context_window_tokens: 1_000,
+        round_usages: [null, {}, { completion_tokens: 2 }, { prompt_tokens: 0 },
           { prompt_tokens: -1 }, { prompt_tokens: "500" }],
       }),
     ]))
@@ -69,18 +72,18 @@ describe("fetchSessionUsage", () => {
     })
   })
 
-  test("takes context and capacity from the latest message with context usage, not its neighbors", async () => {
+  test("takes context and capacity from the latest completed turn with context usage", async () => {
     const round = { prompt_tokens: 70, context_tokens: 999 }
     mockResponses(thread([
-      assistant("old", { usage: { context_tokens: 100 }, contextWindowTokens: 1_000 }),
-      assistant("context", {
+      completed("old", { usage: { context_tokens: 100 }, context_window_tokens: 1_000 }),
+      completed("context", {
         usage: { prompt_tokens: 50_000, context_tokens: 250 },
-        contextWindowTokens: 4_000,
+        context_window_tokens: 4_000,
       }),
-      assistant("newer", {
+      completed("newer", {
         usage: { prompt_tokens: 90_000, total_tokens: 91_000 },
-        contextWindowTokens: 100_000,
-        roundUsages: [round],
+        context_window_tokens: 100_000,
+        round_usages: [round],
       }),
     ]))
 
@@ -90,19 +93,19 @@ describe("fetchSessionUsage", () => {
     })
   })
 
-  test("keeps usage-only and empty assistants while ignoring streaming, trace and non-assistant rows", async () => {
+  test("reads completed usage while ignoring unfinished streams, tools and user events", async () => {
     const rounds = [{ prompt_tokens: 80 }, { prompt_tokens: 160, cached_tokens: 40 }]
-    const noise = { usage: { context_tokens: 999 }, roundUsages: [{ prompt_tokens: 999 }] }
+    const noise = { usage: { context_tokens: 999 }, round_usages: [{ prompt_tokens: 999 }] }
     mockResponses(thread([
-      assistant("usage-only", { content: undefined, usage: { context_tokens: 80 }, roundUsages: [rounds[0]] }),
-      assistant("empty", {
-        content: "", usage: { context_tokens: 160 }, contextWindowTokens: 2_000,
-        roundUsages: [rounds[1]],
+      completed("usage-only", { usage: { context_tokens: 80 }, round_usages: [rounds[0]] }),
+      completed("empty", {
+        usage: { context_tokens: 160 }, context_window_tokens: 2_000,
+        round_usages: [rounds[1]],
       }),
-      assistant("empty", { isStreaming: true, ...noise }),
-      assistant("empty", { kind: "trace", ...noise }),
-      { role: "tool", kind: "trace", ...noise },
-      { role: "user", content: "question", ...noise },
+      { event: "delta", text: "still running", ...noise },
+      { event: "stream_end", text: "unfinished turn", ...noise },
+      { event: "message", kind: "tool_hint", text: "tool", ...noise },
+      { event: "user_message", starts_turn: true, text: "question", ...noise },
     ]))
 
     expect(await fetchSessionUsage(apiUrl, apiToken, chatId)).toStrictEqual({
@@ -114,18 +117,18 @@ describe("fetchSessionUsage", () => {
   test("successful compaction clears context but not bars, and later completed usage restores it", async () => {
     const oldRound = { prompt_tokens: 800 }
     const newRound = { prompt_tokens: 120 }
-    const old = assistant("old", {
-      usage: { context_tokens: 800 }, contextWindowTokens: 1_000, roundUsages: [oldRound],
+    const old = completed("old", {
+      usage: { context_tokens: 800 }, context_window_tokens: 1_000, round_usages: [oldRound],
     })
     const compaction = (phase: string) => ({
-      role: "activity", kind: "compaction", compaction: { id: "compact-1", phase },
+      event: "context_compaction", compaction_id: "compact-1", phase,
     })
     mockResponses(
       thread([old, compaction("started")]),
       thread([old, compaction("failed")]),
       thread([old, compaction("succeeded")]),
-      thread([old, compaction("succeeded"), assistant("new", {
-        usage: { context_tokens: 120 }, contextWindowTokens: 2_000, roundUsages: [newRound],
+      thread([old, compaction("succeeded"), completed("new", {
+        usage: { context_tokens: 120 }, context_window_tokens: 2_000, round_usages: [newRound],
       })]),
     )
 
@@ -147,11 +150,11 @@ describe("fetchSessionUsage", () => {
       { prompt_tokens: 40 },
       { prompt_tokens: 80, cached_tokens: 0, cache_write_tokens: 0 },
     ]
-    for (const capacity of [undefined, 0, -1, "64000", null]) {
+    for (const capacity of [undefined, 0, -1]) {
       mockResponses(thread([
-        assistant("old", { usage: { context_tokens: 88 }, contextWindowTokens: 64_000 }),
-        assistant("latest", {
-          usage: { context_tokens: 0 }, contextWindowTokens: capacity, roundUsages: rounds,
+        completed("old", { usage: { context_tokens: 88 }, context_window_tokens: 64_000 }),
+        completed("latest", {
+          usage: { context_tokens: 0 }, context_window_tokens: capacity, round_usages: rounds,
         }),
       ]))
 
@@ -177,7 +180,7 @@ describe("fetchSessionUsage", () => {
     const fresh = { apiUrl: "http://refreshed.test", apiToken: "fresh-token" }
     const fetchMock = mockResponses(
       new Response("expired", { status: 401 }),
-      thread([assistant("fresh", { usage: { context_tokens: 42 } })]),
+      thread([completed("fresh", { usage: { context_tokens: 42 } })]),
     )
     const reauthenticate = mock(async (_rejectedToken: string) => fresh)
 

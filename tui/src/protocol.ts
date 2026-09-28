@@ -1,6 +1,6 @@
-import { decodeNotification, isCompactionPhase, isRecoveryState } from "../../packages/client-events/notifications"
+import { decodeNotification, isRecoveryState } from "../../packages/client-events/notifications"
 import type { ContextCompaction, NotificationEvent, RecoveryState } from "../../packages/client-events/notifications"
-export type { ContextCompaction, RecoveryState, RecoveryStatus, RetryStatus } from "../../packages/client-events/notifications"
+export type { ContextCompaction, RecoveryState, RetryStatus } from "../../packages/client-events/notifications"
 
 export type ConnectionStatus =
   | "starting"
@@ -589,9 +589,50 @@ async function fetchApi(
   return request(await reauthenticate(apiToken))
 }
 
+type HistoryEvent = Extract<InboundEvent, { event:
+  | "user_message" | "message" | "file_edit" | "delta" | "stream_end"
+  | "reasoning_delta" | "reasoning_end" | "context_compaction" | "turn_end"
+}> & { round_usages?: TokenUsage[] }
+
 interface ThreadPage {
-  messages?: Array<Record<string, unknown>>
+  events: HistoryEvent[]
   page?: { has_more_before?: boolean; before_cursor?: string; user_message_offset?: number }
+}
+
+function parseHistoryEvents(values: unknown[]): HistoryEvent[] {
+  const events: HistoryEvent[] = []
+  const seen = new Set<string>()
+  for (const value of values) {
+    const event = decodeInboundEvent(value)
+    if (!event || !isRecord(value) || !optional(value.turn_id, "string")) {
+      throw new Error("Invalid history event")
+    }
+    if (typeof value.projection_id === "string") {
+      if (seen.has(value.projection_id)) continue
+      seen.add(value.projection_id)
+    }
+    switch (event.event) {
+      case "user_message":
+      case "message":
+      case "file_edit":
+      case "delta":
+      case "stream_end":
+      case "reasoning_delta":
+      case "reasoning_end":
+      case "context_compaction":
+        events.push(event)
+        break
+      case "turn_end":
+        events.push({
+          ...event,
+          round_usages: Array.isArray(value.round_usages) ? value.round_usages.filter(isTokenUsage) : [],
+        })
+        break
+      default:
+        throw new Error(`Unsupported history event: ${event.event}`)
+    }
+  }
+  return events
 }
 
 async function fetchThreadPage(
@@ -602,7 +643,7 @@ async function fetchThreadPage(
   reauthenticate?: ApiReauthenticator,
   signal?: AbortSignal,
 ): Promise<ThreadPage> {
-  if (!apiUrl || !apiToken) return {}
+  if (!apiUrl || !apiToken) return { events: [] }
   const key = encodeURIComponent(`websocket:${chatId}`)
   const params = new URLSearchParams({ limit: "120", direction: "latest" })
   if (beforeCursor) params.set("before", beforeCursor)
@@ -613,9 +654,22 @@ async function fetchThreadPage(
     reauthenticate,
     signal,
   )
-  if (response.status === 404) return {}
+  if (response.status === 404) return { events: [] }
   if (!response.ok) throw new Error(`history request failed: HTTP ${response.status}`)
-  return await response.json() as ThreadPage
+  const payload: unknown = await response.json()
+  if (!isRecord(payload) || typeof payload.schemaVersion !== "number") {
+    throw new Error("Invalid history response")
+  }
+  const page = isRecord(payload.page) ? payload.page : undefined
+  const pagination = {
+    has_more_before: page?.has_more_before === true,
+    before_cursor: typeof page?.before_cursor === "string" ? page.before_cursor : undefined,
+    user_message_offset: typeof page?.user_message_offset === "number" ? page.user_message_offset : undefined,
+  }
+  if (payload.projection === "events" && Array.isArray(payload.events)) {
+    return { events: parseHistoryEvents(payload.events), page: pagination }
+  }
+  throw new Error("Unsupported history response format")
 }
 
 /** Same recent model-call samples and context boundary as the WebUI usage popover. */
@@ -631,14 +685,13 @@ export async function fetchSessionUsage(
   const snapshot: SessionUsageSnapshot = { context: null, rounds: [] }
   const seenTurns = new Set<unknown>()
   let contextResolved = false
-  for (const message of [...(payload.messages ?? [])].reverse()) {
-    if (message.kind === "compaction" && isRecord(message.compaction)
-      && message.compaction.phase === "succeeded") contextResolved = true
-    if (message.role !== "assistant" || message.kind === "trace" || message.isStreaming) continue
-    const usage = isTokenUsage(message.usage) ? message.usage : null
+  for (const event of [...payload.events].reverse()) {
+    if (event.event === "context_compaction" && event.phase === "succeeded") contextResolved = true
+    if (event.event !== "turn_end") continue
+    const usage = event.usage
     if (!contextResolved && typeof usage?.context_tokens === "number"
       && Number.isFinite(usage.context_tokens) && usage.context_tokens >= 0) {
-      const window = message.contextWindowTokens
+      const window = event.context_window_tokens
       snapshot.context = {
         tokens: usage.context_tokens,
         ...(typeof window === "number" && Number.isFinite(window) && window > 0
@@ -646,13 +699,12 @@ export async function fetchSessionUsage(
       }
       contextResolved = true
     }
-    const turnKey = message.turnId || message.id || message
+    const turnKey = event.turn_id || event
     if (seenTurns.has(turnKey)) continue
     seenTurns.add(turnKey)
-    const rounds = Array.isArray(message.roundUsages) ? message.roundUsages : []
-    for (const round of [...rounds].reverse()) {
+    for (const round of [...(event.round_usages ?? [])].reverse()) {
       if (snapshot.rounds.length >= 8) break
-      if (isTokenUsage(round) && typeof round.prompt_tokens === "number"
+      if (typeof round.prompt_tokens === "number"
         && Number.isFinite(round.prompt_tokens) && round.prompt_tokens > 0) {
         snapshot.rounds.push(round)
       }
@@ -674,65 +726,74 @@ export async function fetchHistory(
     ? Math.max(0, payload.page.user_message_offset)
     : 0
   const messages: HistoryMessage[] = []
-  for (const message of payload.messages || []) {
-    const role = message.role
-    const content = message.content
-    if (message.kind === "compaction") {
-      const compaction = message.compaction
-      if (isRecord(compaction)
-        && typeof compaction.id === "string"
-        && compaction.id
-        && isCompactionPhase(compaction.phase)) {
+  let stream: { row: HistoryMessage; turnId?: string } | null = null
+  let lastAnswer: { row: HistoryMessage; turnId?: string } | null = null
+  for (const event of payload.events) {
+    switch (event.event) {
+      case "user_message": {
+        if (event.starts_turn) stream = null
+        const media = event.media_urls ?? []
+        if (!event.text.trim() && !media.length) break
+        userIndex += 1
         messages.push({
-          role: "activity",
-          content: "",
-          compaction: { id: compaction.id, phase: compaction.phase },
+          role: "user", content: event.text,
+          ...(media.length ? { media } : {}),
+          ...(event.turn_id ? { turnId: event.turn_id } : {}),
         })
+        lastAnswer = null
+        break
       }
-      continue
-    }
-    if (role === "tool" && message.kind === "trace") {
-      const traces = Array.isArray(message.traces)
-        ? message.traces.filter((value): value is string => typeof value === "string")
-        : []
-      const toolEvents = Array.isArray(message.toolEvents)
-        ? message.toolEvents.filter(isToolEvent)
-        : undefined
-      const fileEdits = Array.isArray(message.fileEdits)
-        ? message.fileEdits.filter(isFileEdit)
-        : undefined
-      const activity = traces.join("\n") || (typeof content === "string" ? content : "")
-      messages.push({
-        role: "activity",
-        content: activity,
-        ...(toolEvents?.length ? { toolEvents } : {}),
-        ...(fileEdits?.length ? { fileEdits } : {}),
-      })
-      continue
-    }
-    if (
-      (role !== "user" && role !== "assistant")
-      || message.kind === "reasoning"
-      || typeof content !== "string"
-    ) {
-      continue
-    }
-    const media = Array.isArray(message.media) ? message.media.filter(isMediaAttachment) : []
-    if (role === "user") {
-      if (!content.trim() && !media.length) continue
-      userIndex += 1
-      messages.push({
-        role: "user",
-        content,
-        ...(media.length ? { media } : {}),
-        ...(typeof message.turnId === "string" ? { turnId: message.turnId } : {}),
-      })
-    } else if (content.trim()) {
-      messages.push({ role: "assistant", content, forkIndex: userIndex })
+      case "delta":
+      case "stream_end":
+        if (!stream || stream.turnId !== event.turn_id) {
+          const row: HistoryMessage = { role: "assistant", content: "", forkIndex: userIndex }
+          messages.push(row)
+          stream = { row, turnId: event.turn_id }
+        }
+        if (event.event === "delta") stream.row.content += event.text
+        else if (event.text !== undefined) stream.row.content = event.text
+        lastAnswer = stream
+        if (event.event === "stream_end" && !(event.resuming && event.merge_next)) stream = null
+        break
+      case "message":
+        if (event.kind === "reasoning") break
+        if (event.kind === "tool_hint" || event.kind === "progress") {
+          messages.push({
+            role: "activity", content: event.text,
+            ...(event.tool_events?.length ? { toolEvents: event.tool_events } : {}),
+          })
+        } else {
+          // A final message can repeat the answer already saved by stream_end.
+          if (stream && stream.turnId === event.turn_id) stream.row.content = event.text
+          else if (!lastAnswer || lastAnswer.turnId !== event.turn_id || lastAnswer.row.content !== event.text) {
+            const row: HistoryMessage = { role: "assistant", content: event.text, forkIndex: userIndex }
+            messages.push(row)
+            lastAnswer = { row, turnId: event.turn_id }
+          }
+          stream = null
+        }
+        break
+      case "file_edit":
+        if (event.edits.length) messages.push({ role: "activity", content: "", fileEdits: event.edits })
+        break
+      case "context_compaction":
+        stream = null
+        messages.push({
+          role: "activity", content: "",
+          compaction: { id: event.compaction_id, phase: event.phase },
+        })
+        break
+      case "turn_end":
+        stream = null
+        lastAnswer = null
+        break
+      case "reasoning_delta":
+      case "reasoning_end":
+        break
     }
   }
   return {
-    messages,
+    messages: messages.filter((row) => row.role !== "assistant" || row.content.trim()),
     hasMoreBefore: payload.page?.has_more_before === true,
     beforeCursor: typeof payload.page?.before_cursor === "string"
       ? payload.page.before_cursor

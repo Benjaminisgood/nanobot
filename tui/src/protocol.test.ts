@@ -1077,55 +1077,27 @@ describe("gateway protocol", () => {
     }
   })
 
-  test("reports when the bounded history snapshot omits earlier turns", async () => {
+  test("reports when canonical history omits earlier turns", async () => {
     const original = globalThis.fetch
     let requested = ""
     globalThis.fetch = ((input: string | URL | Request) => {
       requested = String(input)
-      return Promise.resolve(new Response(JSON.stringify({
-        messages: [
-          { role: "user", content: "hello", turnId: "turn-1" },
-          {
-            role: "user",
-            content: "",
-            turnId: "turn-image",
-            media: [{ kind: "image", url: "/api/media/sig/image", name: "shot.png" }],
-          },
-          {
-            role: "tool",
-            kind: "trace",
-            content: "read_file",
-            traces: ["read_file"],
-            toolEvents: [{ phase: "end", call_id: "read-1", name: "read_file" }],
-          },
-          { role: "assistant", kind: "reasoning", content: "private thought" },
-          { role: "assistant", content: "hi", forkIndex: 2 },
+      return Promise.resolve(Response.json({
+        schemaVersion: 3, projection: "events",
+        events: [
+          { event: "user_message", chat_id: "chat", starts_turn: true, text: "hello", turn_id: "turn-1" },
+          { event: "stream_end", chat_id: "chat", text: "hi" },
         ],
         page: { has_more_before: true, before_cursor: "older-1" },
-      })))
+      }))
     }) as typeof fetch
-
     try {
-      const history = await fetchHistory("http://nanobot.test", "token", "chat", "newer-page")
-      expect(history).toEqual({
+      expect(await fetchHistory("http://nanobot.test", "token", "chat", "newer-page")).toEqual({
         messages: [
           { role: "user", content: "hello", turnId: "turn-1" },
-          {
-            role: "user",
-            content: "",
-            turnId: "turn-image",
-            media: [{ kind: "image", url: "/api/media/sig/image", name: "shot.png" }],
-          },
-          {
-            role: "activity",
-            content: "read_file",
-            toolEvents: [{ phase: "end", call_id: "read-1", name: "read_file" }],
-          },
-          { role: "assistant", content: "hi", forkIndex: 2 },
+          { role: "assistant", content: "hi", forkIndex: 1 },
         ],
-        hasMoreBefore: true,
-        beforeCursor: "older-1",
-        userMessageOffset: 0,
+        hasMoreBefore: true, beforeCursor: "older-1", userMessageOffset: 0,
       })
       expect(requested).toContain("before=newer-page")
     } finally {
@@ -1136,35 +1108,18 @@ describe("gateway protocol", () => {
   test("loads compaction history as activity rows", async () => {
     const original = globalThis.fetch
     globalThis.fetch = Object.assign(async () => Response.json({
-      messages: [
-        { role: "assistant", content: "before" },
-        ...["started", "succeeded", "failed", "cancelled"].map((phase) => ({
-          role: "assistant",
-          kind: "compaction",
-          content: "",
-          compaction: { id: phase, phase },
-        })),
-        { role: "assistant", kind: "compaction", content: "invalid", compaction: null },
-        {
-          role: "assistant", kind: "compaction", content: "invalid",
-          compaction: { id: "", phase: "succeeded" },
-        },
-        {
-          role: "assistant", kind: "compaction", content: "invalid",
-          compaction: { id: "unknown", phase: "unknown" },
-        },
-        { role: "assistant", content: "after" },
-      ],
+      schemaVersion: 3, projection: "events",
+      events: ["started", "succeeded", "failed", "cancelled"].map((phase) => ({
+        event: "context_compaction", chat_id: "chat", compaction_id: phase, phase,
+      })),
     }), { preconnect: original.preconnect })
     try {
       const history = await fetchHistory("http://nanobot.test", "token", "chat")
-      expect(history.messages).toEqual([
-        { role: "assistant", content: "before", forkIndex: 0 },
-        ...(["started", "succeeded", "failed", "cancelled"] as const).map((phase) => ({
-          role: "activity" as const, content: "", compaction: { id: phase, phase },
+      expect(history.messages).toEqual(
+        (["started", "succeeded", "failed", "cancelled"] as const).map((phase) => ({
+          role: "activity", content: "", compaction: { id: phase, phase },
         })),
-        { role: "assistant", content: "after", forkIndex: 0 },
-      ])
+      )
     } finally {
       globalThis.fetch = original
     }
