@@ -14,6 +14,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.turn_delivery import TurnDeliveryFactory
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -84,6 +85,10 @@ class _GatewayAgentContractStub:
     """Minimal stable AgentLoop surface required by gateway assembly tests."""
 
     tools = ToolRegistry()
+    subagents = MagicMock(spec=SubagentManager)
+
+    async def discard_session(self, _session_key: str) -> None:
+        pass
 
     @staticmethod
     def mcp_runtime_status() -> dict[str, str]:
@@ -2197,6 +2202,7 @@ def test_webui_yes_creates_config_and_enables_local_websocket(
     )
 
     assert result.exit_code == 0, result.output
+    assert result.stdout.count("Using config:") == 1
     data = json.loads(config_file.read_text(encoding="utf-8"))
     websocket = data["channels"]["websocket"]
     assert websocket["enabled"] is True
@@ -2217,6 +2223,30 @@ def test_webui_yes_creates_config_and_enables_local_websocket(
     assert "ssh -N -L 8899:127.0.0.1:8899 <user>@<server>" in compact_output
     assert seen["lease_release_wait_for_stop"] is False
     assert "stop_timeout" not in seen
+
+
+@pytest.mark.parametrize("explicit_config", [True, False])
+def test_webui_announces_existing_config_once(monkeypatch, tmp_path: Path, explicit_config: bool) -> None:
+    from nanobot.config import loader
+
+    config_file = tmp_path / "instance" / "config.json"
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    loader.save_config(config, config_file)
+    default_config = tmp_path / "default" / "config.json" if explicit_config else config_file
+    monkeypatch.setattr(loader, "_current_config_path", default_config)
+    _patch_webui_provider_ready(monkeypatch)
+    _patch_gateway_ports_free(monkeypatch)
+    _patch_webui_managed_gateway(monkeypatch)
+
+    args = ["webui", "--yes", "--no-open"]
+    if explicit_config:
+        args.extend(["--config", str(config_file)])
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.count("Using config:") == 1
+    assert f"Using config: {config_file}" in _without_rendered_line_breaks(result.stdout)
 
 
 def test_webui_background_points_to_the_single_persistent_gateway_command(
@@ -3475,7 +3505,8 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
         enabled_channels: list[str] = []
 
         def __init__(self, *_args, **_kwargs) -> None:
-            return None
+            seen["webui_subagent_manager"] = _kwargs["webui_subagent_manager"]
+            seen["webui_discard_session"] = _kwargs["webui_discard_session"]
 
         def get_channel(self, name: str) -> object | None:
             return object() if name == "websocket" else None
@@ -3506,6 +3537,8 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
     agent = seen["agent"]
     agent_kwargs = seen["agent_from_config_kwargs"]
     kwargs = seen["local_trigger_queue_kwargs"]
+    assert seen["webui_subagent_manager"] is agent.subagents
+    assert seen["webui_discard_session"] == agent.discard_session
     assert isinstance(agent_kwargs["provider"], UnconfiguredProvider) is bool(setup_error)
     refreshed_snapshot = agent_kwargs["provider_snapshot_loader"]()
     assert not isinstance(refreshed_snapshot.provider, UnconfiguredProvider)

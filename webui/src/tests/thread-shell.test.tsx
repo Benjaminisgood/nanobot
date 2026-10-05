@@ -141,6 +141,11 @@ function makeClient() {
     getRunGeneration: (chatId: string) => runGenerationByChatId.get(chatId) ?? 0,
     canReconcileCanonicalCompletion,
     reconcileCanonicalCompletion,
+    fenceCanonicalCompletedTurns: (chatId: string, turnIds: readonly string[]) => {
+      const fences = completedTurnIdsByChatId.get(chatId) ?? new Set<string>();
+      for (const turnId of turnIds) fences.add(turnId);
+      completedTurnIdsByChatId.set(chatId, fences);
+    },
     getGoalState: (chatId: string) => goalStateByChatId.get(chatId),
     onChat: (chatId: string, handler: (ev: import("@/lib/types").InboundEvent) => void) => {
       let handlers = chatHandlers.get(chatId);
@@ -217,12 +222,14 @@ function wrap(
   children: ReactNode,
   modelName?: string | null,
   token = "tok",
+  webuiCapabilities: string[] = [],
 ) {
   return (
     <ClientProvider
       client={client as unknown as import("@/lib/nanobot-client").NanobotClient}
       token={token}
       modelName={modelName ?? null}
+      webuiCapabilities={webuiCapabilities}
     >
       {children}
     </ClientProvider>
@@ -484,6 +491,39 @@ describe("ThreadShell", () => {
         json: async () => ({}),
       }),
     );
+  });
+
+  it("renders one persisted task entry at the initiating prompt through the full shell", async () => {
+    const client = makeClient();
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/subagents")) return httpJson({ tasks: [{
+        task_id: "completed-task", label: "Inspect settings", task_description: "Inspect settings",
+        origin_turn_id: "delegation-turn", origin_message_id: null, created_at: 100, completed_at: 102,
+        state: "done", phase: "done", elapsed_seconds: 2, iteration: 1, tool_events: [],
+        usage: null, receipts: {}, result: "Verified", partial: false, stop_reason: "completed", error: null,
+      }] });
+      if (String(input).includes("/webui-thread")) return httpJson(transcriptFromSimpleMessages([
+        { role: "user", content: "Delegate inspection", turnId: "delegation-turn" },
+        { role: "assistant", content: "Parent conclusion", turnId: "delegation-turn" },
+      ]));
+      return { ok: false, status: 404, json: async () => ({}) };
+    }));
+    const shell = () => wrap(client, <ThreadShell session={session("persisted-tasks")} title="Task history"
+      onToggleSidebar={() => {}} />, null, "tok", ["webui.core.v1", "webui.subagents.v1"]);
+    const view = render(shell());
+    await screen.findByText("Delegate inspection");
+    fireEvent.click(await screen.findByRole("button", { name: /Delegated work Finished: 1/ }));
+    const task = await screen.findByRole("button", { name: /Inspect settings Completed/ });
+    await screen.findByText("Delegate inspection");
+    expect(screen.getAllByRole("button", { name: /Inspect settings/ })).toHaveLength(1);
+    expect(screen.getByTestId("thread-message-region")).toContainElement(task);
+    expect(within(screen.getByTestId("thread-composer-motion")).queryByText("Inspect settings")).not.toBeInTheDocument();
+    view.unmount();
+    render(shell());
+    await screen.findByText("Delegate inspection");
+    fireEvent.click(await screen.findByRole("button", { name: /Delegated work Finished: 1/ }));
+    await screen.findByRole("button", { name: /Inspect settings Completed/ });
+    expect(client.sendMessage).not.toHaveBeenCalled();
   });
 
   it("clears the welcome draft after a delayed new-chat send and an unchanged round-trip", async () => {
@@ -1410,7 +1450,7 @@ describe("ThreadShell", () => {
     expect(screen.queryByText(/This response used a fallback model/)).not.toBeInTheDocument();
   });
 
-  it.each([false, true])("hides unconfigured model details in setup tooltips (existing history: %s)", async (hasHistory) => {
+  it.each([false, true])("keeps model setup actionable without a repeated tooltip (existing history: %s)", async (hasHistory) => {
     const client = makeClient();
     const settings = modelSettings("anthropic/claude-opus-4-5", "anthropic");
     settings.agent.has_api_key = false;
@@ -1439,7 +1479,7 @@ describe("ThreadShell", () => {
     await screen.findByText(hasHistory ? "Previous message" : HERO_GREETING_PATTERN);
     const badge = screen.getByRole("button", { name: "Choose your AI" });
     fireEvent.focus(badge);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(/^Choose your AI$/);
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
     fireEvent.click(badge);
     expect(onOpenModelSettings).toHaveBeenCalledTimes(1);
     expect(client.sendMessage).not.toHaveBeenCalled();
@@ -3171,6 +3211,40 @@ describe("ThreadShell", () => {
 
     expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
     expect(client.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("remembers explicit completed turns on initial history load", async () => {
+    const client = makeClient();
+    const turnId = "turn-completed-before-load";
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes("websocket%3Ainitial-completion/webui-thread")) {
+        return httpJson({
+          ...transcriptFromSimpleMessages([
+            { role: "user", content: "previous question", turnId },
+          ]),
+          has_pending_tool_calls: false,
+          completed_turn_ids: [turnId],
+        });
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }));
+    render(wrap(client, <ThreadShell
+      session={session("initial-completion")}
+      title="Initial completion"
+      onToggleSidebar={() => {}}
+      onNewChat={() => {}}
+    />));
+    await screen.findByText("previous question");
+    act(() => client._emitChat("initial-completion", {
+      event: "goal_status", chat_id: "initial-completion", turn_id: turnId,
+      status: "running", started_at: 4_000,
+    }));
+    expect(screen.queryByRole("button", { name: "Stop response" })).not.toBeInTheDocument();
+    act(() => client._emitChat("initial-completion", {
+      event: "goal_status", chat_id: "initial-completion", turn_id: "new-turn",
+      status: "running", started_at: 5_000,
+    }));
+    expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
   });
 
   it("fences websocket frames that arrive after canonical completion", async () => {

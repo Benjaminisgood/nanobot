@@ -1,4 +1,10 @@
 import {
+  CompletedTaskIcon,
+  WebSearchIcon,
+  McpIcon,
+  ToolRunIcon,
+} from "@/components/icons/product-icons";
+import {
   Fragment,
   memo,
   useCallback,
@@ -8,16 +14,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import {
-  CheckCircle2,
-  Clock3,
-  Layers,
-  Search,
-  Server,
-  Terminal,
-  Wrench,
-  type LucideIcon,
-} from "lucide-react";
+import { Clock3, Layers, Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { MarkdownText } from "@/components/MarkdownText";
@@ -43,7 +40,6 @@ import { ThinkingReasoningShell } from "@/components/thread/activity/ThinkingRea
 import { WebActivityRow } from "@/components/thread/activity/WebActivityRow";
 import {
   describeTraceLine,
-  type TraceDescription,
 } from "@/components/thread/activity/trace-activity-model";
 import { WebSearchRun } from "@/components/thread/activity/WebSearchRun";
 import { webSearchRunsByTraceLine } from "@/components/thread/activity/web-search-model";
@@ -52,6 +48,7 @@ import {
   isReasoningOnlyAssistant,
 } from "@/lib/activity-timeline";
 import { useFileEditDisplayMode } from "@/hooks/useFileEditDisplayMode";
+import { useLocalPreferences } from "@/hooks/useLocalPreferences";
 import { useLogoFallback } from "@/hooks/useLogoFallback";
 import { usePageVisibility } from "@/hooks/usePageVisibility";
 import { useThreadVisibility } from "@/hooks/useThreadVisibility";
@@ -179,7 +176,7 @@ export function AgentActivityCluster(props: AgentActivityClusterProps) {
     () => summarizeFileEditsByMessage(messages, props.isTurnStreaming),
     [messages, props.isTurnStreaming],
   );
-  if (props.expanded !== undefined || displayMode === "summary" || !editsByMessage.size) {
+  if (displayMode === "summary" || !editsByMessage.size) {
     return <FoldedAgentActivity {...props} />;
   }
 
@@ -192,6 +189,7 @@ export function AgentActivityCluster(props: AgentActivityClusterProps) {
     items.push(
       <FoldedAgentActivity
         {...props}
+        detailsId={undefined}
         key={pending[0]?.id ?? "tail-status"}
         messages={pending}
         isTurnStreaming={last && props.isTurnStreaming}
@@ -225,7 +223,7 @@ export function AgentActivityCluster(props: AgentActivityClusterProps) {
   }
   flush(true);
   return (
-    <div className={cn("flex w-full flex-col gap-0.5", props.hasBodyBelow && "mb-2")}>
+    <div id={props.detailsId} className={cn("flex w-full flex-col gap-0.5", props.hasBodyBelow && "mb-2")}>
       {items}
     </div>
   );
@@ -249,7 +247,7 @@ function FoldedAgentActivity({
   detailsId,
 }: AgentActivityClusterProps) {
   const { t } = useTranslation();
-  const fileEditDisplayMode = useFileEditDisplayMode();
+  const { activityMode, fileEditDisplayMode } = useLocalPreferences();
   const pageVisible = usePageVisibility();
   const threadVisible = useThreadVisibility();
   const activityMessages = useMemo(() => coalesceActivityMessages(messages), [messages]);
@@ -287,12 +285,15 @@ function FoldedAgentActivity({
   const [now, setNow] = useState(() => Date.now());
   const wasTurnStreamingRef = useRef(isTurnStreaming);
   const wasTurnStreaming = wasTurnStreamingRef.current;
-  /** Live work stays open; completed work briefly shows the done state, then tucks away. */
+  /** Auto follows execution; expanded keeps details open unless manually collapsed. */
   const outerExpanded = expanded ?? (
     userToggledOuter
       ? outerOpenLocal
-      : isTurnStreaming || completionHoldOpen || (wasTurnStreaming && !isTurnStreaming)
+      : activityMode === "expanded" || isTurnStreaming || completionHoldOpen || (wasTurnStreaming && !isTurnStreaming)
   );
+  useEffect(() => {
+    setUserToggledOuter(false);
+  }, [activityMode]);
   const deferredTraceRefs = useMemo(
     () => Array.from(new Set(
       messages
@@ -804,11 +805,11 @@ function ActivityTraceRow({
   const trace = describeTraceLine(line, status, t, state?.result);
   const rowActive = status === "running" && active;
   const Icon = trace.icon === "clock" ? Clock3 : (trace.kind === "search"
-    ? Search
+    ? WebSearchIcon
     : trace.kind === "done"
-      ? CheckCircle2
+      ? CompletedTaskIcon
       : trace.kind === "tool"
-        ? Wrench
+        ? ToolRunIcon
         : Layers);
   if (trace.url && trace.host) {
     return (
@@ -824,7 +825,7 @@ function ActivityTraceRow({
   }
   return (
     <ActivityStep
-      marker={<TraceIconMark trace={trace} fallbackIcon={Icon} active={rowActive} />}
+      icon={Icon}
       active={rowActive && trace.kind !== "done"}
       tone={status === "error" ? "error" : status === "done" ? "success" : "active"}
       label={formatActivityTarget(t, trace.label, trace.detail)}
@@ -874,30 +875,6 @@ function toolProgressError(error: unknown): string | undefined {
     }
   }
   return undefined;
-}
-
-function TraceIconMark({
-  trace,
-  fallbackIcon: FallbackIcon,
-  active,
-}: {
-  trace: TraceDescription;
-  fallbackIcon: LucideIcon;
-  active: boolean;
-}) {
-  return (
-    <FallbackIcon
-      className={cn(
-        "h-3.5 w-3.5 shrink-0",
-        trace.kind === "done"
-          ? "text-emerald-500/75"
-          : active
-            ? "text-muted-foreground/75"
-            : "text-muted-foreground/45",
-      )}
-      aria-hidden
-    />
-  );
 }
 
 const CLI_RUN_TOOL_NAMES = new Set(["run_cli_app", "cli_anything_run"]);
@@ -1391,7 +1368,7 @@ function McpRunRow({ run, active, preset }: { run: McpRunSummary; active: boolea
           ) : preset ? (
             mcpPresetInitials(preset).slice(0, 2)
           ) : (
-            <Server className="h-3 w-3" aria-hidden />
+            <McpIcon className="h-3 w-3" aria-hidden />
           )}
         </span>
       )}

@@ -13,6 +13,8 @@ import { Trans, useTranslation } from "react-i18next";
 import { channelUiPresentation } from "@/channel-plugins/registry";
 import { StarPrompt } from "@/components/StarPrompt";
 import { Sidebar } from "@/components/Sidebar";
+import { RemoteInstances, useRemoteConnections } from "@/components/remote/RemoteInstances";
+import { RemoteConnectionsPage } from "@/components/remote/RemoteConnectionsPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { SidebarResizeHandle, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from "@/components/SidebarResizeHandle";
 import { matchSidebarShortcut } from "@/lib/sidebar-shortcuts";
@@ -52,6 +54,7 @@ import { useSkills } from "@/hooks/useSkills";
 import { useLogoFallback } from "@/hooks/useLogoFallback";
 import { usePageVisibility } from "@/hooks/usePageVisibility";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { useAppViewport } from "@/hooks/useAppViewport";
 import type { SendAttachment, SendOptions } from "@/hooks/useNanobotStream";
 import { ThemeProvider, useTheme } from "@/hooks/useTheme";
 import { logoFallbackUrls } from "@/lib/provider-brand";
@@ -113,7 +116,13 @@ type BootState =
       modelName: string | null;
       ingressLimits: BootstrapResponse["limits"] | null;
       runtimeSurface: RuntimeSurface;
+      webuiCapabilities: string[];
     };
+
+function bootstrapCapabilities(boot: BootstrapResponse): string[] {
+  const capabilities = boot.terminal?.webui?.capabilities;
+  return Array.isArray(capabilities) ? capabilities.filter((entry) => typeof entry === "string") : [];
+}
 
 const SIDEBAR_STORAGE_KEY = "nanobot-webui.sidebar";
 const SESSION_UPDATES_STORAGE_KEY = "nanobot-webui.sidebar.session-updates.v1";
@@ -130,7 +139,7 @@ const TOKEN_REFRESH_MIN_DELAY_MS = 5_000;
 const PAIRING_POLL_INTERVAL_MS = 5_000;
 const PAIRING_IDLE_POLL_INTERVAL_MS = 15_000;
 const PAIRING_DISMISS_SNOOZE_MS = 30_000;
-type ShellView = "chat" | "settings" | "apps" | "automations" | "skills" | "channels";
+type ShellView = "chat" | "settings" | "apps" | "automations" | "skills" | "channels" | "remote";
 type ShellRoute = {
   view: ShellView;
   activeKey: string | null;
@@ -279,6 +288,9 @@ function readShellRoute(): ShellRoute {
   }
   if (path === "/channels") {
     return { view: "channels", activeKey, temporary, settingsSection: "channels" };
+  }
+  if (path === "/remote") {
+    return { view: "remote", activeKey, temporary, settingsSection: "overview" };
   }
   if (path === "/skills") {
     return { view: "skills", activeKey, temporary, settingsSection: "skills" };
@@ -889,6 +901,7 @@ function resolveRuntimeSurface(
 }
 
 export default function App() {
+  useAppViewport();
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
   const bootstrapSecretRef = useRef("");
@@ -917,6 +930,7 @@ export default function App() {
               modelName: boot.model_name ?? current.modelName,
               ingressLimits: boot.limits ?? current.ingressLimits,
               runtimeSurface,
+              webuiCapabilities: bootstrapCapabilities(boot),
             }
           : current,
       );
@@ -964,6 +978,7 @@ export default function App() {
             modelName: boot.model_name ?? null,
             ingressLimits: boot.limits ?? null,
             runtimeSurface,
+            webuiCapabilities: bootstrapCapabilities(boot),
           });
         } catch (e) {
           if (cancelled) return;
@@ -1083,13 +1098,14 @@ export default function App() {
       token={state.token}
       modelName={state.modelName}
       ingressLimits={state.ingressLimits}
+      webuiCapabilities={state.webuiCapabilities}
     >
-      <Shell
+      <RemoteInstances><Shell
         runtimeSurface={state.runtimeSurface}
         onModelNameChange={handleModelNameChange}
         onLogout={handleLogout}
         onNativeEngineRestart={handleNativeEngineRestart}
-      />
+      /></RemoteInstances>
     </ClientProvider>
   );
 }
@@ -1106,8 +1122,28 @@ function Shell({
   onNativeEngineRestart: () => Promise<string>;
 }) {
   const { t, i18n } = useTranslation();
-  const { client, getToken } = useClient();
+  const remoteConnections = useRemoteConnections();
+  const localActive = remoteConnections?.localActive !== false;
+  const managingConnections = remoteConnections?.managing === true && !remoteConnections?.activeHostId;
   const { theme, toggle } = useTheme();
+  const managementMain = useRef<HTMLElement>(null);
+  const reportManagementSurface = remoteConnections?.reportManagementSurface;
+  useEffect(() => {
+    const main = managementMain.current;
+    if (!main || !reportManagementSurface) return;
+    const report = () => {
+      const rect = main.getBoundingClientRect();
+      reportManagementSurface({ left: rect.left, top: rect.top, width: rect.width, height: rect.height }, theme);
+    };
+    const observer = new ResizeObserver(report);
+    observer.observe(main);
+    window.addEventListener("resize", report);
+    report();
+    return () => { observer.disconnect(); window.removeEventListener("resize", report); };
+  }, [reportManagementSurface, theme]);
+  const remoteConnectionsRef = useRef(remoteConnections);
+  remoteConnectionsRef.current = remoteConnections;
+  const { client, getToken } = useClient();
   const {
     sessions,
     loading,
@@ -1148,6 +1184,10 @@ function Shell({
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
   const [sidebarDragging, setSidebarDragging] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  useEffect(() => {
+    // The drawer portals outside the local host panel; don't leave it over a remote view.
+    if (!localActive || managingConnections) setMobileSidebarOpen(false);
+  }, [localActive, managingConnections]);
   const mobileSidebarRef = useRef<HTMLDivElement>(null);
   const [sessionSearchOpen, setSessionSearchOpen] = useState(false);
   const mobileWorkbench = useMediaQuery("(max-width: 767px)");
@@ -1263,6 +1303,9 @@ function Shell({
   const navigate = useCallback(
     (route: ShellRoute, options?: { replace?: boolean }) => {
       const leave = () => {
+        // The visible sidebar always belongs to its existing host. Navigation
+        // dismisses global management without switching to a different host.
+        if (remoteConnectionsRef.current?.managing) remoteConnectionsRef.current.closeManagement();
         setActiveKey(route.activeKey);
         setView(route.view);
         setSettingsInitialSection(route.settingsSection);
@@ -1281,6 +1324,7 @@ function Shell({
   useEffect(() => {
     const applyRoute = () => {
       const route = readShellRoute();
+      if (route.view === "remote") setMobileSidebarOpen(false);
       if (currentShellRouteRef.current.view === "settings" && route.view !== "settings" && settingsExitGuardRef.current) {
         writeShellRoute(currentShellRouteRef.current, true);
         settingsExitGuardRef.current(() => {
@@ -2135,6 +2179,7 @@ function Shell({
     const actions = { newChat: onNewChat, search: onOpenSessionSearch, apps: onOpenApps,
       skills: onOpenSkills, automations: onOpenAutomations, channels: onOpenChannels, settings: () => onOpenSettings() };
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!localActive) return;
       const action = matchSidebarShortcut(event);
       if (!action) return;
       event.preventDefault();
@@ -2142,7 +2187,7 @@ function Shell({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onNewChat, onOpenSessionSearch, onOpenApps, onOpenSkills, onOpenAutomations, onOpenChannels, onOpenSettings]);
+  }, [localActive, onNewChat, onOpenSessionSearch, onOpenApps, onOpenSkills, onOpenAutomations, onOpenChannels, onOpenSettings]);
 
   const onSettingsSectionChange = useCallback(
     (section: SettingsSectionKey) => {
@@ -2632,6 +2677,7 @@ function Shell({
   }, [updateWorkbenchState]);
 
   useEffect(() => {
+    if (!localActive) return;
     if (view === "settings") {
       document.title = t("app.documentTitle.chat", {
         title: t("settings.sidebar.title"),
@@ -2654,6 +2700,10 @@ function Shell({
       document.title = t("app.documentTitle.chat", { title: t("settings.nav.channels") });
       return;
     }
+    if (view === "remote") {
+      document.title = t("app.documentTitle.chat", { title: t("remote.title") });
+      return;
+    }
     if (view === "skills") {
       document.title = t("app.documentTitle.chat", {
         title: t("settings.nav.skills", { defaultValue: "Skills" }),
@@ -2663,7 +2713,7 @@ function Shell({
     document.title = activeSession
       ? t("app.documentTitle.chat", { title: headerTitle })
       : t("app.documentTitle.base");
-  }, [activeSession, headerTitle, i18n.resolvedLanguage, t, view]);
+  }, [localActive, activeSession, headerTitle, i18n.resolvedLanguage, t, view]);
 
   const pinnedPaneKeys = useMemo(
     () => new Set(sidebarState.pinned_keys),
@@ -2688,11 +2738,11 @@ function Shell({
   const sidebarProps = {
     sessions: sidebarTopicSessions,
     temporarySessions: temporarySessionList,
-    activeKey: view === "chat"
+    activeKey: !managingConnections && view === "chat"
       ? (temporaryChatActive ? activeKey : activeSidebarKey)
       : null,
     loading,
-    newChatActive: view === "chat" && activeKey === null,
+    newChatActive: !managingConnections && view === "chat" && activeKey === null,
     onNewChat,
     onSelect: onSelectSidebarItem,
     onCloseTemporaryChat,
@@ -2718,7 +2768,7 @@ function Shell({
     onOpenSkills,
     onSettingsIntent,
     onOpenSearch: onOpenSessionSearch,
-    activeUtility: view === "apps" || view === "automations" || view === "skills" || view === "channels" ? view : null,
+    activeUtility: !managingConnections && (view === "apps" || view === "automations" || view === "skills" || view === "channels") ? view : null,
     onToggleArchived,
     pinnedKeys: sidebarPinnedTabKeys,
     archivedKeys: sidebarArchivedTabKeys,
@@ -2747,7 +2797,7 @@ function Shell({
 
   return (
     <ThemeProvider theme={theme}>
-      <StarPrompt ready={!loading && !sidebarStateLoading} />
+      <StarPrompt ready={localActive && !managingConnections && !loading && !sidebarStateLoading} />
       <div
         className={cn(
           "relative h-full w-full overflow-hidden",
@@ -2863,18 +2913,22 @@ function Shell({
               />
             </Suspense>
           ) : null}
-        <main
+        <main ref={managementMain}
+          aria-hidden={managingConnections && remoteConnections?.embeddedManagement || undefined}
+          {...(managingConnections && remoteConnections?.embeddedManagement ? { inert: "" } : {})}
           className={cn(
             "relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background",
           )}
         >
+          <div className={cn("absolute inset-0 flex flex-col", managingConnections && "hidden")}
+            aria-hidden={managingConnections || undefined} {...(managingConnections ? { inert: "" } : {})}>
             {(view === "chat" || chatVisited) && <div
               className={cn(
                 "absolute inset-0 flex flex-col",
                 view !== "chat" && "hidden",
               )}
             >
-              <ThreadVisibilityContext.Provider value={view === "chat"}>
+              <ThreadVisibilityContext.Provider value={localActive && !managingConnections && view === "chat"}>
                 <Suspense fallback={<StartupShell embedded />}>
                   <PaneWorkbench
                     panes={renderedWorkbenchPanes}
@@ -3021,7 +3075,11 @@ function Shell({
             </div>}
             {view !== "chat" && (
               <div className="absolute inset-0 flex flex-col">
-                <Suspense fallback={<SurfaceLoadingFallback />}>
+                {view === "remote" ? <RemoteConnectionsPage
+                  mainNavigationExpanded={showMainSidebar && hostSidebarOpen}
+                  hostChromeInset={showHostChrome}
+                  onBackToChat={onBackToChat}
+                /> : <Suspense fallback={<SurfaceLoadingFallback />}>
                   <SettingsView
                     registerExitGuard={registerSettingsExitGuard}
                     theme={theme}
@@ -3043,9 +3101,17 @@ function Shell({
                     isRestarting={isRestarting}
                     hostChromeInset={showHostChrome}
                   />
-                </Suspense>
+                </Suspense>}
               </div>
             )}
+          </div>
+          {managingConnections && !remoteConnections?.embeddedManagement && <div className="absolute inset-0 flex flex-col">
+            <RemoteConnectionsPage
+              mainNavigationExpanded={showMainSidebar && hostSidebarOpen}
+              hostChromeInset={showHostChrome}
+              onBackToChat={() => remoteConnections?.closeManagement()}
+            />
+          </div>}
           </main>
         </div>
 

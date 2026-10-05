@@ -187,7 +187,7 @@ export function AutomationsSettings({
   const filters = visibleJobs.length ? (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="sm" aria-label={filterLabel} title={filterLabel}
+        <Button variant="ghost" size="sm" aria-label={filterLabel} title={filter === "all" ? filterLabel : undefined}
           className={cn("h-8 text-[12px]", filter === "all" ? "w-8 p-0 text-muted-foreground" : "gap-1.5 bg-background text-foreground")}>
           <ListFilter className="h-4 w-4" strokeWidth={1.5} aria-hidden />
           {filter !== "all" ? filterLabel : null}

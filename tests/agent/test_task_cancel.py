@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agent.session_helpers import run_session
+from nanobot.agent.memory import Consolidator
 from nanobot.bus.outbound_events import StreamDeltaEvent, StreamEndEvent
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import GenerationSettings
@@ -454,7 +454,7 @@ class TestDispatch:
 
 class TestSubagentCancellation:
     @pytest.mark.asyncio
-    async def test_cancel_by_session(self):
+    async def test_cancel_by_session(self, tmp_path):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
 
@@ -463,21 +463,24 @@ class TestSubagentCancellation:
             workspace=MagicMock(),
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            consolidator=MagicMock(spec=Consolidator),
         )
 
         cancelled = asyncio.Event()
+        started = asyncio.Event()
+        mgr.workspace = tmp_path
 
-        async def slow():
+        async def slow(spec):
+            started.set()
             try:
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 cancelled.set()
                 raise
 
-        task = asyncio.create_task(slow())
-        await asyncio.sleep(0)
-        mgr._running_tasks["sub-1"] = task
-        mgr._session_tasks["test:c1"] = {"sub-1"}
+        mgr.runner.run = slow
+        await mgr.spawn("task", runtime=_runtime(MagicMock()), session_key="test:c1")
+        await started.wait()
 
         count = await mgr.cancel_by_session("test:c1")
         assert count == 1
@@ -493,11 +496,12 @@ class TestSubagentCancellation:
             workspace=MagicMock(),
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            consolidator=MagicMock(spec=Consolidator),
         )
         assert await mgr.cancel_by_session("nonexistent") == 0
 
     @pytest.mark.asyncio
-    async def test_cancel_by_session_terminates_exec_sessions(self):
+    async def test_cancel_by_session_does_not_terminate_parent_exec_sessions(self):
         from nanobot.agent.subagent import SubagentManager
         from nanobot.agent.tools.exec_session import ExecSessionManager
         from nanobot.bus.queue import MessageBus
@@ -507,6 +511,7 @@ class TestSubagentCancellation:
             workspace=MagicMock(),
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            consolidator=MagicMock(spec=Consolidator),
         )
         # Replace the real exec session manager with a mock
         mock_exec_mgr = AsyncMock(spec=ExecSessionManager)
@@ -515,7 +520,7 @@ class TestSubagentCancellation:
 
         await mgr.cancel_by_session("test:c1")
 
-        mock_exec_mgr.terminate_by_owner.assert_awaited_once_with("test:c1")
+        mock_exec_mgr.terminate_by_owner.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_subagent_preserves_reasoning_fields_in_tool_turn(self, monkeypatch, tmp_path):
@@ -555,16 +560,14 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
-        from nanobot.agent.subagent import SubagentStatus
-        status = SubagentStatus(task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic())
-        await mgr._run_subagent(
-            "sub-1",
-            "do task",
-            "label",
-            {"channel": "test", "chat_id": "c1"},
-            status,
-            _runtime(provider),
+        await mgr.spawn(
+            task="do task",
+            label="label",
+            origin_channel="test",
+            origin_chat_id="c1",
+            runtime=_runtime(provider),
         )
+        await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
 
         assistant_messages = [
             msg for msg in captured_second_call
@@ -588,6 +591,7 @@ class TestSubagentCancellation:
             workspace=tmp_path,
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            consolidator=MagicMock(spec=Consolidator),
             tools_config=ToolsConfig(exec=ExecToolConfig(enable=False)),
         )
         mgr._announce_result = AsyncMock()
@@ -603,16 +607,14 @@ class TestSubagentCancellation:
 
         mgr.runner.run = AsyncMock(side_effect=fake_run)
 
-        from nanobot.agent.subagent import SubagentStatus
-        status = SubagentStatus(task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic())
-        await mgr._run_subagent(
-            "sub-1",
-            "do task",
-            "label",
-            {"channel": "test", "chat_id": "c1"},
-            status,
-            _runtime(provider),
+        await mgr.spawn(
+            task="do task",
+            label="label",
+            origin_channel="test",
+            origin_chat_id="c1",
+            runtime=_runtime(provider),
         )
+        await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
 
         mgr.runner.run.assert_awaited_once()
         mgr._announce_result.assert_awaited_once()
@@ -661,16 +663,14 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
-        from nanobot.agent.subagent import SubagentStatus
-        status = SubagentStatus(task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic())
-        await mgr._run_subagent(
-            "sub-1",
-            "do task",
-            "label",
-            {"channel": "test", "chat_id": "c1"},
-            status,
-            _runtime(provider),
+        await mgr.spawn(
+            task="do task",
+            label="label",
+            origin_channel="test",
+            origin_chat_id="c1",
+            runtime=_runtime(provider),
         )
+        await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
 
         mgr._announce_result.assert_awaited_once()
         args = mgr._announce_result.await_args.args
@@ -681,7 +681,7 @@ class TestSubagentCancellation:
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):
-        from nanobot.agent.subagent import SubagentManager, SubagentStatus
+        from nanobot.agent.subagent import SubagentManager
         from nanobot.bus.queue import MessageBus
         from nanobot.providers.base import LLMResponse, ToolCallRequest
 
@@ -713,15 +713,8 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
-        task = asyncio.create_task(
-            mgr._run_subagent(
-                "sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"},
-                SubagentStatus(task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic()),
-                _runtime(provider),
-            )
-        )
-        mgr._running_tasks["sub-1"] = task
-        mgr._session_tasks["test:c1"] = {"sub-1"}
+        await mgr.spawn("do task", label="label", runtime=_runtime(provider), session_key="test:c1")
+        task = next(iter(mgr._running_tasks.values()))
 
         await asyncio.wait_for(started.wait(), timeout=1.0)
 
@@ -746,6 +739,7 @@ class TestSubagentAnnounceSessionKey:
             workspace=MagicMock(),
             bus=bus,
             max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            consolidator=MagicMock(spec=Consolidator),
         )
         return mgr, bus
 
@@ -788,9 +782,8 @@ class TestSubagentAnnounceSessionKey:
         assert msg.chat_id == "discord:333"
 
     @pytest.mark.asyncio
-    async def test_session_key_flows_through_run_subagent(self):
-        """Verify session_key in origin propagates from _run_subagent to _announce_result."""
-        from nanobot.agent.subagent import SubagentStatus
+    async def test_spawn_routes_result_to_parent_session(self):
+        """Background results return to the parent's canonical session."""
 
         mgr, bus = self._make_mgr()
 
@@ -804,16 +797,15 @@ class TestSubagentAnnounceSessionKey:
 
         mgr.runner.run = AsyncMock(side_effect=fake_run)
 
-        status = SubagentStatus(
-            task_id="sub-4", label="label", task_description="task",
-            started_at=time.monotonic(),
+        await mgr.spawn(
+            task="task",
+            label="label",
+            origin_channel="telegram",
+            origin_chat_id="444",
+            runtime=_runtime(),
+            session_key=UNIFIED_SESSION_KEY,
         )
-        await mgr._run_subagent(
-            "sub-4", "task", "label",
-            {"channel": "telegram", "chat_id": "444", "session_key": UNIFIED_SESSION_KEY},
-            status,
-            _runtime(),
-        )
+        await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
 
         msg = await bus.consume_inbound()
         assert msg.session_key_override == UNIFIED_SESSION_KEY

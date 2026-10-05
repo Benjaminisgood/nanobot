@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import time
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -153,17 +153,6 @@ async def test_goal_command_can_implement_plan_from_prior_discussion(tmp_path):
             ],
             usage=None,
         ),
-        LLMResponse(
-            content="trying to start another goal",
-            tool_calls=[
-                ToolCallRequest(
-                    id="call_create_again",
-                    name="create_goal",
-                    arguments={"objective": "Start an unrelated follow-up."},
-                )
-            ],
-            usage=None,
-        ),
         LLMResponse(content="done", tool_calls=[], usage=None),
     ])
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
@@ -186,14 +175,11 @@ async def test_goal_command_can_implement_plan_from_prior_discussion(tmp_path):
     assert session.metadata[GOAL_STATE_KEY]["status"] == "completed"
     first_request = provider.chat_stream_with_retry.await_args_list[0].kwargs["messages"]
     assert "staged migration plan" in str(first_request)
-    assert "/goal implement the plan above" in str(first_request)
+    assert "implement the plan above" in str(first_request)
     assert _GOAL_RUNTIME_GUIDANCE_TAG in str(first_request)
-    final_request = provider.chat_stream_with_retry.await_args_list[-1].kwargs["messages"]
-    assert "create_goal is unavailable for this turn" in str(final_request)
-    assert _GOAL_RUNTIME_GUIDANCE_TAG in str(session.messages[2]["content"])
-    assert _GOAL_RUNTIME_GUIDANCE_TAG not in str(
-        public_history_message(session.messages[2])["content"]
-    )
+    assert session.messages[2]["content"] == "/goal implement the plan above"
+    assert session.messages[3]["_hidden_history"] == {"kind": "goal_request"}
+    assert _GOAL_RUNTIME_GUIDANCE_TAG in str(session.messages[3]["content"])
 
 
 @pytest.mark.asyncio
@@ -654,8 +640,8 @@ async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, monkeypatch):
-    from nanobot.agent.subagent import SubagentManager, SubagentStatus
+async def test_subagent_max_iterations_announces_partial_incomplete_result(tmp_path, monkeypatch):
+    from nanobot.agent.subagent import SubagentManager
     from nanobot.bus.queue import MessageBus
 
     bus = MessageBus()
@@ -672,24 +658,28 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
         consolidator=MagicMock(),
         max_iterations=2,
     )
-    mgr._announce_result = AsyncMock()
 
     async def fake_execute(self, **kwargs):
         return "tool result"
 
     monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
-    status = SubagentStatus(task_id="sub-1", label="label", task_description="do task", started_at=time.monotonic())
-    await mgr._run_subagent(
-        "sub-1",
-        "do task",
-        "label",
-        {"channel": "test", "chat_id": "c1"},
-        status,
-        LLMRuntime.capture(provider, "test-model", context_window_tokens=128_000),
+    await mgr.spawn(
+        task="do task",
+        label="label",
+        origin_channel="test",
+        origin_chat_id="c1",
+        runtime=LLMRuntime.capture(provider, "test-model", context_window_tokens=128_000),
     )
+    await asyncio.gather(*mgr._running_tasks.values(), return_exceptions=True)
 
-    mgr._announce_result.assert_awaited_once()
-    args = mgr._announce_result.await_args.args
-    assert args[3] == "Task completed but no final response was generated."
-    assert args[5] == "ok"
+    status = next(iter(mgr.statuses_for_session("test:c1").values()))
+    assert status.state == "incomplete"
+    assert status.stop_reason == "max_iterations"
+    assert status.partial is True
+    assert status.result == "working"
+    notice = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert notice.metadata["subagent_state"] == "incomplete"
+    assert notice.metadata["subagent_partial"] is True
+    assert "working" in notice.content
+    await mgr.close()

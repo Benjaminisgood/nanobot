@@ -1,17 +1,19 @@
+import {
+  ModelsIcon,
+  WebSearchIcon,
+  ImageGenerationIcon,
+  VoiceIcon,
+} from "@/components/icons/product-icons";
 import { useState, type Dispatch, type SetStateAction } from "react";
 import {
   ArrowUpCircle,
-  Bot,
   BookOpen,
   MessageCircle,
   Check,
   ChevronRight,
   ExternalLink,
-  Globe2,
   Github,
-  ImageIcon,
   Loader2,
-  Mic,
   type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -90,7 +92,7 @@ export function OverviewSettings({
         <SettingsSectionTitle>{tx("settings.sections.ai", "AI")}</SettingsSectionTitle>
         <SettingsGroup>
           <OverviewListRow
-            icon={Bot}
+            icon={ModelsIcon}
             valueLogoProvider={activeProvider}
             title={tx("settings.overview.model", "Current model")}
             value={activeModelValue}
@@ -105,7 +107,7 @@ export function OverviewSettings({
         <SettingsSectionTitle>{tx("settings.sections.capabilities", "Capabilities")}</SettingsSectionTitle>
         <SettingsGroup>
           <OverviewListRow
-            icon={Globe2}
+            icon={WebSearchIcon}
             valueLogoProvider={settings.web_search.provider}
             title={tx("settings.overview.webSearch", "Web search")}
             value={webStatus}
@@ -113,7 +115,7 @@ export function OverviewSettings({
             onClick={() => onSelectSection("browser")}
           />
           <OverviewListRow
-            icon={ImageIcon}
+            icon={ImageGenerationIcon}
             valueLogoProvider={settings.image_generation.provider}
             title={tx("settings.overview.imageGeneration", "Image generation")}
             value={imageStatus}
@@ -121,7 +123,7 @@ export function OverviewSettings({
             onClick={() => onSelectSection("image")}
           />
           <OverviewListRow
-            icon={Mic}
+            icon={VoiceIcon}
             valueLogoProvider={transcription.provider}
             title={tx("settings.overview.voiceInput", "Voice input")}
             value={voiceStatus}
@@ -413,7 +415,7 @@ function OverviewRowIcon({
   icon: LucideIcon;
 }) {
   return (
-    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-control bg-muted text-foreground/82 transition-colors group-hover:bg-muted/80 dark:bg-muted/70">
+    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-control bg-muted text-foreground/82 transition-colors dark:bg-muted/70">
       <Icon className="h-4 w-4" aria-hidden />
     </span>
   );
@@ -442,6 +444,15 @@ function OverviewValueLogo({
         )}
         aria-hidden
       >
+        <span
+          className={cn(
+            "col-start-1 row-start-1 grid h-full w-full place-items-center rounded-md text-[7.5px] font-semibold text-white",
+            logoLoaded ? "opacity-0" : "opacity-100",
+          )}
+          style={{ backgroundColor: brand.color }}
+        >
+          {brand.initials}
+        </span>
         <img
           src={logoUrl}
           alt=""
@@ -450,7 +461,7 @@ function OverviewValueLogo({
           referrerPolicy="no-referrer"
           draggable={false}
           className={cn(
-            "object-contain",
+            "col-start-1 row-start-1 object-contain",
             isLogoTile ? "h-5 w-5" : "h-3.5 w-3.5",
             logoLoaded ? "opacity-100" : "opacity-0",
           )}
