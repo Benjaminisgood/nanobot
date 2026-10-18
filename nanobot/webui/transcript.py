@@ -12,10 +12,12 @@ import shutil
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Mapping, NamedTuple, Sequence, cast
+from typing import Any, Callable, Mapping, NamedTuple, NotRequired, Sequence, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
 from loguru import logger
@@ -817,7 +819,7 @@ def _encode_page_cursor(before_turn_ordinal: int) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _decode_page_cursor(value: str | None) -> int | None:
+def decode_transcript_cursor(value: str | None) -> int | None:
     if not value:
         return None
     try:
@@ -931,6 +933,7 @@ def _select_transcript_page(
     *,
     limit: int | None,
     before: str | None,
+    after: str | None = None,
     stats: TranscriptReplayStats | None = None,
     _manifest_rebuilt: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -940,16 +943,19 @@ def _select_transcript_page(
     turn_cache: dict[str, list[list[dict[str, Any]]]] = {}
     chunks = _chunk_turn_refs(session_key, turn_cache, stats=stats)
     total_turns = sum(chunk.turn_count for chunk in chunks)
-    before_ordinal = _decode_page_cursor(before)
+    before_ordinal = decode_transcript_cursor(before)
     upper_ordinal = total_turns if before_ordinal is None else min(before_ordinal, total_turns)
+    after_ordinal = decode_transcript_cursor(after)
     selected: list[_TranscriptTurnRef] = []
     selected_event_count = 0
     selected_record_count = 0
     selected_bytes = 0
     budget_reached = False
 
-    for chunk in reversed(chunks):
+    for chunk in (chunks if after_ordinal is not None else reversed(chunks)):
         if chunk.start_ordinal >= upper_ordinal:
+            continue
+        if after_ordinal is not None and chunk.start_ordinal + chunk.turn_count <= after_ordinal:
             continue
         local_upper = min(chunk.turn_count, upper_ordinal - chunk.start_ordinal)
         if local_upper <= 0:
@@ -975,11 +981,14 @@ def _select_transcript_page(
                 session_key,
                 limit=limit,
                 before=before,
+                after=after,
                 stats=stats,
                 _manifest_rebuilt=True,
             )
         local_upper = min(local_upper, len(turns))
-        for turn_index in range(local_upper - 1, -1, -1):
+        indices = (range(max(0, after_ordinal - chunk.start_ordinal), local_upper)
+                   if after_ordinal is not None else range(local_upper - 1, -1, -1))
+        for turn_index in indices:
             ordinal = chunk.start_ordinal + turn_index
             trace_details_safe = True
             turn, compacted_delta_records = _compact_completed_stream_deltas(
@@ -1018,7 +1027,7 @@ def _select_transcript_page(
         if selected_event_count >= page_limit or budget_reached:
             break
 
-    selected_chronological = list(reversed(selected))
+    selected_chronological = selected if after_ordinal is not None else list(reversed(selected))
     lines = [
         record
         for ref in selected_chronological
@@ -1034,6 +1043,8 @@ def _select_transcript_page(
         return [], {
             "before_cursor": None,
             "has_more_before": False,
+            "after_cursor": None,
+            "has_more_after": False,
             "loaded_event_count": 0,
             "user_message_offset": 0,
         }
@@ -1043,6 +1054,9 @@ def _select_transcript_page(
     page = {
         "before_cursor": _encode_page_cursor(first_ref.ordinal) if has_more else None,
         "has_more_before": has_more,
+        "after_cursor": _encode_page_cursor(selected_chronological[-1].ordinal + 1)
+            if selected_chronological[-1].ordinal + 1 < total_turns else None,
+        "has_more_after": selected_chronological[-1].ordinal + 1 < total_turns,
         "loaded_event_count": 0,
         "user_message_offset": _count_user_messages_before_ordinal(
             session_key,
@@ -2506,6 +2520,7 @@ def build_webui_thread_response(
     limit: int | None = None,
     direction: str | None = None,
     before: str | None = None,
+    after: str | None = None,
     stats: TranscriptReplayStats | None = None,
 ) -> dict[str, Any] | None:
     """Return canonical transcript events for the WebUI projector."""
@@ -2514,6 +2529,7 @@ def build_webui_thread_response(
         session_key,
         limit=limit,
         before=before,
+        after=after,
         stats=replay_stats,
     )
     if not lines and active_turn_started_at is None:
@@ -2562,3 +2578,120 @@ def build_webui_thread_response(
         payload["fork_boundary_event_index"] = fork_boundary_event_index
     payload["page"] = page
     return payload
+
+
+class PromptSummary(TypedDict):
+    id: str
+    preview: str
+    answerPreview: str
+    createdAt: int
+    cursor: str
+    turnId: str
+
+
+@lru_cache(maxsize=64)
+def _chunk_prompt_summaries(path: Path, identity: tuple[int, int, int], start: int) -> tuple[PromptSummary, ...]:
+    # Stored records use compact JSON. A normal chunk already fits the page byte
+    # budget, so do not serialize all answer/tool bodies again just to count them.
+    check_turn_bytes = identity[2] > _MAX_TRANSCRIPT_PAGE_BYTES
+    result: list[PromptSummary] = []
+    turns = _split_transcript_turns(_read_transcript_file(path))
+    for ordinal, raw_turn in enumerate(turns, start):
+        turn, _ = _compact_completed_stream_deltas(raw_turn)
+        if len(turn) > _MAX_TRANSCRIPT_PAGE_RECORDS or (check_turn_bytes and _records_bytes(turn) > _MAX_TRANSCRIPT_PAGE_BYTES):
+            turn = _trim_oversized_turn(
+                turn, max_records=_MAX_TRANSCRIPT_PAGE_RECORDS,
+                max_bytes=_MAX_TRANSCRIPT_PAGE_BYTES,
+            )
+        records = _records_with_replay_identity(turn, turn_ordinal=ordinal)
+        seen_turns: set[str] = set()
+        seen_messages: set[str] = set()
+        for index, record in enumerate(records):
+            if record.get("event") != "user":
+                continue
+            turn_id = str(record.get("turn_id") or "")
+            # Match the client projector's user-message deduplication.
+            provenance = normalize_session_message_ui_metadata(record.get("session_message"))
+            if provenance:
+                message_id = str(provenance["message_id"])
+                if message_id in seen_messages:
+                    continue
+                seen_messages.add(message_id)
+            elif turn_id and turn_id in seen_turns:
+                continue
+            if turn_id:
+                seen_turns.add(turn_id)
+            answer = ""
+            for following in records[index + 1:]:
+                if following.get("event") == "user":
+                    break
+                if following.get("event") in {"message", "stream_end"} and not following.get("kind"):
+                    answer = str(following.get("text") or "").strip()[:240]
+                    if answer:
+                        break
+            result.append({
+                "id": _client_projection_event_id(record),
+                "preview": str(record.get("text") or "").strip()[:320],
+                "answerPreview": answer,
+                "createdAt": _valid_created_at_ms(record.get("created_at_ms")) or 0,
+                "cursor": _encode_page_cursor(ordinal),
+                "turnId": turn_id,
+            })
+    return tuple(result)
+
+
+def build_prompt_index(session_key: str) -> list[PromptSummary]:
+    """Read every prompt, without materializing full history or touching SQLite."""
+    result: list[PromptSummary] = []
+    start = 0
+    chunks = [
+        (_segment_file_path(session_key, entry["id"]), entry["turn_count"])
+        for entry in _read_segment_manifest_entries(session_key)
+    ]
+    chunks.append((webui_transcript_path(session_key), 0))
+    for path, count in chunks:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        result.extend(_chunk_prompt_summaries(path, (stat.st_ino, stat.st_mtime_ns, stat.st_size), start))
+        start += count
+    return result
+
+
+# Short-lived response snapshots share the chunk summaries; they do not retain
+# full transcripts or write another durable representation of the conversation.
+_PROMPT_SNAPSHOTS: OrderedDict[tuple[Path, str], tuple[PromptSummary, ...]] = OrderedDict()
+_PROMPT_SNAPSHOT_LOCK = threading.Lock()
+
+
+class PromptIndexResponse(TypedDict):
+    prompts: Sequence[PromptSummary]
+    replaceFrom: int
+    revision: NotRequired[str | None]
+
+
+def prompt_index_response(session_key: str, previous_revision: str | None) -> PromptIndexResponse:
+    path = webui_transcript_path(session_key)
+    revision = webui_transcript_revision(session_key)
+    with _PROMPT_SNAPSHOT_LOCK:
+        previous = _PROMPT_SNAPSHOTS.get((path, previous_revision)) if previous_revision else None
+        current = _PROMPT_SNAPSHOTS.get((path, revision)) if revision else None
+    if current is None:
+        current = tuple(build_prompt_index(session_key))
+        # Do not label a read made across an append/rotation as one stable revision.
+        if revision != webui_transcript_revision(session_key):
+            return {"prompts": current, "replaceFrom": 0}
+        if revision:
+            with _PROMPT_SNAPSHOT_LOCK:
+                _PROMPT_SNAPSHOTS[path, revision] = current
+                _PROMPT_SNAPSHOTS.move_to_end((path, revision))
+                while len(_PROMPT_SNAPSHOTS) > 8:
+                    _PROMPT_SNAPSHOTS.popitem(last=False)
+    replace_from = 0
+    if previous is not None:
+        for old, new in zip(previous, current):
+            if old != new:
+                break
+            replace_from += 1
+    return {"prompts": current[replace_from:], "replaceFrom": replace_from, "revision": revision}

@@ -5,7 +5,7 @@ import { MessageBlockMenuActions, MessageBubble } from "@/components/MessageBubb
 import { ThreadMessages } from "@/components/thread/ThreadMessages";
 import { setAppLanguage } from "@/i18n";
 import * as clipboard from "@/lib/clipboard";
-import { formatMessageEndTime } from "@/lib/format";
+import { formatMessageEndTime } from "@/lib/format-time";
 import type {
   CliAppInfo,
   McpPresetInfo,
@@ -274,31 +274,37 @@ describe("MessageBubble", () => {
     expect(bubble).toHaveClass("bg-secondary/70");
   });
 
-  it("does not replay an entrance animation when persisted messages mount", () => {
+  it("renders completed message branches with static wrapper classes", async () => {
     const messages: UIMessage[] = [
       {
         id: "u-persisted",
         role: "user",
         content: "Earlier question",
-        createdAt: Date.now(),
+        createdAt: 1_700_000_000_000,
       },
       {
         id: "a-persisted",
         role: "assistant",
         content: "Earlier answer",
-        createdAt: Date.now(),
+        createdAt: 1_700_000_001_000,
       },
       {
         id: "t-persisted",
         role: "tool",
         kind: "trace",
         content: "Earlier tool call",
-        createdAt: Date.now(),
+        createdAt: 1_700_000_002_000,
       },
     ];
 
     for (const message of messages) {
       const { container, unmount } = render(<MessageBubble message={message} />);
+      if (message.kind === "trace") {
+        const disclosure = screen.getByRole("button", { expanded: false });
+        fireEvent.click(disclosure);
+        expect(disclosure).toHaveAttribute("aria-expanded", "true");
+      }
+      expect(await screen.findByText(message.content)).toBeVisible();
       for (const className of ["animate-in", "fade-in-0", "slide-in-from-bottom-1"]) {
         expect(container.firstElementChild).not.toHaveClass(className);
       }
@@ -663,8 +669,8 @@ describe("MessageBubble", () => {
     expect(token).toHaveClass("font-[550]");
     expect(token.className).not.toContain("rounded");
     expect(token.className).not.toContain("px-");
-    expect(token.getAttribute("style")).toContain("color: #0B5CFF");
-    expect(token.getAttribute("style")).not.toContain("text-shadow");
+    expect(token).toHaveClass("text-foreground");
+    expect(token.style.textShadow).toBe("");
     const logo = screen.getByTestId("message-cli-mention-logo-zoom");
     expect(logo).toHaveClass("h-[1.1em]", "w-[1.1em]", "rounded-[0.25em]", "top-1/2", "-translate-y-1/2");
     expect(logo.parentElement).toHaveClass("mr-1", "w-[1.1em]");
@@ -716,7 +722,7 @@ describe("MessageBubble", () => {
     expect(token).toHaveTextContent("@Draw.io");
     expect(token.className).not.toContain("rounded");
     expect(token.className).not.toContain("px-");
-    expect(token.getAttribute("style")).toContain("color: #F08705");
+    expect(token).toHaveClass("text-foreground");
     expect(screen.getByTestId("message-cli-mention-logo-drawio")).toBeInTheDocument();
   });
 
@@ -733,7 +739,7 @@ describe("MessageBubble", () => {
     const token = screen.getByTestId("message-mcp-mention-browserbase");
     expect(token).toHaveTextContent("@Browserbase");
     expect(token).toHaveAttribute("title", "MCP server: Browserbase (@browserbase)");
-    expect(token.getAttribute("style")).toContain("color: #111827");
+    expect(token).toHaveClass("text-foreground");
     const logo = screen.getByTestId("message-mcp-mention-logo-browserbase");
     expect(logo).toHaveClass("h-[1.1em]", "w-[1.1em]", "rounded-[0.25em]", "top-1/2", "-translate-y-1/2");
     expect(logo.parentElement).toHaveClass("mr-1", "w-[1.1em]");

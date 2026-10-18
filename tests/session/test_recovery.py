@@ -14,13 +14,21 @@ from nanobot.session.recovery import (
     PENDING_USER_TURN_KEY,
     RECOVERY_METADATA_KEY,
     RUNTIME_CHECKPOINT_KEY,
-    RecoveryActionError,
-    RecoveryCoordinator,
     acknowledge_pending_followups,
     pending_followups,
     record_pending_followup,
 )
 from nanobot.webui import session_list_index, transcript
+from nanobot.webui.recovery import RecoveryActionError, RecoveryCoordinator
+
+
+@pytest.fixture(autouse=True)
+def _isolate_webui_transcripts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recovery scans must discover only test-owned transcripts, not active user chats."""
+    webui_dir = tmp_path / "isolated-webui"
+    webui_dir.mkdir()
+    monkeypatch.setattr(session_list_index, "get_webui_dir", lambda: webui_dir)
+    monkeypatch.setattr(transcript, "get_webui_dir", lambda: webui_dir)
 
 
 def _persist(manager: SessionManager, session: Session) -> None:
@@ -178,13 +186,13 @@ async def test_scan_loads_only_sessions_that_need_webui_recovery(
 
     coordinator, _, restarted = _coordinator(tmp_path)
     loaded: list[str] = []
-    get_or_create = restarted.get_or_create
+    get_or_create = restarted.state.get
 
-    def tracked_get_or_create(key: str) -> Session:
+    async def tracked_get_or_create(key: str) -> Session:
         loaded.append(key)
-        return get_or_create(key)
+        return await get_or_create(key)
 
-    monkeypatch.setattr(restarted, "get_or_create", tracked_get_or_create)
+    monkeypatch.setattr(restarted.state, "get", tracked_get_or_create)
     monkeypatch.setattr(
         "nanobot.webui.transcript.has_unfinished_transcript_tail",
         lambda _key: False,
@@ -733,26 +741,59 @@ async def test_scan_failure_is_visible_instead_of_aborting_other_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator, bus, sessions = _coordinator(tmp_path)
-    session = sessions.get_or_create("websocket:chat")
-    session.metadata[PENDING_USER_TURN_KEY] = True
-    _persist(sessions, session)
+    keys = {"websocket:first", "websocket:second"}
+    for key in sorted(keys):
+        session = sessions.get_or_create(key)
+        session.add_message("user", f"finish {key}")
+        session.metadata[PENDING_USER_TURN_KEY] = True
+        _persist(sessions, session)
+    recover_session = RecoveryCoordinator._recover_session
+    attempted = []
 
-    async def fail(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("boom")
+    async def fail_first(self, session: Session, chat_id: str) -> None:
+        attempted.append((session.key, chat_id))
+        if len(attempted) == 1:
+            raise RuntimeError("boom")
+        await recover_session(self, session, chat_id)
 
-    monkeypatch.setattr(RecoveryCoordinator, "_recover_session", fail)
-    await coordinator.scan()
+    monkeypatch.setattr(RecoveryCoordinator, "_recover_session", fail_first)
+    try:
+        await coordinator.scan()
 
-    state = sessions.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
-    assert state["status"] == "failed"
-    assert state["can_continue"] is False
-    assert isinstance(bus.outbound.get_nowait().event, RecoveryStateEvent)
+        assert len(attempted) == 2
+        assert {key for key, _ in attempted} == keys
+        failed_key, failed_chat = attempted[0]
+        healthy_key, healthy_chat = attempted[1]
+        state = sessions.read_session_snapshot(failed_key).metadata[RECOVERY_METADATA_KEY]
+        assert state["status"] == "failed"
+        assert state["reason"] == "recovery_failed"
+        assert state["can_continue"] is False
+        healthy = sessions.read_session_snapshot(healthy_key)
+        healthy_state = healthy.metadata[RECOVERY_METADATA_KEY]
+        assert healthy_state["status"] == "awaiting_user"
+        assert healthy_state["reason"] == "restart_requires_confirmation"
+        assert healthy.metadata[PENDING_USER_TURN_KEY] is True
+        assert [message["content"] for message in healthy.messages] == [f"finish {healthy_key}"]
+        assert bus.inbound.empty()
+        messages = []
+        while not bus.outbound.empty():
+            messages.append(bus.outbound.get_nowait())
+        recovery_messages = [message for message in messages if isinstance(message.event, RecoveryStateEvent)]
+        assert [(message.channel, message.chat_id, message.event.status, message.event.recovery_id)
+                for message in recovery_messages] == [
+            ("websocket", failed_chat, "failed", state["recovery_id"]),
+            ("websocket", healthy_chat, "awaiting_user", healthy_state["recovery_id"]),
+        ]
+        assert recovery_messages[0].event.can_continue is False
+        assert recovery_messages[1].event.reason == "restart_requires_confirmation"
 
-    with pytest.raises(RecoveryActionError, match="context is unavailable"):
-        await coordinator.handle_action(
-            "continue",
-            {"chat_id": "chat", "recovery_id": state["recovery_id"]},
-        )
+        with pytest.raises(RecoveryActionError, match="context is unavailable"):
+            await coordinator.handle_action(
+                "continue",
+                {"chat_id": failed_chat, "recovery_id": state["recovery_id"]},
+            )
+    finally:
+        await sessions.state.aclose()
 
 
 @pytest.mark.asyncio

@@ -86,7 +86,7 @@ describe("ThreadMessages", () => {
         const assertIndependentDiff = () => {
           const diff = screen.getByTestId("file-edit-diff");
           expect(diff).toBeVisible();
-          expect(screen.getByText("Edited")).toBeInTheDocument();
+          expect(screen.getByRole("img", { name: "Edited", exact: true })).toBeInTheDocument();
           expect(diff.closest('[aria-hidden="true"], [inert], [data-testid="agent-activity-content"]'))
             .toBeNull();
           expect(screen.getByText("File updated")).toBeVisible();
@@ -731,7 +731,9 @@ describe("ThreadMessages", () => {
     const rows = Array.from(container.firstElementChild?.children ?? []);
 
     expect(rows).toHaveLength(2);
-    expect(rows[0]).not.toHaveClass("mt-2", "mt-4", "mt-5");
+    for (const className of ["mt-2", "mt-4", "mt-5"]) {
+      expect(rows[0]).not.toHaveClass(className);
+    }
     expect(rows[1]).not.toHaveClass("mt-4");
     const answerRow = screen.getByText("final answer")
       .closest<HTMLElement>("[data-thread-display-unit]")!;
@@ -765,14 +767,16 @@ describe("ThreadMessages", () => {
     const timestamp = menu.querySelector<HTMLElement>("[data-message-timestamp]")!;
     expect(timestamp).toBeInTheDocument();
     expect(timestamp).toHaveClass("min-h-[var(--message-block-control-size)]");
-    expect(timestamp.parentElement).toHaveClass("border-t", "text-muted-foreground/45");
+    expect(timestamp.parentElement).toHaveClass("border-t", "text-muted-foreground");
     expect(toolbar).not.toContainElement(timestamp);
     expect(timestamp).not.toHaveAttribute("tabindex");
     expect(timestamp.querySelector("svg")).not.toBeInTheDocument();
     expect(disclosure.compareDocumentPosition(timestamp) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy();
     expect(menu).toHaveClass("w-max", "max-w-64", "bg-popover", "rounded-floating", "overflow-y-auto");
-    expect(menu).not.toHaveClass("min-w-[8.5rem]", "bg-popover/95", "rounded-xl");
+    for (const className of ["min-w-[8.5rem]", "bg-popover/95", "rounded-xl"]) {
+      expect(menu).not.toHaveClass(className);
+    }
     const menuButtons = Array.from(menu.querySelectorAll("button"));
     expect(menuButtons.length).toBeGreaterThan(1);
     for (const button of menuButtons) {

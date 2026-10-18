@@ -15,6 +15,7 @@ export type ChannelPresentation = {
 
 export type ChannelSetupPresentation = {
   mode?: "webui" | "credentials" | "connect";
+  privacyNotice?: string;
   primaryActionLabel?: string;
   command?: string;
   docsUrl?: string;

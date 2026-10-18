@@ -214,6 +214,39 @@ function catalogFeature(
 describe("Settings channels", () => {
   installSettingsViewTestHooks();
 
+  it("shows agent chat privacy before entering credentials or enabling the channel", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/settings") return jsonResponse(settingsPayload());
+      if (url === "/api/settings/nanobot-features") return jsonResponse({
+        features: [{
+          ...catalogFeature("whatsapp_agent", false),
+          display_name: "WhatsApp Agent Platform",
+          webui: "webui/index.ts",
+          setup: {
+            verifies_connection: true,
+            fields: [channelSetupField("whatsapp_agent", "token", "secret", { required: true })],
+            requirements: [{ alternatives: [["channels.whatsapp_agent.token"]] }],
+          },
+        }],
+        enabled_count: 0,
+      });
+      return jsonResponse({});
+    }));
+
+    renderSettingsView({ initialSection: "channels" });
+    fireEvent.click(await screen.findByRole("button", { name: "View WhatsApp Agent Platform settings" }));
+
+    const privacy = screen.getByText(/Agent chats are not end-to-end encrypted/);
+    expect(privacy).toBeVisible();
+    expect(privacy).toHaveTextContent("nanobot and your configured model provider");
+    const token = screen.getByLabelText("API token");
+    expect(token).toHaveValue("");
+    expect(privacy.compareDocumentPosition(token) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "Enable channel" })).not.toBeChecked();
+    expect(requestMutationMock).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       name: "telegram",

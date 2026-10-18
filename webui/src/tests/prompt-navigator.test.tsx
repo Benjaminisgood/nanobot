@@ -12,6 +12,21 @@ beforeEach(() => {
 
 afterEach(() => restoreBrowserFocus());
 
+it("keeps a long searchable index windowed and keyboard-reachable", async () => {
+  const user = userEvent.setup();
+  const jump = vi.fn();
+  render(<PromptNavigator messages={Array.from({ length: 2000 }, (_, index) => ({
+    id: String(index), role: "user", content: `Question ${index}`, createdAt: index + 1,
+  }))} onJumpToPrompt={jump} />);
+  await user.click(screen.getByRole("button", { name: "Message navigation" }));
+  expect(screen.getAllByRole("button", { name: /Jump to message:/ }).length).toBeLessThan(25);
+  await user.tab();
+  await user.keyboard("{End}");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Jump to message: Question 1999" })).toHaveFocus());
+  await user.keyboard("{Enter}");
+  expect(jump).toHaveBeenCalledWith("1999");
+});
+
 it("lets users type into prompt search immediately after opening it", async () => {
   const user = userEvent.setup();
   const onJumpToPrompt = vi.fn();

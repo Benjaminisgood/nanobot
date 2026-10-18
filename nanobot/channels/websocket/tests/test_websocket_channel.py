@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -52,7 +53,7 @@ from nanobot.providers.base import LLMUsage
 from nanobot.runtime_context import RUNTIME_CONTEXT_INPUT_META, WEBUI_QUOTE_SOURCE
 from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 from nanobot.session import webui_turns as wth
-from nanobot.session.manager import SessionManager
+from nanobot.session.manager import Session, SessionManager
 from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
 from nanobot.session.session_handles import session_handle_for_name
 from nanobot.webui.gateway_services import GatewayServices, build_gateway_services
@@ -91,7 +92,7 @@ from .ws_test_client import http_get as _http_get
 
 # -- Shared helpers (aligned with test_websocket_integration.py) ---------------
 
-_PORT = 29876
+_PORT = 0
 
 
 async def _register_running_turn(
@@ -133,6 +134,7 @@ def _thread_conversation_events(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _ch(bus: Any, **kw: Any) -> WebSocketChannel:
+    image_generation_reload = kw.pop("image_generation_reload", None)
     cfg: dict[str, Any] = {
         "enabled": True,
         "allowFrom": ["*"],
@@ -153,6 +155,7 @@ def _ch(bus: Any, **kw: Any) -> WebSocketChannel:
         runtime_model_name=None,
         runtime_surface="browser",
         runtime_capabilities_overrides=None,
+        image_generation_reload=image_generation_reload,
     )
     return WebSocketChannel(cfg, bus, gateway=gateway)
 
@@ -177,12 +180,36 @@ def _basic_handler(bus: Any, **kw: Any) -> GatewayServices:
     )
 
 
-async def _connect_when_ready(url: str) -> Any:
-    while True:
-        try:
-            return await websockets.connect(url)
-        except OSError:
-            await asyncio.sleep(0.02)
+@pytest.fixture
+async def start_listener():
+    """Start test-owned ephemeral listeners and join them even if setup/assertions fail."""
+    listeners = []
+
+    async def start(channel: WebSocketChannel):
+        assert channel.config.port == 0
+        task = asyncio.create_task(channel.start())
+        listeners.append((channel, task))
+        async with asyncio.timeout(5):
+            while True:
+                if task.done():
+                    await task
+                    raise AssertionError("listener stopped before becoming ready")
+                server = channel._server
+                if server is not None and server.sockets and server.is_serving():
+                    return server.sockets[0].getsockname()[1], task
+                await asyncio.sleep(0.01)
+
+    try:
+        yield start
+    finally:
+        for channel, task in reversed(listeners):
+            try:
+                await asyncio.wait_for(channel.stop(), timeout=5)
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def _wait_for_connection_cleanup(
@@ -872,8 +899,8 @@ def test_issue_route_secret_matches_empty_secret() -> None:
 
 
 @pytest.mark.asyncio
-async def test_token_issue_route_requires_secret_when_static_token_configured(bus: MagicMock) -> None:
-    port = 29882
+async def test_token_issue_route_requires_secret_when_static_token_configured(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(
         bus,
         port=port,
@@ -882,8 +909,7 @@ async def test_token_issue_route_requires_secret_when_static_token_configured(bu
         websocketRequiresToken=True,
     )
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         denied = await _http_get(f"http://127.0.0.1:{port}/custom-token")
@@ -2032,7 +2058,7 @@ async def test_webui_set_workspace_scope_rejects_running_chat(bus: MagicMock, tm
             },
         },
     )
-    channel.gateway.workspaces.persist_scope(
+    await channel.gateway.workspaces.persist_scope(
         "chat-running",
         channel.gateway.workspaces.scope_for_session_key("websocket:chat-running"),
     )
@@ -2117,7 +2143,7 @@ async def test_remote_webui_scope_allows_access_reduction(
 
 
 @pytest.mark.asyncio
-async def test_remote_access_reduction_rejects_stale_in_flight_message_scope(
+async def test_in_flight_message_without_scope_uses_latest_access_mode(
     bus: MagicMock,
     tmp_path,
     monkeypatch,
@@ -2154,10 +2180,6 @@ async def test_remote_access_reduction_rejects_stale_in_flight_message_scope(
                 "chat_id": chat_id,
                 "content": "hello",
                 "webui": True,
-                "workspace_scope": {
-                    "project_path": str(default_workspace),
-                    "access_mode": "full",
-                },
             },
         )
     )
@@ -2178,18 +2200,16 @@ async def test_remote_access_reduction_rejects_stale_in_flight_message_scope(
     release_hydrate.set()
     await message_task
 
-    assert sessions.read_session_file(f"websocket:{chat_id}") is None
+    saved = sessions.read_session_file(f"websocket:{chat_id}")
+    assert saved["metadata"]["workspace_scope"]["access_mode"] == "restricted"
     assert channel.gateway.workspaces.scope_for_session_key(
         f"websocket:{chat_id}"
     ).access_mode == "restricted"
-    payload = json.loads(message_conn.send.await_args.args[0])
-    assert payload["event"] == "error"
-    assert payload["detail"] == "workspace_scope_rejected"
-    bus.publish_inbound.assert_not_awaited()
+    bus.publish_inbound.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_remote_webui_scope_rejects_full_access_for_custom_scope(
+async def test_remote_webui_scope_allows_full_access_for_custom_scope(
     bus: MagicMock,
     tmp_path,
 ) -> None:
@@ -2220,11 +2240,11 @@ async def test_remote_webui_scope_rejects_full_access_for_custom_scope(
     )
 
     payload = json.loads(conn.send.await_args.args[0])
-    assert payload["event"] == "error"
-    assert payload["detail"] == "workspace_scope_rejected"
-    assert payload["reason"] == "full workspace access is unavailable for this connection"
-    assert payload["chat_id"] == "chat-remote"
-    assert sessions.read_session_file("websocket:chat-remote") is None
+    assert payload["event"] == "session_updated"
+    assert payload["workspace_scope"]["access_mode"] == "full"
+    assert channel.gateway.workspaces.scope_for_session_key(
+        "websocket:chat-remote"
+    ).project_path == project.resolve()
 
 
 @pytest.mark.asyncio
@@ -2976,6 +2996,56 @@ async def test_stream_transcript_persists_without_subscribers() -> None:
     assert _thread_conversation_events(body)[-1]["role"] == "assistant"
     assert _thread_conversation_events(body)[-1]["content"] == "hello world"
     assert _thread_conversation_events(body)[-1]["latencyMs"] == 42
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("temporary", [False, True])
+async def test_stream_policy_does_not_copy_history_on_runtime_loop(
+    bus, tmp_path, monkeypatch, temporary,
+) -> None:
+    import nanobot.session.state as session_state
+
+    sessions = SessionManager(tmp_path)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]}, bus,
+        gateway=_basic_handler(bus, session_manager=sessions, workspace_path=tmp_path),
+    )
+    owner = object()
+    chat_id = (
+        await channel.gateway.temporary_chats.create(owner, trusted_webui=True)
+        if temporary else "history-copy"
+    )
+    history = [
+        {"role": "user", "content": f"history {i}"} for i in range(1000)
+    ]
+    draft = await sessions.state.import_messages(f"websocket:{chat_id}", history)
+    await sessions.state.checkpoint_view(draft, {"messages": history})
+    runtime_thread = threading.get_ident()
+    original_copy = session_state.deepcopy
+
+    def copy_off_loop(value, *args, **kwargs):
+        if (
+            isinstance(value, Session) and value.messages
+            or isinstance(value, dict) and "runtime_checkpoint" in value
+        ):
+            assert threading.get_ident() != runtime_thread, "history copied on runtime loop"
+        return original_copy(value, *args, **kwargs)
+
+    monkeypatch.setattr(session_state, "deepcopy", copy_off_loop)
+    append = MagicMock()
+    monkeypatch.setattr("nanobot.webui.transcript.append_transcript_object", append)
+    try:
+        policy = channel.gateway.temporary_chats.message_policy(owner, chat_id, "hello")
+        assert (policy is not None) is temporary
+        await channel.send_delta(chat_id, "one", stream_id="s1")
+        await channel.send_delta(chat_id, " two", stream_id="s1")
+        await channel.send_delta(chat_id, "", stream_id="s1", stream_end=True)
+        await channel.send_reasoning_delta(chat_id, "plan", stream_id="r1")
+        await channel.send_reasoning_end(chat_id, stream_id="r1")
+        assert append.call_count == (0 if temporary else 2)
+    finally:
+        channel.gateway.temporary_chats.close()
+        await sessions.state.aclose()
 
 
 @pytest.mark.asyncio
@@ -3917,7 +3987,8 @@ async def test_hydrate_noop_without_session_manager() -> None:
 async def test_hydrate_skips_when_no_goal_on_disk() -> None:
     bus = MagicMock()
     sm = MagicMock()
-    sm.read_session_metadata.return_value = None
+    sm.state.read_metadata = AsyncMock()
+    sm.state.read_metadata.return_value = None
     channel = WebSocketChannel(
         {"enabled": True, "allowFrom": ["*"]},
         bus,
@@ -3933,7 +4004,8 @@ async def test_hydrate_skips_when_no_goal_on_disk() -> None:
 async def test_hydrate_notifies_when_goal_active_on_disk() -> None:
     bus = MagicMock()
     sm = MagicMock()
-    sm.read_session_metadata.return_value = {
+    sm.state.read_metadata = AsyncMock()
+    sm.state.read_metadata.return_value = {
         "metadata": {
             "goal_state": {
                 "status": "active",
@@ -3964,7 +4036,8 @@ async def test_hydrate_notifies_when_goal_active_on_disk() -> None:
 async def test_hydrate_restores_blocked_attention_on_disk() -> None:
     bus = MagicMock()
     sm = MagicMock()
-    sm.read_session_metadata.return_value = {
+    sm.state.read_metadata = AsyncMock()
+    sm.state.read_metadata.return_value = {
         "metadata": {
             "goal_state": {
                 "status": "blocked",
@@ -4105,17 +4178,14 @@ async def test_stop_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_client_receives_ready_and_agent_sees_inbound(bus: MagicMock) -> None:
-    port = 29876
+async def test_end_to_end_client_receives_ready_and_agent_sees_inbound(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
 
-    server_task = asyncio.create_task(channel.start())
+    port, server_task = await start_listener(channel)
 
     try:
-        client = await asyncio.wait_for(
-            _connect_when_ready(f"ws://127.0.0.1:{port}/ws?client_id=tester"),
-            timeout=5,
-        )
+        client = await websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=tester")
         async with client:
             ready_raw = await client.recv()
             ready = json.loads(ready_raw)
@@ -4144,12 +4214,11 @@ async def test_end_to_end_client_receives_ready_and_agent_sees_inbound(bus: Magi
 
 
 @pytest.mark.asyncio
-async def test_token_rejects_handshake_when_mismatch(bus: MagicMock) -> None:
-    port = 29877
+async def test_token_rejects_handshake_when_mismatch(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port, path="/", token="secret")
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         with pytest.raises(websockets.exceptions.InvalidStatus) as excinfo:
@@ -4162,12 +4231,11 @@ async def test_token_rejects_handshake_when_mismatch(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_wrong_path_returns_404(bus: MagicMock) -> None:
-    port = 29878
+async def test_wrong_path_returns_404(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         with pytest.raises(websockets.exceptions.InvalidStatus) as excinfo:
@@ -4187,8 +4255,8 @@ def test_registry_discovers_websocket_channel() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_route_issues_token_then_websocket_requires_it(bus: MagicMock) -> None:
-    port = 29879
+async def test_http_route_issues_token_then_websocket_requires_it(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(
         bus, port=port,
         tokenIssuePath="/auth/token",
@@ -4196,8 +4264,7 @@ async def test_http_route_issues_token_then_websocket_requires_it(bus: MagicMock
         websocketRequiresToken=True,
     )
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         deny = await _http_get(f"http://127.0.0.1:{port}/auth/token")
@@ -4236,8 +4303,9 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
     bus: MagicMock,
     monkeypatch,
     tmp_path,
+    start_listener,
 ) -> None:
-    port = 29891
+    port = 0
     config_path = tmp_path / "config.json"
     config = Config()
     config.agents.defaults.model = "openai/gpt-4o"
@@ -4268,16 +4336,10 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
             "requires_restart": False,
         }
     )
-    monkeypatch.setattr(
-        "nanobot.webui.settings_routes.request_image_generation_reload",
-        image_reload,
-    )
-
-    channel = _ch(bus, port=port)
+    channel = _ch(bus, port=port, image_generation_reload=image_reload)
     channel.gateway.tokens.api_tokens["tok"] = time.monotonic() + 300
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     webui_client = None
     try:
@@ -4650,33 +4712,41 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name", ["openrouter", "SenseNova"])
 async def test_image_settings_hot_reload_without_restart(
-    bus: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    provider_name: str,
+    start_listener,
 ) -> None:
-    port = 29935
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.tools.image_generation import (
+        ImageGenerationTool,
+        reload_image_generation_tool,
+    )
+
+    port = 0
     config_path = tmp_path / "config.json"
-    config = Config()
+    config = Config.model_validate({"providers": {"SenseNova": {
+        "apiKey": "named-image-key", "apiBase": "https://images.test/v1",
+        "extraHeaders": {"X-Connection": "named"},
+    }}})
     config.providers.openrouter.api_key = "image-key"
     save_config(config, config_path)
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
-    image_reload = AsyncMock(
-        return_value={
-            "ok": True,
-            "message": "Image generation settings applied.",
-            "requires_restart": False,
-        }
-    )
-    monkeypatch.setattr(
-        "nanobot.webui.settings_routes.request_image_generation_reload",
-        image_reload,
-    )
+    runtime_bus = MessageBus()
+    provider = MagicMock(aclose=AsyncMock())
+    provider.get_default_model.return_value = "test-model"
+    agent = AgentLoop(bus=runtime_bus, provider=provider, workspace=tmp_path)
 
-    channel = _ch(bus, port=port)
+    async def image_reload() -> dict[str, Any]:
+        return await reload_image_generation_tool(
+            config_path=config_path, workspace=agent.workspace, registry=agent.tools,
+        )
+
+    channel = _ch(runtime_bus, port=port, image_generation_reload=image_reload)
     channel.gateway.tokens.api_tokens["tok"] = time.monotonic() + 300
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
     webui_client = None
     try:
         webui_token = channel.gateway.tokens.issue_token(300, audience="webui")
@@ -4687,47 +4757,71 @@ async def test_image_settings_hot_reload_without_restart(
         response = await _webui_mutate(
             webui_client,
             "settings.image_generation.update",
-            {"enabled": True, "provider": "openrouter", "model": "openai/gpt-image-1"},
+            {
+                "enabled": True, "provider": provider_name, "model": "openai/gpt-image-1",
+                "extra_headers": {"X-Image": "configured"},
+                "extra_body": {"watermark": False},
+            },
         )
 
         assert response.status_code == 200
         assert response.json()["requires_restart"] is False
         assert response.json()["restart_required_sections"] == []
-        image_reload.assert_awaited_once_with(bus)
+        tool = agent.tools.get("generate_image")
+        assert isinstance(tool, ImageGenerationTool)
+        assert tool.config.model == "openai/gpt-image-1"
+        client = tool._provider_client()
+        assert client is not None
+        assert client.api_key == ("image-key" if provider_name == "openrouter" else "named-image-key")
+        assert client.extra_headers["X-Image"] == "configured"
+        if provider_name == "SenseNova":
+            assert client.extra_headers["X-Connection"] == "named"
+        assert client.extra_body == {"watermark": False}
+        assert agent.tools.has("read_file")
+        assert runtime_bus.inbound_size == 0
+
+        disabled = await _webui_mutate(
+            webui_client,
+            "settings.image_generation.update",
+            {"enabled": False},
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["requires_restart"] is False
+        assert not agent.tools.has("generate_image")
     finally:
         if webui_client is not None:
             await webui_client.close()
         await channel.stop()
         await server_task
+        await agent.aclose()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_available", [True, False])
 async def test_image_settings_fall_back_to_restart_when_hot_reload_fails(
     bus: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    runtime_available: bool,
+    start_listener,
 ) -> None:
-    port = 29936
+    port = 0
     config_path = tmp_path / "config.json"
     config = Config()
     config.providers.openrouter.api_key = "image-key"
     save_config(config, config_path)
     monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
-    monkeypatch.setattr(
-        "nanobot.webui.settings_routes.request_image_generation_reload",
-        AsyncMock(
-            return_value={
-                "ok": False,
-                "message": "Image generation hot reload timed out.",
-                "requires_restart": True,
-            }
-        ),
+    image_reload = AsyncMock(
+        return_value={
+            "ok": False,
+            "message": "Image generation hot reload timed out.",
+            "requires_restart": True,
+        }
     )
 
-    channel = _ch(bus, port=port)
+    channel = _ch(bus, port=port, image_generation_reload=image_reload if runtime_available else None)
     channel.gateway.tokens.api_tokens["tok"] = time.monotonic() + 300
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
     webui_client = None
     try:
         webui_token = channel.gateway.tokens.issue_token(300, audience="webui")
@@ -4752,13 +4846,12 @@ async def test_image_settings_fall_back_to_restart_when_hot_reload_fails(
 
 
 @pytest.mark.asyncio
-async def test_commands_api_returns_slash_command_metadata(bus: MagicMock) -> None:
-    port = 29892
+async def test_commands_api_returns_slash_command_metadata(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
     channel.gateway.tokens.api_tokens["tok"] = time.monotonic() + 300
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         denied = await _http_get(f"http://127.0.0.1:{port}/api/commands")
@@ -4786,8 +4879,8 @@ async def test_commands_api_returns_slash_command_metadata(bus: MagicMock) -> No
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_exposes_native_surface(bus: MagicMock) -> None:
-    port = 29893
+async def test_bootstrap_exposes_native_surface(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = WebSocketChannel(
         {
             "enabled": True,
@@ -4806,8 +4899,7 @@ async def test_bootstrap_exposes_native_surface(bus: MagicMock) -> None:
         ),
     )
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         response = await _http_get(
@@ -4913,12 +5005,11 @@ def test_update_provider_settings_ignores_api_type_for_non_openai(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMock) -> None:
-    port = 29880
+async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port, streaming=True)
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=stream-tester") as client:
@@ -4966,12 +5057,11 @@ async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMoc
 
 
 @pytest.mark.asyncio
-async def test_token_issue_rejects_when_at_capacity(bus: MagicMock) -> None:
-    port = 29881
+async def test_token_issue_rejects_when_at_capacity(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port, tokenIssuePath="/auth/token", tokenIssueSecret="s")
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         # Fill issued tokens to capacity
@@ -4994,12 +5084,11 @@ async def test_token_issue_rejects_when_at_capacity(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_allow_from_rejects_unauthorized_client_id(bus: MagicMock) -> None:
-    port = 29882
+async def test_allow_from_rejects_unauthorized_client_id(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port, allowFrom=["alice", "bob"])
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         with pytest.raises(websockets.exceptions.InvalidStatus) as exc_info:
@@ -5234,12 +5323,11 @@ async def test_side_channel_command_does_not_register_queued_turn(
 
 
 @pytest.mark.asyncio
-async def test_client_id_truncation(bus: MagicMock) -> None:
-    port = 29883
+async def test_client_id_truncation(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         long_id = "x" * 200
@@ -5253,12 +5341,11 @@ async def test_client_id_truncation(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_utf8_binary_frame_ignored(bus: MagicMock) -> None:
-    port = 29884
+async def test_non_utf8_binary_frame_ignored(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=bin-test") as client:
@@ -5274,8 +5361,8 @@ async def test_non_utf8_binary_frame_ignored(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_static_token_accepts_issued_token_as_fallback(bus: MagicMock) -> None:
-    port = 29885
+async def test_static_token_accepts_issued_token_as_fallback(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(
         bus, port=port,
         token="static-secret",
@@ -5283,8 +5370,7 @@ async def test_static_token_accepts_issued_token_as_fallback(bus: MagicMock) -> 
         tokenIssueSecret="route-secret",
     )
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         # Get an issued token
@@ -5305,12 +5391,11 @@ async def test_static_token_accepts_issued_token_as_fallback(bus: MagicMock) -> 
 
 
 @pytest.mark.asyncio
-async def test_allow_from_empty_list_denies_all(bus: MagicMock) -> None:
-    port = 29886
+async def test_allow_from_empty_list_denies_all(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port, allowFrom=[])
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         with pytest.raises(websockets.exceptions.InvalidStatus) as exc_info:
@@ -5323,13 +5408,12 @@ async def test_allow_from_empty_list_denies_all(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_websocket_requires_token_without_issue_path(bus: MagicMock) -> None:
+async def test_websocket_requires_token_without_issue_path(bus: MagicMock, start_listener) -> None:
     """When websocket_requires_token is True but no token or issue path configured, all connections are rejected."""
-    port = 29887
+    port = 0
     channel = _ch(bus, port=port, websocketRequiresToken=True)
 
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         # No token at all → 401
@@ -5356,11 +5440,10 @@ async def test_websocket_requires_token_without_issue_path(bus: MagicMock) -> No
 
 
 @pytest.mark.asyncio
-async def test_multiplex_legacy_still_works(bus: MagicMock) -> None:
-    port = 29930
+async def test_multiplex_legacy_still_works(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=legacy") as client:
@@ -5394,11 +5477,10 @@ async def test_multiplex_legacy_still_works(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multiplex_new_chat_roundtrip(bus: MagicMock) -> None:
-    port = 29931
+async def test_multiplex_new_chat_roundtrip(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=mp") as client:
@@ -5530,11 +5612,10 @@ async def test_webui_message_envelope_appends_user_transcript(
 
 
 @pytest.mark.asyncio
-async def test_multiplex_two_chats_isolated(bus: MagicMock) -> None:
-    port = 29932
+async def test_multiplex_two_chats_isolated(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=two") as client:
@@ -5567,11 +5648,10 @@ async def test_multiplex_two_chats_isolated(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multiplex_invalid_frames_return_error(bus: MagicMock) -> None:
-    port = 29933
+async def test_multiplex_invalid_frames_return_error(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=bad") as client:
@@ -5603,11 +5683,10 @@ async def test_multiplex_invalid_frames_return_error(bus: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multiplex_cleanup_on_disconnect(bus: MagicMock) -> None:
-    port = 29934
+async def test_multiplex_cleanup_on_disconnect(bus: MagicMock, start_listener) -> None:
+    port = 0
     channel = _ch(bus, port=port)
-    server_task = asyncio.create_task(channel.start())
-    await asyncio.sleep(0.3)
+    port, server_task = await start_listener(channel)
 
     try:
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws?client_id=dc") as client:
@@ -5669,13 +5748,17 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
             "updated_at": "2026-05-19T10:01:00Z",
         },
     ]
-    monkeypatch.setattr(ws_http_module, "list_webui_sessions", lambda _session_manager: sessions)
+    session_manager.state.query_metadata = AsyncMock(side_effect=lambda project: project([]))
+    monkeypatch.setattr(ws_http_module, "list_webui_sessions", lambda _session_manager, _stored: sessions)
     handle = session_handle_for_name("websocket:chat-1", "luma")
     monkeypatch.setattr(
         ws_http_module,
         "SessionHandleResolver",
         lambda _session_manager: SimpleNamespace(
-            list_all_by_key=lambda: {handle.session_key: handle}
+            handles_from_metadata=MagicMock(return_value={handle.session_key: handle}),
+            alist_all_by_key=AsyncMock(
+                return_value={handle.session_key: handle}
+            )
         ),
     )
     channel = WebSocketChannel(
@@ -6621,15 +6704,12 @@ def test_handle_webui_thread_get_does_not_backfill_hidden_subagent_result(
     ]
 
 
-@pytest.mark.parametrize("headers,allowed", [
-    (None, False),
-    ([], False),
-    ({}, False),
-    ({"Host": "localhost:8765"}, True),
-    ({"Host": "remote.example"}, False),
-    ({"Host": "localhost:8765", "X-Forwarded-For": "203.0.113.8"}, False),
+@pytest.mark.parametrize("headers", [
+    {"Host": "localhost:8765"},
+    {"Host": "remote.example"},
+    {"Host": "localhost:8765", "X-Forwarded-For": "203.0.113.8"},
 ])
-async def test_full_access_requires_local_handshake(bus, tmp_path, headers, allowed):
+async def test_webui_access_mode_can_toggle_back_to_full(bus, tmp_path, headers):
     sessions = SessionManager(tmp_path / "sessions")
     channel = WebSocketChannel(
         {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"},
@@ -6639,17 +6719,62 @@ async def test_full_access_requires_local_handshake(bus, tmp_path, headers, allo
     )
     conn = AsyncMock()
     conn.remote_address = ("127.0.0.1", 50123)
-    conn.request = SimpleNamespace(headers=headers) if headers is not None else None
-    await channel._dispatch_envelope(conn, "client", {
-        "type": "set_workspace_scope",
-        "chat_id": "handshake-scope",
-        "workspace_scope": {"project_path": str(tmp_path), "access_mode": "full"},
-    })
-    result = json.loads(conn.send.await_args.args[0])
-    if allowed:
+    conn.request = SimpleNamespace(headers=headers)
+    for mode in ("full", "restricted", "full"):
+        conn.send.reset_mock()
+        await channel._dispatch_envelope(conn, "client", {
+            "type": "set_workspace_scope",
+            "chat_id": "handshake-scope",
+            "workspace_scope": {"project_path": str(tmp_path), "access_mode": mode},
+        })
+        result = json.loads(conn.send.await_args.args[0])
         assert result["event"] == "session_updated"
-        assert result["workspace_scope"]["access_mode"] == "full"
-    else:
-        assert result["event"] == "error"
-        assert result["reason"] == "full workspace access is unavailable for this connection"
-        assert sessions.read_session_file("websocket:handshake-scope") is None
+        assert result["workspace_scope"]["access_mode"] == mode
+        assert channel.gateway.workspaces.scope_for_session_key(
+            "websocket:handshake-scope"
+        ).access_mode == mode
+
+
+@pytest.mark.parametrize("command_type", ["new_chat", "attach", "set_workspace_scope", "message"])
+async def test_webui_commands_keep_session_io_off_event_loop(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_type: str,
+) -> None:
+    import threading
+
+    sessions = SessionManager(tmp_path / "sessions")
+    sessions.save(sessions.get_or_create("websocket:io-chat"))
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"},
+        bus,
+        gateway=_basic_handler(bus, session_manager=sessions, workspace_path=tmp_path),
+    )
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+    loop_thread = threading.get_ident()
+    calls: list[str] = []
+
+    def require_worker(name):
+        operation = getattr(sessions._store, name)
+
+        def checked(*args, **kwargs):
+            assert threading.get_ident() != loop_thread, name
+            calls.append(name)
+            return operation(*args, **kwargs)
+
+        return checked
+
+    for name in ("read_metadata", "load", "save", "replace_metadata"):
+        monkeypatch.setattr(sessions._store, name, require_worker(name))
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {"type": command_type, "chat_id": "io-chat", "content": "/help", "webui": True},
+    )
+
+    assert "read_metadata" in calls
+    if command_type in {"set_workspace_scope", "message"}:
+        assert "load" in calls
+        assert "save" in calls or "replace_metadata" in calls
+    assert all(json.loads(call.args[0])["event"] != "error" for call in conn.send.await_args_list)
+    await channel._cleanup_connection(conn)

@@ -1,10 +1,8 @@
-import { useState } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ChatList } from "@/components/ChatList";
-import { RenameChatDialog } from "@/components/RenameChatDialog";
 import type { ChatSummary } from "@/lib/types";
 import { mockBrowserFocus } from "./browser-focus";
 
@@ -15,7 +13,6 @@ const topic: ChatSummary = {
 };
 
 function SidebarFocusCase() {
-  const [rename, setRename] = useState<string | null>(null);
   return <>
     <ChatList
       sessions={[topic, {
@@ -43,13 +40,11 @@ function SidebarFocusCase() {
       onTogglePin={vi.fn()}
       onToggleArchive={vi.fn()}
       onAttachPane={vi.fn()}
-      onRequestRename={(_key, title) => setRename(title)}
-      onRequestRenameTab={(_key, title) => setRename(title)}
-      onRequestRenameProject={(_key, title) => setRename(title)}
+      onRequestRename={vi.fn().mockResolvedValue(undefined)}
+      onRequestRenameTab={vi.fn()}
+      onRequestRenameProject={vi.fn()}
     />
     <button>Outside destination</button>
-    <RenameChatDialog open={rename !== null} title={rename ?? ""}
-      onCancel={() => setRename(null)} onConfirm={() => setRename(null)} />
   </>;
 }
 
@@ -94,7 +89,10 @@ describe("sidebar action focus", () => {
     await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
     await waitFor(() => expect(input).toHaveFocus());
     await user.keyboard("Updated");
-    expect(input).toHaveValue("ReviewUpdated");
+    expect(input).toHaveValue("Updated");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("button", { name: "Review", exact: true })).toHaveFocus();
   });
 
   it("keeps an outside click focused on its destination", async () => {

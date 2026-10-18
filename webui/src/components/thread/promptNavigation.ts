@@ -7,6 +7,7 @@ export interface PromptAnchor {
   preview: string;
   createdAt: number;
   index: number;
+  cursor?: string;
 }
 
 export function userPromptAnchors(messages: UIMessage[]): PromptAnchor[] {
