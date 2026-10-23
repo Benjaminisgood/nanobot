@@ -1,9 +1,10 @@
-"""TAP registration scaffold. No science checks and no guessed CLI flags.
+"""TAP registration. No science checks and no guessed CLI flags.
 
 ``register_contract``, ``register_executor``, and ``set_red_line_hook`` forward
-to the kernel. Boss-flow commands stay in ``pending`` until
-``taptap --describe-json`` supplies flag and positional names. Red-line ids
-are opaque strings; this module does not interpret them.
+to the kernel. Boss-flow commands stay in ``pending`` until a
+``taptap --describe-json`` document supplies flag and positional names.
+Red-line ids are opaque strings; this module does not interpret them and does
+not install a hook unless the caller passes one.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ class PendingCli:
     red_line_ids: tuple[str, ...]
     describe_json_todo: str
     also: tuple[tuple[str, str], ...] = ()
+    catalog_source: str | None = None
 
 
 class TapAdapter:
@@ -43,6 +45,7 @@ class TapAdapter:
     def __init__(self, runtime: CommandOpRuntime) -> None:
         self._runtime = runtime
         self._registered: list[str] = []
+        self._described: set[str] = set()
 
     def register_contract(
         self,
@@ -51,10 +54,31 @@ class TapAdapter:
     ) -> None:
         """Register a contract the caller fully specified. Flags are not invented here."""
         self._runtime.register_contract(contract, executor)
-        self._registered.append(contract.ref)
+        if contract.ref not in self._registered:
+            self._registered.append(contract.ref)
 
     def register_executor(self, contract_ref: str, executor: CommandExecutor) -> None:
         self._runtime.register_executor(contract_ref, executor)
+
+    def load_describe_document(
+        self,
+        document: object,
+        executor: CommandExecutor,
+    ) -> tuple[str, ...]:
+        """Register contracts from a describe-json document and bind ``executor``.
+
+        Flag names come from the document. This does not call ``set_red_line_hook``.
+        """
+        from nanobot.agent.command_op.describe import parse_describe_document
+
+        contracts = parse_describe_document(document)
+        refs: list[str] = []
+        for contract in contracts:
+            self.register_contract(contract)
+            self.register_executor(contract.ref, executor)
+            self._described.add(contract.ref)
+            refs.append(contract.ref)
+        return tuple(refs)
 
     def set_red_line_hook(self, hook: RedLineHook) -> None:
         """Install an adapter hook. Returned strings become ``need_input`` errors.
@@ -65,8 +89,10 @@ class TapAdapter:
         self._runtime.set_red_line_hook(hook)
 
     def pending(self, template: str) -> tuple[PendingCli, ...]:
-        return tuple(
-            PendingCli(
+        rows: list[PendingCli] = []
+        for spec in template_specs(template):
+            described = f"{spec.app}/{spec.command}" in self._described
+            rows.append(PendingCli(
                 template=template,
                 step_id=spec.step_id,
                 name=spec.name,
@@ -74,11 +100,11 @@ class TapAdapter:
                 app=spec.app,
                 command=spec.command,
                 red_line_ids=spec.red_line_ids,
-                describe_json_todo=DESCRIBE_JSON_TODO,
+                describe_json_todo="" if described else DESCRIBE_JSON_TODO,
                 also=spec.also,
-            )
-            for spec in template_specs(template)
-        )
+                catalog_source="describe-json" if described else None,
+            ))
+        return tuple(rows)
 
     @property
     def registered_refs(self) -> tuple[str, ...]:

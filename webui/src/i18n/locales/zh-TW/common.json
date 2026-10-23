@@ -2350,5 +2350,31 @@
       "cancel": "取消",
       "switchDirectory": "切換目錄"
     }
+  },
+  "commandWorkbench": {
+    "title": "命令",
+    "open": "命令",
+    "loading": "正在載入命令",
+    "live": "目錄來自 taptap --describe-json",
+    "unavailable": "沒有 taptap --describe-json。這些命令繼續等待。",
+    "invalid": "無法讀取 taptap --describe-json。這些命令繼續等待。",
+    "unchecked": "尚未檢查目錄。",
+    "progress": "{{done}} / {{total}}",
+    "current": "目前步驟",
+    "fill": "儲存",
+    "approve": "核准",
+    "cancel": "取消",
+    "approveHint": "只核准這一條命令。",
+    "needsInput": "待填寫",
+    "needsApproval": "待核准",
+    "startQuantitative": "開始定量",
+    "startKinetics": "開始動力學",
+    "exitCode": "結束碼",
+    "noOps": "沒有等待中的命令。",
+    "pending": "等待目錄",
+    "acceptance": "跑完仍需科學驗收。",
+    "log": "日誌",
+    "error": "沒能更新這條命令。",
+    "required": "必填"
   }
 }

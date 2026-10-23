@@ -2350,5 +2350,31 @@
       "cancel": "Annuler",
       "switchDirectory": "Changer de dossier"
     }
+  },
+  "commandWorkbench": {
+    "title": "Commandes",
+    "open": "Commandes",
+    "loading": "Chargement des commandes",
+    "live": "Catalogue issu de taptap --describe-json",
+    "unavailable": "taptap --describe-json est indisponible. Ces commandes restent en attente.",
+    "invalid": "taptap --describe-json est illisible. Ces commandes restent en attente.",
+    "unchecked": "Catalogue non vérifié.",
+    "progress": "{{done}} sur {{total}}",
+    "current": "Étape en cours",
+    "fill": "Enregistrer",
+    "approve": "Approuver",
+    "cancel": "Annuler",
+    "approveHint": "Approuve cette commande exacte.",
+    "needsInput": "Saisie requise",
+    "needsApproval": "Approbation requise",
+    "startQuantitative": "Démarrer le quantitatif",
+    "startKinetics": "Démarrer la cinétique",
+    "exitCode": "Code de sortie",
+    "noOps": "Aucune commande en attente.",
+    "pending": "En attente d’un catalogue",
+    "acceptance": "Une exécution terminée attend encore l’acceptation scientifique.",
+    "log": "Journal",
+    "error": "Impossible de mettre à jour la commande.",
+    "required": "Obligatoire"
   }
 }

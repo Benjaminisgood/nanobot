@@ -53,6 +53,7 @@ import type {
   WebuiThreadTraceDetailPayload,
   WorkspaceScopePayload,
 } from "./types";
+import { isCommandOpsSnapshot, type CommandOpsSnapshot } from "./command-ops";
 import { fetchWithTimeout } from "./http";
 import { isSubagentTask } from "./subagent-tasks";
 
@@ -1430,6 +1431,22 @@ export async function updateRuntimeConfigSettings(
   values: Record<string, import("@/lib/types").RuntimeConfigValue>,
 ): Promise<SettingsPayload> {
   return mutation<SettingsPayload>(transport, "settings.runtime_config.update", { values });
+}
+
+export async function fetchCommandOps(token: string): Promise<CommandOpsSnapshot> {
+  const payload = await request<unknown>("/api/webui/command-ops", token, { cache: "no-store" });
+  if (!isCommandOpsSnapshot(payload)) throw new Error("Invalid command ops response");
+  return payload;
+}
+
+export async function mutateCommandOp(
+  transport: WebUIMutationTransport,
+  action: "fill" | "approve" | "cancel" | "start_run",
+  payload: Record<string, unknown>,
+): Promise<CommandOpsSnapshot> {
+  const result = await mutation<unknown>(transport, `command_op.${action}`, payload);
+  if (!isCommandOpsSnapshot(result)) throw new Error("Invalid command ops response");
+  return result;
 }
 
 export function starPromptAction(

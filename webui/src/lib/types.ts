@@ -1602,6 +1602,28 @@ export type InboundEvent =
       goal_state: GoalStateWsPayload;
     }
   | {
+      event: "command_op";
+      name: string;
+      op_id: string;
+      status: string;
+      blocked_reason: string | null;
+      contract_ref: string;
+      argv_sha256: string | null;
+      parent_run_id: string | null;
+      step_id: string | null;
+    }
+  | {
+      event: "template_run";
+      name: string;
+      run_id: string;
+      template: string;
+      done: number;
+      total: number;
+      current_step: string | null;
+      status: string;
+      accepted: boolean;
+    }
+  | {
       event: "session_updated";
       chat_id: string;
       scope?: "metadata" | "thread" | string;
