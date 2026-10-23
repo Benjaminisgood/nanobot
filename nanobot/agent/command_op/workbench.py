@@ -57,6 +57,8 @@ class CommandWorkbench:
         """Form state a UI needs beside the CommandOp event stream."""
         op = self._runtime.get(op_id)
         snapshot = op.argv_snapshot
+        run = op.run
+        contract = self._runtime.contract_for(op.contract_ref)
         return {
             "op_id": op.op_id,
             "contract_ref": op.contract_ref,
@@ -68,6 +70,24 @@ class CommandWorkbench:
             "parent_run_id": op.parent_run_id,
             "step_id": op.step_id,
             "actions": self.actions(op),
+            "fields": [] if contract is None else [
+                {
+                    "name": param.name,
+                    "type": param.type,
+                    "required": param.required,
+                    "enum": None if param.enum is None else list(param.enum),
+                    "flag": param.flag,
+                    "positional": param.positional,
+                }
+                for param in contract.params
+            ],
+            "run": None if run is None else {
+                "exit_code": run.exit_code,
+                "log_uri": run.log_uri,
+                "started_at": run.started_at,
+                "ended_at": run.ended_at,
+            },
+            "artifacts": [{"path": item.path, "sha": item.sha} for item in op.artifacts],
         }
 
     def run_view(self, run_id: str) -> dict[str, Any]:

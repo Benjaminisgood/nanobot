@@ -2350,5 +2350,31 @@
       "cancel": "Hủy",
       "switchDirectory": "Đổi thư mục"
     }
+  },
+  "commandWorkbench": {
+    "title": "Lệnh",
+    "open": "Lệnh",
+    "loading": "Đang tải lệnh",
+    "live": "Danh mục từ taptap --describe-json",
+    "unavailable": "Không có taptap --describe-json. Các lệnh này vẫn chờ.",
+    "invalid": "Không đọc được taptap --describe-json. Các lệnh này vẫn chờ.",
+    "unchecked": "Chưa kiểm tra danh mục.",
+    "progress": "{{done}} / {{total}}",
+    "current": "Bước hiện tại",
+    "fill": "Lưu",
+    "approve": "Duyệt",
+    "cancel": "Hủy",
+    "approveHint": "Chỉ duyệt đúng lệnh này.",
+    "needsInput": "Cần điền",
+    "needsApproval": "Cần duyệt",
+    "startQuantitative": "Bắt đầu định lượng",
+    "startKinetics": "Bắt đầu động học",
+    "exitCode": "Mã thoát",
+    "noOps": "Không có lệnh nào đang chờ.",
+    "pending": "Đang chờ danh mục",
+    "acceptance": "Chạy xong vẫn cần nghiệm thu khoa học.",
+    "log": "Nhật ký",
+    "error": "Không cập nhật được lệnh.",
+    "required": "Bắt buộc"
   }
 }

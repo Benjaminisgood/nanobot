@@ -27,6 +27,7 @@ import { activateReloadCache, clearReloadCache } from "@/lib/reload-cache";
 import { webuiThreadCache } from "@/lib/webui-thread-cache";
 import { ThreadVisibilityContext } from "@/hooks/useThreadVisibility";
 import type { SettingsExitGuard } from "@/components/settings/contracts";
+import { CommandWorkbenchHost } from "@/components/command-workbench/CommandWorkbench";
 import { PaneWorkbench } from "@/components/workbench/PaneWorkbench";
 import {
   MAX_WORKBENCH_PANES,
@@ -3194,6 +3195,7 @@ function Shell({
             </div>
           </div>
         ) : null}
+        <CommandWorkbenchHost />
         <PairingCodePopup
           requests={visiblePairingRequests}
           total={visiblePairingRequests.length}

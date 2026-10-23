@@ -2350,5 +2350,31 @@
       "cancel": "キャンセル",
       "switchDirectory": "ディレクトリ切り替え"
     }
+  },
+  "commandWorkbench": {
+    "title": "コマンド",
+    "open": "コマンド",
+    "loading": "コマンドを読み込み中",
+    "live": "カタログは taptap --describe-json から",
+    "unavailable": "taptap --describe-json がありません。コマンドは保留のままです。",
+    "invalid": "taptap --describe-json を読めません。コマンドは保留のままです。",
+    "unchecked": "カタログは未確認です。",
+    "progress": "{{done}} / {{total}}",
+    "current": "現在の手順",
+    "fill": "保存",
+    "approve": "承認",
+    "cancel": "キャンセル",
+    "approveHint": "このコマンドだけを承認します。",
+    "needsInput": "入力待ち",
+    "needsApproval": "承認待ち",
+    "startQuantitative": "定量を開始",
+    "startKinetics": "速度論を開始",
+    "exitCode": "終了コード",
+    "noOps": "待っているコマンドはありません。",
+    "pending": "カタログ待ち",
+    "acceptance": "実行後も科学的な確認が必要です。",
+    "log": "ログ",
+    "error": "コマンドを更新できませんでした。",
+    "required": "必須"
   }
 }

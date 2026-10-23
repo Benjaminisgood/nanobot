@@ -2,7 +2,7 @@
 
 import asyncio
 import signal
-from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import replace
 from functools import partial
@@ -749,6 +749,11 @@ def _run_gateway(
         agent.context.skills.disabled_skills = set(disabled_skills)
         agent.subagents.disabled_skills = set(disabled_skills)
 
+    async def _webui_command_ops(action: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        from nanobot.webui.command_ops_api import dispatch_command_ops
+
+        return await dispatch_command_ops(agent, action, payload)
+
     async def _webui_image_generation_reload() -> dict[str, Any]:
         return await reload_image_generation_tool(
             config_path=Path(config_path),
@@ -778,6 +783,7 @@ def _run_gateway(
         webui_recovery_action=recovery.handle_action,
         webui_subagent_manager=agent.subagents,
         webui_discard_session=agent.discard_session,
+        webui_command_ops_action=_webui_command_ops,
         config_path=Path(config_path),
     )
 

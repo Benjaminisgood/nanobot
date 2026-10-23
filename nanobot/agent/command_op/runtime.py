@@ -104,6 +104,11 @@ class CommandOpStore:
             raise CommandOpError(f"corrupt command op {op_id}") from exc
         return command_op_from_dict(data)
 
+    def ids(self) -> list[str]:
+        if not self.root.is_dir():
+            return []
+        return sorted(path.stem for path in self.root.glob("*.json") if path.is_file())
+
 
 class CommandOpRuntime:
     """Authoritative CommandOp state for one workspace."""
@@ -125,6 +130,8 @@ class CommandOpRuntime:
         self._contracts: dict[str, CommandContract] = {}
         self._executors: dict[str, CommandExecutor] = {}
         self._red_line_hook: RedLineHook = _no_red_lines
+        self.catalog_status = "unavailable"
+        self.catalog_detail = "taptap --describe-json has not been checked"
         self._lock = asyncio.Lock()
         self._inflight: dict[str, asyncio.Task[CommandOp]] = {}
 
@@ -150,9 +157,29 @@ class CommandOpRuntime:
         """
         self._red_line_hook = hook
 
+    def note_catalog_discovery(self, status: str, detail: str) -> None:
+        """Record whether ``taptap --describe-json`` produced a catalog."""
+        if status not in {"live", "unavailable", "invalid"}:
+            raise CommandOpError(f"unknown catalog status {status}")
+        self.catalog_status = status
+        self.catalog_detail = detail
+
+    def list_ops(self) -> list[CommandOp]:
+        return [self.store.get(op_id) for op_id in self.store.ids()]
+
+    def list_template_runs(self) -> list[TemplateRun]:
+        return [
+            run
+            for run_id in self.template_runs.ids()
+            if (run := self.template_runs.find(run_id)) is not None
+        ]
+
     def load_builtin_catalog(self) -> None:
         """Register the single demo contract. TAP catalogs are not loaded here."""
         self.register_contract(DEMO_WRITE_NOTE, DemoWriteNoteExecutor())
+
+    def contract_for(self, contract_ref: str) -> CommandContract | None:
+        return self._contracts.get(contract_ref)
 
     def contract(self, app: str, command: str) -> CommandContract:
         ref = f"{app}/{command}"

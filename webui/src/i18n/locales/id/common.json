@@ -2350,5 +2350,31 @@
       "cancel": "Batal",
       "switchDirectory": "Ganti direktori"
     }
+  },
+  "commandWorkbench": {
+    "title": "Perintah",
+    "open": "Perintah",
+    "loading": "Memuat perintah",
+    "live": "Katalog dari taptap --describe-json",
+    "unavailable": "taptap --describe-json tidak tersedia. Perintah ini tetap menunggu.",
+    "invalid": "taptap --describe-json tidak dapat dibaca. Perintah ini tetap menunggu.",
+    "unchecked": "Katalog belum diperiksa.",
+    "progress": "{{done}} dari {{total}}",
+    "current": "Langkah saat ini",
+    "fill": "Simpan",
+    "approve": "Setujui",
+    "cancel": "Batalkan",
+    "approveHint": "Menyetujui perintah yang persis ini.",
+    "needsInput": "Perlu diisi",
+    "needsApproval": "Perlu persetujuan",
+    "startQuantitative": "Mulai kuantitatif",
+    "startKinetics": "Mulai kinetika",
+    "exitCode": "Kode keluar",
+    "noOps": "Tidak ada perintah yang menunggu.",
+    "pending": "Menunggu katalog",
+    "acceptance": "Proses yang selesai tetap perlu penerimaan ilmiah.",
+    "log": "Log",
+    "error": "Perintah tidak dapat diperbarui.",
+    "required": "Wajib"
   }
 }

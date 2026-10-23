@@ -12,7 +12,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, Callable, Self, TypeGuard, cast
 from urllib.parse import urlsplit, urlunsplit
 from weakref import WeakSet
 
@@ -406,6 +406,9 @@ class WebSocketChannel(BaseChannel):
 
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
         self._reasoning_text_buffers: dict[tuple[str, str], list[str]] = {}
+        self._command_event_unsub: Callable[[], None] | None = None
+        self._template_event_unsub: Callable[[], None] | None = None
+        self._command_broadcasts: set[asyncio.Task[None]] = set()
 
     # -- Subscription bookkeeping -------------------------------------------
 
@@ -679,7 +682,48 @@ class WebSocketChannel(BaseChannel):
                 ),
             )
 
+    def _watch_command_events(self) -> None:
+        """Fan CommandOp and TemplateRun events out without waiting on the socket."""
+        if self._command_event_unsub is not None:
+            return
+        from nanobot.agent.command_op.events import CommandOpEvent, TemplateRunEvent
+        from nanobot.webui.command_ops_api import command_op_wire, template_run_wire
+
+        def on_op(event: CommandOpEvent) -> None:
+            self._schedule_command_broadcast(command_op_wire(event))
+
+        def on_run(event: TemplateRunEvent) -> None:
+            self._schedule_command_broadcast(template_run_wire(event))
+
+        self._command_event_unsub = self.bus.subscribe(on_op, CommandOpEvent)
+        self._template_event_unsub = self.bus.subscribe(on_run, TemplateRunEvent)
+
+    def _unwatch_command_events(self) -> None:
+        if self._command_event_unsub is not None:
+            self._command_event_unsub()
+            self._command_event_unsub = None
+        if self._template_event_unsub is not None:
+            self._template_event_unsub()
+            self._template_event_unsub = None
+        for task in list(self._command_broadcasts):
+            task.cancel()
+
+    def _schedule_command_broadcast(self, body: dict[str, Any]) -> None:
+        task = asyncio.create_task(self._broadcast_command_event(body))
+        self._command_broadcasts.add(task)
+        task.add_done_callback(self._command_broadcasts.discard)
+
+    async def _broadcast_command_event(self, body: dict[str, Any]) -> None:
+        connections = list(self._conn_chats)
+        if not connections:
+            return
+        raw = json.dumps(body, ensure_ascii=False)
+        label = f" {body.get('event', 'command')} "
+        for connection in connections:
+            await self._safe_send_to(connection, raw, label=label)
+
     async def start(self) -> None:
+        self._watch_command_events()
         self.gateway.http.remote_instances.resume()
         from nanobot.utils.logging_bridge import redirect_lib_logging
 
@@ -905,6 +949,7 @@ class WebSocketChannel(BaseChannel):
     # -- Outbound WebSocket events -----------------------------------------
 
     async def stop(self) -> None:
+        self._unwatch_command_events()
         await self.gateway.http.remote_instances.close()
         server_task = self._server_task
         if (

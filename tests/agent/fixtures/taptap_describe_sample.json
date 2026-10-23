@@ -1,0 +1,49 @@
+{
+  "schema": "taptap.describe/v1",
+  "note": "Sample document for the loader. Not a live taptap --describe-json export. Flag and positional names exist only in this file.",
+  "executable": ["taptap"],
+  "commands": [
+    {
+      "app": "project_config",
+      "command": "init_tap",
+      "side_effects": "writes_new",
+      "params": [
+        {"name": "output", "type": "path", "required": true, "flag": "--output"}
+      ]
+    },
+    {
+      "app": "wyx_inspect",
+      "command": "wyx_summary",
+      "side_effects": "read_only",
+      "params": [
+        {"name": "measurement_dir", "type": "path", "required": true, "positional": 0}
+      ]
+    },
+    {
+      "app": "wyx_tables",
+      "command": "experiment_summary",
+      "side_effects": "read_only",
+      "params": [
+        {"name": "measurement_dir", "type": "path", "required": true, "positional": 0}
+      ]
+    },
+    {
+      "app": "process_pulse_sizes",
+      "command": "pulse_size",
+      "side_effects": "writes_new",
+      "red_line_ids": ["no_overwrite_wyx", "pressure_unit_match_header"],
+      "params": [
+        {"name": "measurement_dir", "type": "path", "required": true, "positional": 0},
+        {"name": "config", "type": "path", "required": true, "flag": "--config"},
+        {"name": "output_dir", "type": "path", "required": true, "flag": "--output"},
+        {
+          "name": "pressure_unit",
+          "type": "string",
+          "required": true,
+          "flag": "--pressure-unit",
+          "enum": ["bar", "mbar"]
+        }
+      ]
+    }
+  ]
+}

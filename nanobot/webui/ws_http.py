@@ -26,6 +26,7 @@ from websockets.datastructures import Headers
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
+from nanobot.agent.command_op.models import CommandOpError
 from nanobot.agent.subagent import SubagentControlError
 from nanobot.agent.subagent_status import SubagentSessionError
 from nanobot.command.builtin import builtin_command_palette
@@ -198,6 +199,10 @@ _WEBUI_MUTATION_PATHS = {
     "recovery.continue": "/api/webui/recovery/continue",
     "recovery.dismiss": "/api/webui/recovery/dismiss",
     "subagent.cancel": "/api/webui/subagents/cancel",
+    "command_op.fill": "/api/webui/command-ops/fill",
+    "command_op.approve": "/api/webui/command-ops/approve",
+    "command_op.cancel": "/api/webui/command-ops/cancel",
+    "command_op.start_run": "/api/webui/command-ops/start-run",
     "settings.agent.update": "/api/settings/update",
     "settings.model_configuration.create": "/api/settings/model-configurations/create",
     "settings.model_configuration.update": "/api/settings/model-configurations/update",
@@ -384,6 +389,9 @@ class GatewayHTTPHandler:
         ) = None,
         subagent_manager: SubagentManager | None = None,
         discard_session: Callable[[str], Awaitable[None]] | None = None,
+        command_ops_action: (
+            Callable[[str, Mapping[str, Any]], Awaitable[dict[str, Any]]] | None
+        ) = None,
         log: Any = logger,
     ) -> None:
         self.config = config
@@ -409,6 +417,7 @@ class GatewayHTTPHandler:
         self.recovery_action = recovery_action
         self.subagent_manager = subagent_manager
         self.discard_session = discard_session
+        self.command_ops_action = command_ops_action
         self._skill_install_lock = asyncio.Lock()
         self.cron_service = cron_service
         self.local_trigger_store = local_trigger_store
@@ -522,6 +531,13 @@ class GatewayHTTPHandler:
         if re.match(r"^/api/webui/automations/(enable|disable|delete|run|update|change-chat)$", path):
             return True
         if path in {"/api/webui/recovery/continue", "/api/webui/recovery/dismiss"}:
+            return True
+        if path in {
+            "/api/webui/command-ops/fill",
+            "/api/webui/command-ops/approve",
+            "/api/webui/command-ops/cancel",
+            "/api/webui/command-ops/start-run",
+        }:
             return True
         return path in {
             "/api/webui/skills/install",
@@ -1719,7 +1735,47 @@ class GatewayHTTPHandler:
             return self._handle_webui_sidebar_state(request)
         if got == "/api/webui/sidebar-state/update":
             return self._handle_webui_sidebar_state_update(request)
+        if got == "/api/webui/command-ops":
+            return await self._handle_command_ops_read(request)
+        if got in {
+            "/api/webui/command-ops/fill",
+            "/api/webui/command-ops/approve",
+            "/api/webui/command-ops/cancel",
+            "/api/webui/command-ops/start-run",
+        }:
+            action = {
+                "/api/webui/command-ops/fill": "fill",
+                "/api/webui/command-ops/approve": "approve",
+                "/api/webui/command-ops/cancel": "cancel",
+                "/api/webui/command-ops/start-run": "start_run",
+            }[got]
+            return await self._handle_command_ops_mutation(request, action)
         return None
+
+    async def _handle_command_ops_read(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.command_ops_action is None:
+            return _http_error(404, "command ops are unavailable")
+        try:
+            payload = await self.command_ops_action("snapshot", {})
+        except CommandOpError as exc:
+            return _http_error(400, exc.message)
+        return _http_json_response(payload)
+
+    async def _handle_command_ops_mutation(self, request: WsRequest, action: str) -> Response:
+        if not getattr(request, _WEBUI_MUTATION_REQUEST_ATTR, False):
+            return _http_error(405, "WebUI command actions require an authenticated WebSocket")
+        if self.command_ops_action is None:
+            return _http_error(404, "command ops are unavailable")
+        payload = _mutation_payload(request)
+        if payload is None:
+            return _http_error(400, "invalid command op payload")
+        try:
+            result = await self.command_ops_action(action, payload)
+        except CommandOpError as exc:
+            return _http_error(400, exc.message)
+        return _http_json_response(result)
 
     def _handle_commands(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):

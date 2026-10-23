@@ -500,6 +500,11 @@ class TemplateRunStore:
             raise CommandOpError(f"corrupt template run {run_id}") from exc
         return template_run_from_dict(data)
 
+    def ids(self) -> list[str]:
+        if not self.root.is_dir():
+            return []
+        return sorted(path.stem for path in self.root.glob("*.json") if path.is_file())
+
 
 def _run_step(spec: StepSpec) -> RunStep:
     return RunStep(

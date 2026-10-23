@@ -683,11 +683,30 @@ class AgentLoop:
         a CLI invocation as a CommandOp. ``op.approved`` schedules execution on
         a background task so the turn is not blocked and no chat message is
         synthesized for pending fill, approval, run, or completion.
+
+        A live ``taptap --describe-json`` catalog is registered when the CLI
+        answers with the describe schema. A missing or unreadable CLI leaves
+        boss-flow commands pending and does not invent flags.
         """
+        from nanobot.agent.command_op.describe import (
+            CatalogDiscovery,
+            discover_taptap_catalog,
+            install_live_catalog,
+        )
+        from nanobot.agent.command_op.models import CommandOpError
+        from nanobot.agent.command_op.tap_adapter import TapAdapter
         from nanobot.agent.tools.command_op import register_command_op_tools
 
         self.command_ops = CommandOpRuntime(workspace=self.workspace, bus=self.bus)
         self.command_ops.load_builtin_catalog()
+        self.tap_adapter = TapAdapter(self.command_ops)
+        discovery = discover_taptap_catalog()
+        if discovery.status == "live":
+            try:
+                install_live_catalog(self.tap_adapter, self.workspace, discovery)
+            except CommandOpError as exc:
+                discovery = CatalogDiscovery(status="invalid", detail=exc.message)
+        self.command_ops.note_catalog_discovery(discovery.status, discovery.detail)
         names = register_command_op_tools(self.tools, self.command_ops)
         self.bus.subscribe(self._on_command_op_approved, CommandOpEvent)
         return names

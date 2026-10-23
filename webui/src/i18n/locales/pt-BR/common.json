@@ -2364,5 +2364,31 @@
       "cancel": "Cancelar",
       "switchDirectory": "Trocar diretório"
     }
+  },
+  "commandWorkbench": {
+    "title": "Comandos",
+    "open": "Comandos",
+    "loading": "Carregando comandos",
+    "live": "Catálogo de taptap --describe-json",
+    "unavailable": "taptap --describe-json não está disponível. Estes comandos continuam pendentes.",
+    "invalid": "Não foi possível ler taptap --describe-json. Estes comandos continuam pendentes.",
+    "unchecked": "Catálogo ainda não verificado.",
+    "progress": "{{done}} de {{total}}",
+    "current": "Etapa atual",
+    "fill": "Salvar",
+    "approve": "Aprovar",
+    "cancel": "Cancelar",
+    "approveHint": "Aprova este comando exato.",
+    "needsInput": "Falta preencher",
+    "needsApproval": "Aguardando aprovação",
+    "startQuantitative": "Iniciar quantitativo",
+    "startKinetics": "Iniciar cinética",
+    "exitCode": "Código de saída",
+    "noOps": "Nenhum comando está aguardando.",
+    "pending": "Aguardando um catálogo",
+    "acceptance": "Uma execução concluída ainda precisa de aceitação científica.",
+    "log": "Registro",
+    "error": "Não foi possível atualizar o comando.",
+    "required": "Obrigatório"
   }
 }

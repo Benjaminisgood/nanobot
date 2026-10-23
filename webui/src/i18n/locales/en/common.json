@@ -2550,5 +2550,31 @@
       "cancel": "Cancel",
       "switchDirectory": "Switch directory"
     }
+  },
+  "commandWorkbench": {
+    "title": "Commands",
+    "open": "Commands",
+    "loading": "Loading commands",
+    "live": "Catalog from taptap --describe-json",
+    "unavailable": "taptap --describe-json is not available. These commands stay pending.",
+    "invalid": "taptap --describe-json could not be read. These commands stay pending.",
+    "unchecked": "Catalog has not been checked.",
+    "progress": "{{done}} of {{total}}",
+    "current": "Current step",
+    "fill": "Save",
+    "approve": "Approve",
+    "cancel": "Cancel",
+    "approveHint": "Approves this exact command.",
+    "needsInput": "Needs input",
+    "needsApproval": "Needs approval",
+    "startQuantitative": "Start quantitative run",
+    "startKinetics": "Start kinetics run",
+    "exitCode": "Exit code",
+    "noOps": "No command is waiting.",
+    "pending": "Waiting for a catalog",
+    "acceptance": "A finished run still needs scientific acceptance.",
+    "log": "Log",
+    "error": "Could not update the command.",
+    "required": "Required"
   }
 }

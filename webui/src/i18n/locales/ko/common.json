@@ -2350,5 +2350,31 @@
       "cancel": "취소",
       "switchDirectory": "디렉터리 전환"
     }
+  },
+  "commandWorkbench": {
+    "title": "명령",
+    "open": "명령",
+    "loading": "명령을 불러오는 중",
+    "live": "카탈로그는 taptap --describe-json에서 옵니다",
+    "unavailable": "taptap --describe-json이 없습니다. 명령은 대기 상태입니다.",
+    "invalid": "taptap --describe-json을 읽지 못했습니다. 명령은 대기 상태입니다.",
+    "unchecked": "카탈로그를 아직 확인하지 않았습니다.",
+    "progress": "{{done}} / {{total}}",
+    "current": "현재 단계",
+    "fill": "저장",
+    "approve": "승인",
+    "cancel": "취소",
+    "approveHint": "이 명령만 승인합니다.",
+    "needsInput": "입력 필요",
+    "needsApproval": "승인 필요",
+    "startQuantitative": "정량 시작",
+    "startKinetics": "속도론 시작",
+    "exitCode": "종료 코드",
+    "noOps": "대기 중인 명령이 없습니다.",
+    "pending": "카탈로그 대기",
+    "acceptance": "실행이 끝나도 과학적 확인이 필요합니다.",
+    "log": "로그",
+    "error": "명령을 업데이트하지 못했습니다.",
+    "required": "필수"
   }
 }
