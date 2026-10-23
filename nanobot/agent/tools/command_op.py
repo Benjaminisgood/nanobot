@@ -56,7 +56,11 @@ def _failure(exc: CommandOpError) -> ToolResult:
             additional_properties=True,
         ),
         parent_run_id=StringSchema(
-            "Optional parent TemplateRun id. TemplateRun progress is not tracked here.",
+            "Optional parent TemplateRun id. When that run exists, step_id selects its step.",
+            nullable=True,
+        ),
+        step_id=StringSchema(
+            "Boss-flow step id for parent_run_id, such as pulse_size or y_procedure.",
             nullable=True,
         ),
     )
@@ -87,6 +91,7 @@ class ProposeOpTool(Tool):
         command: str,
         params: dict[str, Any],
         parent_run_id: str | None = None,
+        step_id: str | None = None,
     ) -> ToolResult:
         try:
             op, events = await self._runtime.propose(
@@ -94,6 +99,7 @@ class ProposeOpTool(Tool):
                 command=command,
                 params=params,
                 parent_run_id=parent_run_id,
+                step_id=step_id,
             )
         except CommandOpError as exc:
             return _failure(exc)

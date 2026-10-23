@@ -27,6 +27,8 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.command_op.events import CommandOpEvent
 from nanobot.agent.command_op.models import CommandOp
 from nanobot.agent.command_op.runtime import CommandOpRuntime
+from nanobot.agent.command_op.template_run import TemplateRun
+from nanobot.agent.command_op.workbench import CommandWorkbench
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver, TranscriptInput
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.goal_permission import GoalInputScope
@@ -697,8 +699,28 @@ class AgentLoop:
 
     async def approve_command_op(self, op_id: str, *, sha: str, by: str) -> CommandOp:
         """Bind a user approval to the frozen argv sha and wake the executor."""
-        op, _events = await self.command_ops.approve(op_id, sha=sha, by=by)
-        return op
+        return await self.command_workbench().approve(op_id, sha=sha, by=by)
+
+    async def fill_command_op(self, op_id: str, params: object) -> CommandOp:
+        """Replace authoritative params from the workbench and publish CommandOp events."""
+        return await self.command_workbench().fill(op_id, params)
+
+    async def cancel_command_op(self, op_id: str) -> CommandOp:
+        """Cancel an op from the workbench. Publishes ``op.cancelled``."""
+        return await self.command_workbench().cancel(op_id)
+
+    async def start_template_run(
+        self,
+        template: str,
+        *,
+        run_id: str | None = None,
+    ) -> TemplateRun:
+        """Open a parent quantitative or kinetics run for the boss progress bar."""
+        return await self.command_ops.start_template_run(template, run_id=run_id)
+
+    def command_workbench(self) -> CommandWorkbench:
+        """Fill, approve, and cancel hooks for a UI sharing this loop's bus."""
+        return CommandWorkbench(self.command_ops, self.bus)
 
     def register_runtime_context_provider(
         self,
