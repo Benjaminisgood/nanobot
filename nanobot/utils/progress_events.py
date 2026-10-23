@@ -6,6 +6,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
+from nanobot.agent.command_op.events import COMMAND_OP_TOOL_STATUSES
 from nanobot.agent.hook import AgentHookContext
 from nanobot.bus.outbound_events import (
     FileEditEvent,
@@ -121,7 +122,13 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
         result = context.tool_results[idx]
         event = context.tool_events[idx]
         status = event.get("status")
-        phase = "end" if status == "ok" else "error"
+        command_op = isinstance(status, str) and status in COMMAND_OP_TOOL_STATUSES
+        if status == "ok" or status == "done":
+            phase = "end"
+        elif command_op:
+            phase = status
+        else:
+            phase = "error"
         files, embeds = tool_event_result_extras(result)
         payload = {
             "version": 1,
@@ -129,11 +136,13 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
             "call_id": str(getattr(tool_call, "id", "") or ""),
             "name": getattr(tool_call, "name", ""),
             "arguments": _tool_event_arguments(tool_call),
-            "result": result if phase == "end" else None,
+            "result": None if phase == "error" else result,
             "error": None,
             "files": files,
             "embeds": embeds,
         }
+        if command_op:
+            payload["disposition"] = status
         if phase == "error":
             if isinstance(result, str) and result.strip():
                 payload["error"] = result.strip()

@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from loguru import logger
 
+from nanobot.agent.command_op.events import COMMAND_OP_TOOL_STATUSES
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.context import tool_log_content_allowed
 from nanobot.agent.tools.file_state import file_read_context
@@ -213,6 +214,10 @@ async def _execute_tool_call(
         detail = "(empty)"
     elif len(detail) > 120:
         detail = detail[:120] + "..."
+    # CommandOp suspensions are pending fill / approval / run / done, not CLI success.
+    disposition = getattr(result, "command_op_disposition", None)
+    if isinstance(disposition, str) and disposition in COMMAND_OP_TOOL_STATUSES:
+        return result, {"name": tool_call.name, "status": disposition, "detail": detail}
     return result, {"name": tool_call.name, "status": "ok", "detail": detail}
 
 

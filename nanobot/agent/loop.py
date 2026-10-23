@@ -24,6 +24,9 @@ from loguru import logger
 from nanobot.agent import context as agent_context
 from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
+from nanobot.agent.command_op.events import CommandOpEvent
+from nanobot.agent.command_op.models import CommandOp
+from nanobot.agent.command_op.runtime import CommandOpRuntime
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver, TranscriptInput
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.goal_permission import GoalInputScope
@@ -667,8 +670,35 @@ class AgentLoop:
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
+        registered.extend(self._register_command_ops())
 
         logger.info("Registered {} tools: {}", len(registered), registered)
+
+    def _register_command_ops(self) -> list[str]:
+        """Register the CommandOp kernel (draft section 5).
+
+        TapTool and TapRunManager are not in this tree. ``propose_op`` suspends
+        a CLI invocation as a CommandOp. ``op.approved`` schedules execution on
+        a background task so the turn is not blocked and no chat message is
+        synthesized for pending fill, approval, run, or completion.
+        """
+        from nanobot.agent.tools.command_op import register_command_op_tools
+
+        self.command_ops = CommandOpRuntime(workspace=self.workspace, bus=self.bus)
+        self.command_ops.load_builtin_catalog()
+        names = register_command_op_tools(self.tools, self.command_ops)
+        self.bus.subscribe(self._on_command_op_approved, CommandOpEvent)
+        return names
+
+    async def _on_command_op_approved(self, event: CommandOpEvent) -> None:
+        if event.name != "op.approved":
+            return
+        self.schedule_background(self.command_ops.execute(event.op_id))
+
+    async def approve_command_op(self, op_id: str, *, sha: str, by: str) -> CommandOp:
+        """Bind a user approval to the frozen argv sha and wake the executor."""
+        op, _events = await self.command_ops.approve(op_id, sha=sha, by=by)
+        return op
 
     def register_runtime_context_provider(
         self,
