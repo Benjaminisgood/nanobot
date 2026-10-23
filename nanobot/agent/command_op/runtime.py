@@ -1,8 +1,7 @@
-"""Schedule one CommandOp without blocking the agent turn.
+"""Schedule CommandOps and TemplateRun progress without blocking the agent turn.
 
-Integration points (draft section 5). TapTool and TapRunManager are not in
-this tree; a future TAP adapter hangs off the three methods below instead of
-growing a second scheduler:
+TAP science stays out of this scheduler. ``TapAdapter`` forwards the three
+registration hooks and does not invent CLI flags:
 
 * ``register_contract`` — static catalog entry (app, command, params, red-line ids)
 * ``register_executor`` — runs the frozen argv after approval
@@ -25,7 +24,7 @@ from uuid import uuid4
 from loguru import logger
 
 from nanobot.agent.command_op.catalog import DEMO_WRITE_NOTE, DemoWriteNoteExecutor
-from nanobot.agent.command_op.events import CommandOpEvent
+from nanobot.agent.command_op.events import CommandOpEvent, TemplateRunEvent
 from nanobot.agent.command_op.models import (
     CommandContract,
     CommandExecution,
@@ -43,6 +42,15 @@ from nanobot.agent.command_op.models import (
     patch_op,
     propose_op,
     validate_contract,
+)
+from nanobot.agent.command_op.template_run import (
+    TemplateRun,
+    TemplateRunStore,
+    attach_step,
+    new_template_run,
+    note_op_finished,
+    run_phase,
+    template_run_event,
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.utils.helpers import atomic_write_text
@@ -109,7 +117,9 @@ class CommandOpRuntime:
     ) -> None:
         self.workspace = workspace
         self.store = CommandOpStore(workspace / "command_ops")
+        self.template_runs = TemplateRunStore(workspace / "template_runs")
         self.events: list[CommandOpEvent] = []
+        self.run_events: list[TemplateRunEvent] = []
         self._bus = bus
         self.auto_approve_readonly = auto_approve_readonly
         self._contracts: dict[str, CommandContract] = {}
@@ -151,6 +161,27 @@ class CommandOpRuntime:
             raise CommandOpError(f"unknown contract {ref}")
         return found
 
+    async def start_template_run(
+        self,
+        template: str,
+        *,
+        run_id: str | None = None,
+    ) -> TemplateRun:
+        """Open a quantitative or kinetics parent run. Tool templates are deferred."""
+        run = new_template_run(template, run_id=run_id or str(uuid4()))
+        async with self._lock:
+            if self.template_runs.find(run.run_id) is not None:
+                raise CommandOpError(f"template run {run.run_id} already exists")
+            self.template_runs.save(run)
+        await self._emit_run(run)
+        return run
+
+    def get_template_run(self, run_id: str) -> TemplateRun:
+        found = self.template_runs.find(run_id)
+        if found is None:
+            raise CommandOpError(f"unknown template run {run_id}")
+        return found
+
     async def propose(
         self,
         *,
@@ -158,11 +189,14 @@ class CommandOpRuntime:
         command: str,
         params: object = None,
         parent_run_id: str | None = None,
+        step_id: str | None = None,
         op_id: str | None = None,
     ) -> tuple[CommandOp, tuple[CommandOpEvent, ...]]:
         parsed = parse_params(params)
+        run_update: TemplateRun | None = None
         async with self._lock:
             contract = self.contract(app, command)
+            parent = self._parent_for_propose(parent_run_id, step_id)
             op, events = propose_op(
                 contract,
                 parsed,
@@ -171,9 +205,24 @@ class CommandOpRuntime:
                 parent_run_id=parent_run_id,
                 auto_approve_readonly=self.auto_approve_readonly,
                 red_line_errors=self._red_lines(contract, parsed),
+                step_id=step_id if parent is not None else None,
             )
+            if parent is not None:
+                if step_id is None:
+                    raise CommandOpError("template step is required")
+                parent = attach_step(
+                    parent,
+                    step_id,
+                    op.op_id,
+                    existing_status=self._step_op_status(parent, step_id),
+                )
+                run_update = parent
             self.store.save(op)
+            if run_update is not None:
+                self.template_runs.save(run_update)
         await self._emit_all(events)
+        if run_update is not None:
+            await self._emit_run(run_update)
         return op, events
 
     def get(self, op_id: str) -> CommandOp:
@@ -275,6 +324,8 @@ class CommandOpRuntime:
             },
             "validation_errors": list(op.validation_errors),
             "parent_run_id": op.parent_run_id,
+            "step_id": op.step_id,
+            "template_run": self._template_observation(op),
             "side_effects": None if contract is None else contract.side_effects,
             "red_line_ids": [] if contract is None else list(contract.red_line_ids),
             "events": [event.name for event in events],
@@ -296,14 +347,76 @@ class CommandOpRuntime:
         except Exception:
             logger.exception("CommandOp {} executor failed", op_id)
             result = CommandExecution(exit_code=1, log_uri=None)
+        run_update: TemplateRun | None = None
         async with self._lock:
             current = self.store.get(op_id)
             if current.status != OpStatus.RUNNING:
                 return current
             finished, event = finish_run(current, result, now=self._now())
             self.store.save(finished)
+            run_update = self._note_template(finished)
         await self._emit_all((event,))
+        if run_update is not None:
+            await self._emit_run(run_update)
         return finished
+
+    def _parent_for_propose(
+        self,
+        parent_run_id: str | None,
+        step_id: str | None,
+    ) -> TemplateRun | None:
+        if parent_run_id is None:
+            if step_id is not None:
+                raise CommandOpError("step_id requires parent_run_id")
+            return None
+        run = self.template_runs.find(parent_run_id)
+        if run is None:
+            if step_id is not None:
+                raise CommandOpError(f"unknown template run {parent_run_id}")
+            return None
+        if not step_id:
+            raise CommandOpError("template step is required")
+        return run
+
+    def _step_op_status(self, run: TemplateRun, step_id: str) -> OpStatus | None:
+        for step in run.steps:
+            if step.step_id != step_id or step.op_id is None:
+                continue
+            return self.store.get(step.op_id).status
+        return None
+
+    def _note_template(self, op: CommandOp) -> TemplateRun | None:
+        if op.parent_run_id is None or op.step_id is None:
+            return None
+        run = self.template_runs.find(op.parent_run_id)
+        if run is None:
+            return None
+        updated = note_op_finished(run, op)
+        self.template_runs.save(updated)
+        return updated
+
+    def _template_observation(self, op: CommandOp) -> dict[str, object] | None:
+        if not op.parent_run_id:
+            return None
+        run = self.template_runs.find(op.parent_run_id)
+        if run is None:
+            return None
+        progress = run.progress
+        return {
+            "run_id": run.run_id,
+            "template": run.template,
+            "done": progress.done,
+            "total": progress.total,
+            "current_step": progress.current_step,
+            "status": run_phase(run),
+            "accepted": run.accepted,
+        }
+
+    async def _emit_run(self, run: TemplateRun) -> None:
+        event = template_run_event(run)
+        self.run_events.append(event)
+        if self._bus is not None:
+            await self._bus.publish(event)
 
     def _require(self, contract_ref: str) -> CommandContract:
         found = self._contracts.get(contract_ref)

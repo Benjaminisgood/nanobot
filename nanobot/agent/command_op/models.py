@@ -66,6 +66,16 @@ def blocked_reason_for(status: OpStatus) -> str | None:
     return None
 
 
+def can_fill(status: OpStatus) -> bool:
+    """Params stay editable until an executor has started."""
+    return status not in _LOCKED_STATUSES
+
+
+def can_cancel(status: OpStatus) -> bool:
+    """A finished op stays finished. A running op can still be cancelled."""
+    return status not in {OpStatus.SUCCEEDED, OpStatus.FAILED, OpStatus.CANCELLED}
+
+
 def tool_disposition(status: OpStatus) -> str:
     """Map an op status onto a tool event that is neither CLI success nor failure."""
     blocked = blocked_reason_for(status)
@@ -164,6 +174,7 @@ class CommandOp:
     run: CommandRun | None = None
     artifacts: tuple[Artifact, ...] = ()
     parent_run_id: str | None = None
+    step_id: str | None = None
     validation_errors: tuple[str, ...] = ()
 
     @property
@@ -351,12 +362,14 @@ def propose_op(
     parent_run_id: str | None,
     auto_approve_readonly: bool,
     red_line_errors: Sequence[str] = (),
+    step_id: str | None = None,
 ) -> tuple[CommandOp, tuple[CommandOpEvent, ...]]:
     draft = CommandOp(
         op_id=op_id,
         contract_ref=contract.ref,
         status=OpStatus.DRAFT,
         parent_run_id=parent_run_id,
+        step_id=step_id,
     )
     filled = fill_op(draft, contract, params, red_line_errors=red_line_errors)
     if filled.status == OpStatus.NEED_INPUT:
@@ -522,6 +535,7 @@ def command_op_to_dict(op: CommandOp) -> dict[str, Any]:
         },
         "artifacts": [{"path": item.path, "sha": item.sha} for item in op.artifacts],
         "parent_run_id": op.parent_run_id,
+        "step_id": op.step_id,
         "validation_errors": list(op.validation_errors),
     }
 
@@ -543,6 +557,7 @@ def command_op_from_dict(data: object) -> CommandOp:
         run=_parse_run(record.get("run")),
         artifacts=_parse_artifacts(record.get("artifacts")),
         parent_run_id=_optional_str(record.get("parent_run_id"), "parent_run_id"),
+        step_id=_optional_str(record.get("step_id"), "step_id"),
         validation_errors=_string_tuple(record.get("validation_errors"), "validation_errors"),
     )
 
@@ -589,6 +604,8 @@ def _event(op: CommandOp, name: CommandOpEventName) -> CommandOpEvent:
         blocked_reason=op.blocked_reason,
         contract_ref=op.contract_ref,
         argv_sha256=None if snapshot is None else snapshot.sha256,
+        parent_run_id=op.parent_run_id,
+        step_id=op.step_id,
     )
 
 

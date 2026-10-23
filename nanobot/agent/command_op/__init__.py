@@ -1,11 +1,12 @@
-"""CommandOp kernel (draft v0, sections 2–5).
+"""CommandOp kernel.
 
 A CLI invocation is a durable operation with authoritative params, a frozen
-argv sha, and approval bound to that sha. TemplateRun progress and TAP
-science rules are adapter follow-ups, not part of this package.
+argv sha, and approval bound to that sha. TemplateRun is the parent progress
+bar. TAP registration is a scaffold: red-line ids stay opaque, and live CLI
+flags wait on ``taptap --describe-json``.
 """
 
-from nanobot.agent.command_op.events import CommandOpEvent
+from nanobot.agent.command_op.events import CommandOpEvent, TemplateRunEvent
 from nanobot.agent.command_op.models import (
     Approval,
     ArgvSnapshot,
@@ -19,6 +20,9 @@ from nanobot.agent.command_op.models import (
     OpStatus,
 )
 from nanobot.agent.command_op.runtime import CommandOpRuntime
+from nanobot.agent.command_op.tap_adapter import TapAdapter
+from nanobot.agent.command_op.template_run import TemplateRun
+from nanobot.agent.command_op.workbench import CommandWorkbench
 
 __all__ = [
     "Approval",
@@ -32,5 +36,9 @@ __all__ = [
     "CommandOpRuntime",
     "CommandParam",
     "CommandRun",
+    "CommandWorkbench",
     "OpStatus",
+    "TapAdapter",
+    "TemplateRun",
+    "TemplateRunEvent",
 ]

@@ -18,6 +18,8 @@ CommandOpEventName = Literal[
     "op.cancelled",
 ]
 
+TemplateRunEventName = Literal["run.progress"]
+
 # Tool-result statuses that mean "this CLI is a CommandOp", not success or failure.
 # ``done`` is the terminal tool disposition; the op status stays succeeded/failed/cancelled.
 COMMAND_OP_TOOL_STATUSES = frozenset({
@@ -44,3 +46,23 @@ class CommandOpEvent(AgentEvent):
     blocked_reason: str | None
     contract_ref: str
     argv_sha256: str | None = None
+    parent_run_id: str | None = None
+    step_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TemplateRunEvent(AgentEvent):
+    """Parent-run progress for the boss bar. Same bus as CommandOp, not a chat message.
+
+    ``accepted`` stays false when a step's exit code is 0. Scientific acceptance
+    is a separate checkbox and is not implied by ``ready_for_acceptance``.
+    """
+
+    name: TemplateRunEventName
+    run_id: str
+    template: str
+    done: int
+    total: int
+    current_step: str | None
+    status: str
+    accepted: bool
