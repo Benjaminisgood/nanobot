@@ -3822,7 +3822,7 @@ describe("ThreadComposer", () => {
     expect(fileInput).toBeTruthy();
     const file = new File(["image"], "draft.png", { type: "image/png" });
     fireEvent.change(fileInput!, { target: { files: [file] } });
-    await screen.findByText("draft.png");
+    await screen.findByRole("img", { name: "draft.png" });
 
     fireEvent.change(input, { target: { value: "look at this" } });
     fireEvent.keyDown(input, { key: "Enter" });
@@ -3834,7 +3834,7 @@ describe("ThreadComposer", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Edit message" }));
     expect(input).toHaveValue("look at this");
-    expect(screen.getByTestId("composer-chip")).toHaveTextContent("draft.png");
+    expect(screen.getByRole("img", { name: "draft.png" })).toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "Waiting to send" })).not.toBeInTheDocument();
 
     fireEvent.keyDown(input, { key: "Enter" });
@@ -4093,7 +4093,7 @@ describe("ThreadComposer", () => {
     fireEvent.change(first.container.querySelector<HTMLInputElement>('input[type="file"]')!, {
       target: { files: [new File(["image"], "queued.png", { type: "image/png" })] },
     });
-    await screen.findByText("queued.png");
+    await screen.findByRole("img", { name: "queued.png" });
     for (const text of ["queued attachment", "more guidance"]) {
       fireEvent.change(screen.getByLabelText("Message input"), { target: { value: text } });
       fireEvent.keyDown(screen.getByLabelText("Message input"), { key: "Enter" });
@@ -4263,7 +4263,7 @@ describe("session composer drafts", () => {
     view.rerender(composer("other-draft"));
     view.rerender(composer("unchanged-draft"));
     expect(screen.getByRole("textbox")).toHaveValue("send once");
-    if (attachment) await screen.findByText("draft.png");
+    if (attachment) await screen.findByRole("img", { name: "draft.png" });
     await act(async () => resolveSend(true));
     view.unmount();
     expect(new ComposerDraftStore().get("unchanged-draft", true)).toBeUndefined();
@@ -4299,10 +4299,10 @@ describe("session composer drafts", () => {
     const file = new File(["image"], "draft.png", { type: "image/png" });
     fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [file] } });
     view.rerender(composer("chat-b"));
-    expect(screen.queryByText("draft.png")).not.toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "draft.png" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Quoted context")).not.toBeInTheDocument();
     view.rerender(composer("chat-a"));
-    expect(await screen.findByText("draft.png")).toBeInTheDocument();
+    expect(await screen.findByRole("img", { name: "draft.png" })).toBeInTheDocument();
     expect(screen.getByLabelText("Quoted context")).toHaveTextContent("quoted answer");
     await waitFor(() => expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));

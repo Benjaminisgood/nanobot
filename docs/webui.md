@@ -181,6 +181,8 @@ In Restricted mode, ordinary file and shell work stays inside the selected proje
 
 The composer supports text, attachments (images, documents, and videos), slash commands and `@` mentions. With voice transcription configured, the empty composer offers voice input; transcription is added to the draft before sending.
 
+Images appear as thumbnails above the draft. Hover over a thumbnail for its filename and size; use its top-right × to remove it before sending. Documents and videos keep their file cards, and attachment errors remain visible.
+
 Choose or drop MP4, WebM, or MOV videos into the composer (one per message, up to 20 MiB per upload). You can play them in WebUI; the Agent cannot directly analyze their contents yet.
 
 To attach a file on the connected nanobot host, paste its path on its own. Quoted paths and spaces are supported; relative paths start from the topic's workspace. The topic's access permissions apply. Path references do not upload or copy the file and have no file-size or combined-size limit; supported formats and attachment counts still apply. If attaching fails, the text stays in your draft.

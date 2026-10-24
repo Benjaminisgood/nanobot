@@ -34,7 +34,7 @@ function csvFile(name = "report.csv", type = "application/vnd.ms-excel") {
   return new File(["name,value\nnanobot,1"], name, { type });
 }
 
-function resolveReady(file: File): EncodeResponse {
+function resolveReady(file: File): Extract<EncodeResponse, { ok: true }> {
   return {
     id: "stub",
     ok: true,
@@ -86,9 +86,9 @@ beforeEach(() => {
 });
 
 describe("ThreadComposer — attachments", () => {
-  it("attaches a picked image and includes its data url on send", async () => {
-    const file = pngFile("a.png");
-    encodeImage.mockResolvedValueOnce(resolveReady(file));
+  it("previews a picked image with size details on hover and includes its data url on send", async () => {
+    const file = pngFile("a.png", 100);
+    encodeImage.mockResolvedValueOnce({ ...resolveReady(file), normalized: true, bytes: 50 });
     const onSend = vi.fn();
 
     render(<ThreadComposer onSend={onSend} />);
@@ -102,9 +102,9 @@ describe("ThreadComposer — attachments", () => {
       fireEvent.change(input, { target: { files: [file] } });
     });
 
-    await waitFor(() =>
-      expect(screen.getByTestId("composer-chip")).toBeInTheDocument(),
-    );
+    expect(screen.getByRole("img", { name: "a.png" })).toHaveAttribute("src", expect.stringContaining("blob:"));
+    expect(screen.getByTestId("composer-chip")).toHaveAttribute("title", "a.png\n100 B → 50 B (auto)");
+    expect(screen.getByRole("button", { name: "Remove attachment" })).toHaveAccessibleDescription("a.png");
 
     const textarea = screen.getByLabelText(/message input/i);
     fireEvent.change(textarea, { target: { value: "hi" } });
@@ -359,6 +359,8 @@ describe("ThreadComposer — attachments", () => {
       fireEvent.change(fileInput, { target: { files: [file] } });
     });
 
+    expect(screen.getByRole("img", { name: "slow.png" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Encoding…")).toBeInTheDocument();
     const textarea = screen.getByLabelText(/message input/i);
     fireEvent.change(textarea, { target: { value: "hello" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
@@ -400,6 +402,9 @@ describe("ThreadComposer — attachments", () => {
     fireEvent.change(textarea, { target: { value: "hi" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onSend).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Remove attachment" }));
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("hi", undefined, undefined);
   });
 });
 
@@ -505,15 +510,15 @@ describe("local attachment paths and video ingress", () => {
     const view = render(composer());
     const input = screen.getByLabelText(/message input/i);
     fireEvent.paste(input, { clipboardData: { items: [], getData: () => firstLocal.path } });
-    await screen.findByText(firstLocal.name);
+    await screen.findByRole("img", { name: firstLocal.name });
     fireEvent.change(input.closest("form")!.querySelector('input[type="file"]')!, { target: { files: [pngFile("middle.png")] } });
-    await screen.findByText("middle.png");
+    await screen.findByRole("img", { name: "middle.png" });
     fireEvent.paste(input, { clipboardData: { items: [], getData: () => lastLocal.path } });
-    await screen.findByText(lastLocal.name);
+    await screen.findByRole("img", { name: lastLocal.name });
     fireEvent.change(input, { target: { value: "compare the first, second and third images" } });
     await waitFor(() => expect(screen.getByRole("button", { name: /send message/i })).toBeEnabled());
-    expect(screen.getAllByTestId("composer-chip").map((chip) => chip.textContent)).toEqual([
-      expect.stringContaining("first.png"), expect.stringContaining("middle.png"), expect.stringContaining("last.png"),
+    expect(screen.getAllByRole("img").map((image) => image.getAttribute("alt"))).toEqual([
+      "first.png", "middle.png", "last.png",
     ]);
     view.unmount();
     render(composer());

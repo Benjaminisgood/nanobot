@@ -2670,7 +2670,7 @@ export function ThreadComposer({
         ) : null}
         {images.length > 0 ? (
           <div
-            className="flex flex-wrap gap-2 px-3 pt-3"
+            className="flex flex-wrap items-start gap-2 px-3 pt-3"
             aria-label={t("thread.composer.attachImage")}
           >
             {images.map((img) => (
@@ -3403,6 +3403,7 @@ function AttachmentChip({
     image.status === "ready" && image.normalized && image.encodedBytes
       ? normalizedHint(image.file.size, image.encodedBytes)
       : formatBytes(image.file.size);
+  const isThumbnail = image.kind === "image" && image.status !== "error";
   const tone =
     image.status === "error"
       ? "border-destructive/40 bg-destructive/5 text-destructive"
@@ -3411,18 +3412,22 @@ function AttachmentChip({
   return (
     <div
       className={cn(
-        "group relative flex items-center gap-2 rounded-control border px-2 py-1.5",
+        "group relative flex max-w-full shrink-0 items-center rounded-control border",
         "transition-colors motion-reduce:transition-none",
+        isThumbnail ? "h-24 w-24" : "gap-2 px-2 py-1.5",
         tone,
       )}
+      title={isThumbnail ? `${image.file.name}\n${sizeLabel}` : undefined}
       data-testid="composer-chip"
     >
-      <div className="relative h-10 w-10 overflow-hidden rounded-md bg-background">
+      <div className={cn(
+        "relative shrink-0 overflow-hidden bg-background",
+        isThumbnail ? "h-full w-full rounded-[inherit]" : "h-10 w-10 rounded-md",
+      )}>
         {image.kind === "image" && image.previewUrl ? (
           <img
             src={image.previewUrl}
-            alt=""
-            aria-hidden
+            alt={isThumbnail ? image.file.name : ""}
             loading="eager"
             draggable={false}
             className="h-full w-full object-cover"
@@ -3447,29 +3452,36 @@ function AttachmentChip({
           </div>
         ) : null}
       </div>
-      <div className="flex min-w-0 flex-col text-[11.5px] leading-4">
-        <span className="max-w-[min(14rem,calc(100vw-8rem))] truncate font-medium" title={image.file.name}>
-          {image.file.name}
-        </span>
-        <span className="truncate text-muted-foreground">
-          {image.status === "error" && image.error
-            ? formatError(image.error)
-            : sizeLabel}
-        </span>
-      </div>
+      {!isThumbnail ? (
+        <div className="flex min-w-0 flex-col text-[11.5px] leading-4">
+          <span className="max-w-[min(14rem,calc(100vw-8rem))] truncate font-medium" title={image.file.name}>
+            {image.file.name}
+          </span>
+          <span className="truncate text-muted-foreground">
+            {image.status === "error" && image.error
+              ? formatError(image.error)
+              : sizeLabel}
+          </span>
+        </div>
+      ) : null}
       <button
         type="button"
         ref={registerRef}
         onClick={onRemove}
         onKeyDown={onKeyDown}
         aria-label={labelRemove}
+        aria-description={image.file.name}
+        title={labelRemove}
         className={cn(
-          "ml-1 grid h-5 w-5 flex-none place-items-center rounded-full",
-          "text-muted-foreground/80 hover:text-foreground",
-          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-foreground/30",
+          "grid flex-none place-items-center rounded-full focus-visible:outline-none focus-visible:ring-2",
+          isThumbnail
+            ? "group/remove absolute right-0 top-0 h-11 w-11 focus-visible:bg-black/50 focus-visible:ring-inset focus-visible:ring-white"
+            : "ml-1 h-5 w-5 text-muted-foreground/80 hover:text-foreground focus-visible:ring-foreground/30",
         )}
       >
-        <X className="h-3.5 w-3.5" aria-hidden />
+        <span className={cn(isThumbnail && "grid h-6 w-6 place-items-center rounded-full bg-black/65 text-white group-hover/remove:bg-black/80")}>
+          <X className="h-3.5 w-3.5" aria-hidden />
+        </span>
       </button>
     </div>
   );
