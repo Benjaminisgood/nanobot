@@ -491,6 +491,35 @@ test("reduced-motion failure keeps its functional 48px slot and retry until natu
   await expect(exhausted).toHaveCount(0);
 });
 
+test("keeps the reading anchor when lazy Markdown loads after a fast prepend", async ({ page }) => {
+  let releaseMarkdown = () => {};
+  const ready = new Promise<void>((resolve) => { releaseMarkdown = resolve; });
+  await page.route("**/MarkdownTextRenderer.tsx*", async (route) => {
+    await ready;
+    await route.continue();
+  });
+  const history = await installHistory(page);
+  history.useFastResponse(true);
+  await page.clock.install({ time: new Date("2026-01-01T00:00:00Z") });
+  const { body, header } = await openSettledHistory(page);
+  await positionAtTop(body);
+  await body.hover();
+  await page.clock.pauseAt(new Date("2026-01-01T01:00:00Z"));
+  await page.mouse.wheel(0, -120);
+  await expect.poll(() => history.reads.length).toBe(1);
+  await expect(header).toHaveAttribute("data-state", "loading");
+  const readingTop = await anchorTop(body, "Question 40");
+  history.releaseFastResponse();
+  await expect(body.getByText("Question 28", { exact: true })).toBeAttached();
+  await expectAnchorCoordinate(body, "Question 40", readingTop);
+
+  releaseMarkdown();
+  await page.clock.resume();
+  await expect(body.locator('[data-thread-display-unit="a40"] p')).toHaveCount(8);
+  await stableLayout(body);
+  await expectAnchorCoordinate(body, "Question 40", readingTop);
+});
+
 for (const elapsedMs of [0, 80]) test(`fast responses reclaim completed slots and keep the next boundary loading${elapsedMs ? " during spring travel" : ""}`, async ({ page }) => {
   const history = await installHistory(page);
   history.useFastResponse(true);

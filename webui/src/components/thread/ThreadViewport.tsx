@@ -88,6 +88,7 @@ export const HISTORY_WINDOW_INCREMENT = 120;
 interface HistoryScrollAnchor {
   key: string;
   offsetTop: number;
+  scrollTop: number;
 }
 
 const THREAD_DISPLAY_UNIT_SELECTOR = "[data-thread-display-unit]";
@@ -458,6 +459,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     }
     historyScrollAnchorRef.current = {
       key,
+      scrollTop: scroller.scrollTop,
       // Normalize out the reveal lease, even when reading above its inline slot.
       offsetTop: element.getBoundingClientRect().top - viewport.top
         - (historySlotRef.current ? HISTORY_HOLD_PX : 0),
@@ -487,6 +489,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
     const nextTop = Math.min(maxScrollTop, Math.max(0, scroller.scrollTop + delta));
     threadMotionRef.current?.jumpTo(nextTop);
+    anchor.scrollTop = scroller.scrollTop;
     return true;
   }, []);
 
@@ -910,7 +913,10 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
         current === logicallyAtBottom ? current : logicallyAtBottom,
       );
       if (owner === "user") {
-        captureHistoryScrollAnchor();
+        // Restoring the anchor also emits scroll. Keep that reading position
+        // through lazy content resizing instead of selecting a prepended row.
+        const anchor = historyScrollAnchorRef.current;
+        if (!anchor || el.scrollTop !== anchor.scrollTop) captureHistoryScrollAnchor();
         if (allowHistoryLoad) maybeLoadEarlierFromScroll();
         if (allowHistoryLoad && distance < HISTORY_PREFETCH_MIN_PX
           && historyWindow?.hasMoreAfter && !navigation?.loading && !navigation?.error) navigation?.newer();
