@@ -132,7 +132,7 @@ describe("merged waiting messages", () => {
       enter(String(index + 1));
     }
     expect(screen.getByLabelText("Message input")).toHaveValue("2");
-    expect(screen.getByTestId("composer-chip")).toHaveTextContent("second.png");
+    expect(within(screen.getByTestId("composer-chip")).getByRole("img", { name: "second.png" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Waiting to send" })).toHaveTextContent("first.png");
     expect(screen.getByText(error, { exact: false })).toBeInTheDocument();
     expect(onSend).not.toHaveBeenCalled();
