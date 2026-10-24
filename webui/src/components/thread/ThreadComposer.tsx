@@ -3479,8 +3479,8 @@ function AttachmentChip({
             : "ml-1 h-5 w-5 text-muted-foreground/80 hover:text-foreground focus-visible:ring-foreground/30",
         )}
       >
-        <span className={cn(isThumbnail && "grid h-6 w-6 place-items-center rounded-full bg-black/65 text-white group-hover/remove:bg-black/80")}>
-          <X className="h-3.5 w-3.5" aria-hidden />
+        <span className={cn(isThumbnail && "grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white group-hover/remove:bg-black/80")}>
+          <X className={isThumbnail ? "h-3 w-3" : "h-3.5 w-3.5"} aria-hidden />
         </span>
       </button>
     </div>

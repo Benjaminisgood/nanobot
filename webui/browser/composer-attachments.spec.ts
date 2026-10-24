@@ -72,7 +72,8 @@ for (const { width, dark, variant } of [
       await testInfo.attach("composer-attachments", { path: screenshot, contentType: "image/png" });
 
       const whiteRemove = chips.filter({ has: page.getByRole("img", { name: "white.png", exact: true }) }).getByRole("button");
-      if (width < 640) await whiteRemove.tap();
+      // Tap outside the visible circle, but inside the larger touch target.
+      if (width < 640) await whiteRemove.tap({ position: { x: 6, y: 22 } });
       else await whiteRemove.click();
       await expect(chips).toHaveCount(3);
       const darkRemove = chips.filter({ has: page.getByRole("img", { name: "dark.png", exact: true }) }).getByRole("button");
