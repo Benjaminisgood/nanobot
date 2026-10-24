@@ -7,12 +7,20 @@ schema is ``invalid`` and also registers nothing.
 
 ``tests/agent/fixtures/taptap_describe_sample.json`` is a sample of this
 schema for the loader. It is not a live ``taptap`` export.
+
+``NANOBOT_TAPTAP`` selects the describe executable. ``stub`` runs
+``python -m nanobot.agent.command_op.taptap_stub``. A filesystem path is used
+as the executable, and a path ending in ``.py`` is started with the current
+interpreter. When the variable is unset, discovery looks up ``taptap`` on
+``PATH`` and then ``python -m taptap``. The stub prints a catalog only. It
+does not execute TAP commands, and it is not the lab Windows TAP binary.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -32,6 +40,9 @@ from nanobot.agent.command_op.models import (
 from nanobot.agent.command_op.tap_adapter import TapAdapter
 
 DESCRIBE_SCHEMA = "taptap.describe/v1"
+TAPTAP_EXECUTABLE_ENV = "NANOBOT_TAPTAP"
+_STUB_TOKEN = "stub"
+_STUB_MODULE = "nanobot.agent.command_op.taptap_stub"
 CatalogStatus = Literal["live", "unavailable", "invalid"]
 
 _SIDE_EFFECTS = frozenset({"read_only", "writes_new", "mutates", "instrument"})
@@ -93,24 +104,35 @@ def discover_taptap_catalog(
     module_present: Callable[[], bool] | None = None,
     invoke: Callable[[list[str]], tuple[int, str, str]] | None = None,
 ) -> CatalogDiscovery:
-    """Run ``taptap --describe-json`` when the CLI is installed.
+    """Run ``taptap --describe-json`` when a CLI is configured.
 
-    ``python -m taptap --describe-json`` is used only when the ``taptap`` module
-    is installed and the binary is not on ``PATH``. Neither probe is attempted
-    when both are missing.
+    ``NANOBOT_TAPTAP``, when set, replaces ``PATH`` and ``python -m taptap``
+    lookup. ``stub`` selects the in-repo describe stub. A value that is empty
+    or not a file is ``unavailable`` and does not fall back to another binary.
+
+    ``python -m taptap --describe-json`` is used only when the variable is
+    unset, the ``taptap`` module is installed, and the binary is not on
+    ``PATH``. Neither probe is attempted when both are missing.
     """
-    find = lookup or shutil.which
-    present = module_present or _taptap_module_present
-    binary = find("taptap")
-    if binary:
-        argv = [binary, "--describe-json"]
-    elif present():
-        argv = [sys.executable, "-m", "taptap", "--describe-json"]
+    override = os.environ.get(TAPTAP_EXECUTABLE_ENV)
+    if override is not None:
+        argv = _explicit_describe_argv(override)
+        if argv is None:
+            detail = _explicit_describe_detail(override)
+            return CatalogDiscovery(status="unavailable", detail=detail)
     else:
-        return CatalogDiscovery(
-            status="unavailable",
-            detail="taptap --describe-json is not available on this machine",
-        )
+        find = lookup or shutil.which
+        present = module_present or _taptap_module_present
+        binary = find("taptap")
+        if binary:
+            argv = [binary, "--describe-json"]
+        elif present():
+            argv = [sys.executable, "-m", "taptap", "--describe-json"]
+        else:
+            return CatalogDiscovery(
+                status="unavailable",
+                detail="taptap --describe-json is not available on this machine",
+            )
     try:
         code, stdout, stderr = (invoke or _invoke)(argv)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -221,6 +243,27 @@ def _object(value: object, label: str) -> Mapping[str, object]:
             raise CommandOpError(f"{label} keys must be strings")
         parsed[key] = item
     return parsed
+
+
+def _explicit_describe_argv(raw: str) -> list[str] | None:
+    """Argv for ``NANOBOT_TAPTAP``, or ``None`` when the value cannot be run."""
+    text = raw.strip()
+    if text == _STUB_TOKEN:
+        return [sys.executable, "-m", _STUB_MODULE, "--describe-json"]
+    path = Path(text)
+    if not text or not path.is_file():
+        return None
+    command = str(path)
+    if path.suffix.lower() == ".py":
+        return [sys.executable, command, "--describe-json"]
+    return [command, "--describe-json"]
+
+
+def _explicit_describe_detail(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return f"{TAPTAP_EXECUTABLE_ENV} is empty"
+    return f"{TAPTAP_EXECUTABLE_ENV} does not point at a file: {text}"
 
 
 def _taptap_module_present() -> bool:

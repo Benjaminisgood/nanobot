@@ -685,8 +685,9 @@ class AgentLoop:
         synthesized for pending fill, approval, run, or completion.
 
         A live ``taptap --describe-json`` catalog is registered when the CLI
-        answers with the describe schema. A missing or unreadable CLI leaves
-        boss-flow commands pending and does not invent flags.
+        answers with the describe schema. ``NANOBOT_TAPTAP`` selects that
+        executable, including the in-repo Linux stub. A missing or unreadable
+        CLI leaves boss-flow commands pending and does not invent flags.
         """
         from nanobot.agent.command_op.describe import (
             CatalogDiscovery,

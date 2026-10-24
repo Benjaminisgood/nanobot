@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.command_op import taptap_stub
 from nanobot.agent.command_op.describe import (
     DESCRIBE_SCHEMA,
+    TAPTAP_EXECUTABLE_ENV,
     CatalogDiscovery,
     discover_taptap_catalog,
+    install_live_catalog,
     parse_describe_document,
 )
 from nanobot.agent.command_op.executor import TapTapExecutor
@@ -44,6 +48,116 @@ def _loop(tmp_path: Path) -> AgentLoop:
     )
 
 
+@pytest.mark.parametrize("value", ["", "   ", "/no/such/taptap-describe-stub"])
+def test_bad_taptap_override_does_not_fall_back_to_path(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(TAPTAP_EXECUTABLE_ENV, value)
+    called = False
+
+    def invoke(argv: list[str]) -> tuple[int, str, str]:
+        nonlocal called
+        del argv
+        called = True
+        return 0, "", ""
+
+    discovery = discover_taptap_catalog(
+        lookup=lambda name: "/usr/bin/taptap" if name == "taptap" else None,
+        module_present=lambda: True,
+        invoke=invoke,
+    )
+    assert discovery.status == "unavailable"
+    assert discovery.document is None
+    assert TAPTAP_EXECUTABLE_ENV in discovery.detail
+    assert called is False
+
+
+def test_taptap_override_binary_path_replaces_path_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "taptap-describe"
+    binary.write_text("", encoding="utf-8")
+    seen: list[list[str]] = []
+
+    def invoke(argv: list[str]) -> tuple[int, str, str]:
+        seen.append(argv)
+        return 0, json.dumps(_document()), ""
+
+    monkeypatch.setenv(TAPTAP_EXECUTABLE_ENV, str(binary))
+    discovery = discover_taptap_catalog(
+        lookup=lambda _name: "/usr/bin/taptap",
+        invoke=invoke,
+    )
+    assert discovery.status == "live"
+    assert seen == [[str(binary), "--describe-json"]]
+    assert parse_describe_document(discovery.document) == parse_describe_document(_document())
+
+
+@pytest.mark.asyncio
+async def test_stub_describe_json_is_accepted_by_command_op(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_path = Path(taptap_stub.__file__)
+    refused = subprocess.run(
+        [sys.executable, str(stub_path), "pulse_size"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert refused.returncode == 2
+    assert refused.stdout == ""
+    assert "lab Windows" in refused.stderr
+
+    monkeypatch.setenv(TAPTAP_EXECUTABLE_ENV, str(stub_path))
+    discovery = discover_taptap_catalog()
+    assert discovery.status == "live"
+    assert discovery.detail == "taptap --describe-json"
+    document = discovery.document
+    assert isinstance(document, dict)
+    note = document.get("note")
+    assert isinstance(note, str)
+    assert "Linux describe-json stub" in note
+    assert "Not the lab Windows" in note
+    parsed = parse_describe_document(document)
+    refs = {item.ref for item in parsed}
+    assert refs == {
+        "project_config/init_tap",
+        "wyx_inspect/wyx_summary",
+        "wyx_tables/experiment_summary",
+        "process_pulse_sizes/pulse_size",
+    }
+
+    runtime = CommandOpRuntime(tmp_path, auto_approve_readonly=False)
+    adapter = TapAdapter(runtime)
+    registered = install_live_catalog(adapter, tmp_path, discovery)
+    assert set(registered) == refs
+    summary = runtime.contract("wyx_inspect", "wyx_summary")
+    assert summary == next(item for item in parsed if item.ref == "wyx_inspect/wyx_summary")
+    op, _events = await runtime.propose(
+        app="wyx_inspect",
+        command="wyx_summary",
+        params={"measurement_dir": "meas"},
+    )
+    assert op.status == OpStatus.AWAITING_APPROVAL
+    assert op.argv_snapshot is not None
+    assert op.argv_snapshot.argv == ("taptap", "wyx_inspect", "wyx_summary", "meas")
+    pulse = next(item for item in adapter.pending("quantitative") if item.step_id == "pulse_size")
+    assert pulse.catalog_source == "describe-json"
+    waiting = next(item for item in adapter.pending("quantitative") if item.step_id == "fit_baseline")
+    assert waiting.catalog_source is None
+    assert waiting.describe_json_todo.startswith("TODO:")
+    with pytest.raises(CommandOpError, match="unknown contract"):
+        runtime.contract("fit_baseline_levels", "fit_baseline")
+
+    monkeypatch.setenv(TAPTAP_EXECUTABLE_ENV, "stub")
+    via_token = discover_taptap_catalog()
+    assert via_token.status == "live"
+    assert parse_describe_document(via_token.document) == parsed
+
+
 def test_sample_fixture_is_not_marked_as_a_live_export() -> None:
     document = _document()
     assert document["schema"] == DESCRIBE_SCHEMA
@@ -67,6 +181,7 @@ def test_parser_rejects_a_param_without_a_flag_or_positional() -> None:
 
 
 def test_discovery_reports_unavailable_without_probing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TAPTAP_EXECUTABLE_ENV, raising=False)
     called = False
 
     def invoke(argv: list[str]) -> tuple[int, str, str]:
@@ -86,7 +201,8 @@ def test_discovery_reports_unavailable_without_probing(monkeypatch: pytest.Monke
     monkeypatch.undo()
 
 
-def test_discovery_parses_live_stdout() -> None:
+def test_discovery_parses_live_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TAPTAP_EXECUTABLE_ENV, raising=False)
     document = _document()
 
     def invoke(argv: list[str]) -> tuple[int, str, str]:
@@ -103,7 +219,8 @@ def test_discovery_parses_live_stdout() -> None:
     assert parse_describe_document(discovery.document) == parse_describe_document(document)
 
 
-def test_invalid_describe_output_registers_nothing() -> None:
+def test_invalid_describe_output_registers_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(TAPTAP_EXECUTABLE_ENV, raising=False)
     discovery = discover_taptap_catalog(
         lookup=lambda name: "/usr/bin/taptap" if name == "taptap" else None,
         module_present=lambda: False,

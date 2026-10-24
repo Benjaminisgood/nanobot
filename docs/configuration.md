@@ -66,6 +66,7 @@ If the WebUI does not expose the option you need, start from the task below. Mos
 | Add external tools through MCP | `tools.mcpServers.<name>` | Start `nanobot gateway --verbose` and check startup/tool logs | [MCP](#mcp-model-context-protocol) |
 | Tighten tool and network safety | `tools.restrictToWorkspace`, `tools.exec.sandbox`, `tools.ssrfWhitelist`, `channels.*.allowFrom` | Run the same workflow through the channel or CLI you plan to expose | [Security](#security), [Pairing](#pairing) |
 | Tune request timeouts or process concurrency | `NANOBOT_STREAM_IDLE_TIMEOUT_S`, `NANOBOT_MAX_CONCURRENT_REQUESTS` | Start nanobot from the same environment and inspect startup/runtime logs | [Runtime Environment Variables](#runtime-environment-variables) |
+| Exercise `taptap --describe-json` on Linux without the lab TAP binary | `NANOBOT_TAPTAP=stub`, or `NANOBOT_TAPTAP` set to one executable path | `python -m nanobot.agent.command_op.taptap_stub --describe-json` prints `"schema": "taptap.describe/v1"` | [Runtime Environment Variables](#runtime-environment-variables) |
 | Run multiple isolated bots | separate `--home` directories, or `--config` and `--workspace` paths, plus distinct `gateway.port` or channel ports when processes run together | Place `--home` before the subcommand; use the same instance selectors with `status`, `agent`, `webui`, `gateway`, and `serve` | [Multiple Instances](./multiple-instances.md), [CLI Reference](./cli-reference.md) |
 | Observe model calls | `LANGFUSE_SECRET_KEY`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_BASE_URL` environment variables | Run one model call, then check the matching Langfuse project | [Langfuse Observability](#langfuse-observability) |
 
@@ -194,6 +195,24 @@ These variables are process-level switches. Set them in the same terminal, servi
 | `NANOBOT_WORKSPACE_SANDBOX_PROVIDER` | `unknown` | Display label for the external workspace sandbox when `NANOBOT_WORKSPACE_SANDBOX_ENFORCED` is truthy, for example `macos_app_sandbox` or `bwrap`. |
 | `NANOBOT_SANDBOX_ENFORCED` | unset | Legacy compatibility alias for `NANOBOT_WORKSPACE_SANDBOX_ENFORCED`. |
 | `NANOBOT_TMUX_SOCKET_DIR` | `${TMPDIR:-/tmp}/nanobot-tmux-sockets` | Socket directory used by the bundled `tmux` skill scripts. |
+| `NANOBOT_TAPTAP` | unset | Executable for `taptap --describe-json`. `stub` selects the in-repo Linux stub. A `.py` path runs under the current Python. This does not run the lab Windows TAP binary. |
+
+### TAP describe stub
+
+`NANOBOT_TAPTAP` selects the executable CommandOp probes with `--describe-json`. Leave it unset to keep the existing lookup: a `taptap` binary on `PATH`, then `python -m taptap` when that module is installed. Set it to `stub` to run `python -m nanobot.agent.command_op.taptap_stub`, or set it to the path of another describe-json CLI. A path ending in `.py` is started with the current Python interpreter. An empty value or a missing file stays unavailable and does not fall back to `PATH`.
+
+The stub prints a `taptap.describe/v1` catalog whose flag and positional names match the repository sample, then exits. It does not execute TAP commands. Approved CommandOps still use the catalog `executable` prefix (`taptap`), which this stub does not provide. Commands absent from the catalog stay pending. The lab Windows TAP binary is a later binding.
+
+```bash
+export NANOBOT_TAPTAP=stub
+python -m nanobot.agent.command_op.taptap_stub --describe-json
+```
+
+An installed environment also provides the same entry as `taptap-describe-stub`. To point at the checkout file instead of the `stub` token:
+
+```bash
+export NANOBOT_TAPTAP="/absolute/path/to/nanobot/agent/command_op/taptap_stub.py"
+```
 
 ### Installer, build, and WebUI development
 

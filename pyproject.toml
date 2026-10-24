@@ -116,6 +116,7 @@ dev = [
 [project.scripts]
 nanobot = "nanobot.cli.entry:main"
 nanobot-desktop-tui = "nanobot.cli.desktop_tui:main"
+taptap-describe-stub = "nanobot.agent.command_op.taptap_stub:main"
 
 # Third-party tool plugins register here.  Built-in tools are discovered
 # automatically via pkgutil scanning in ToolLoader.discover().
