@@ -10,17 +10,21 @@ test("system theme stays live, explicit choices persist, and tabs agree", async 
   await expect(page.getByRole("radio", { name: "System", exact: true })).toBeChecked();
   await page.emulateMedia({ colorScheme: "dark" });
   await expect(page.locator("html")).toHaveClass(/dark/);
-  await page.getByRole("radio", { name: "Light", exact: true }).check();
+  // Native theme snapshots commit the selected preference after capture.
+  await page.getByRole("radio", { name: "Light", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "Light", exact: true })).toBeChecked();
   await expect(page.locator("html")).not.toHaveClass(/dark/);
   await page.reload();
   await expect(page.getByRole("radio", { name: "Light", exact: true })).toBeChecked();
   await expect(page.locator("html")).not.toHaveClass(/dark/);
-  await page.getByRole("radio", { name: "System", exact: true }).check();
+  await page.getByRole("radio", { name: "System", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "System", exact: true })).toBeChecked();
   await expect(page.locator("html")).toHaveClass(/dark/);
   const other = await context.newPage();
   await other.goto("/browser/fixture.html?case=appearance");
   await expect(other.getByRole("radio", { name: "System", exact: true })).toBeChecked();
-  await other.getByRole("radio", { name: "Light", exact: true }).check();
+  await other.getByRole("radio", { name: "Light", exact: true }).click();
+  await expect(other.getByRole("radio", { name: "Light", exact: true })).toBeChecked();
   await expect(page.getByRole("radio", { name: "Light", exact: true })).toBeChecked();
   await expect(page.locator("html")).not.toHaveClass(/dark/);
 });

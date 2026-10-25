@@ -6,6 +6,26 @@ import { useTheme } from "@/hooks/useTheme";
 describe("useTheme", () => {
   let systemDark = false;
   let mediaEvents: EventTarget;
+  let restoreNativeTransition: (() => void) | undefined;
+
+  function deferNativeCapture() {
+    const previous = Object.getOwnPropertyDescriptor(document, "startViewTransition");
+    let update!: () => void;
+    let ready!: () => void;
+    let finish!: () => void;
+    const transition = {
+      ready: new Promise<void>(resolve => { ready = resolve; }),
+      finished: new Promise<void>(resolve => { finish = resolve; }),
+      skipTransition: vi.fn(),
+    };
+    const start = vi.fn((callback: () => void) => { update = callback; return transition; });
+    Object.defineProperty(document, "startViewTransition", { configurable: true, value: start });
+    restoreNativeTransition = () => {
+      if (previous) Object.defineProperty(document, "startViewTransition", previous);
+      else Reflect.deleteProperty(document, "startViewTransition");
+    };
+    return { start, capture: () => { update(); ready(); }, finish };
+  }
 
   function changeSystemTheme(dark: boolean) {
     act(() => {
@@ -22,8 +42,8 @@ describe("useTheme", () => {
     vi.useFakeTimers();
     systemDark = false;
     mediaEvents = new EventTarget();
-    vi.stubGlobal("matchMedia", vi.fn(() => ({
-      get matches() { return systemDark; },
+    vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
+      get matches() { return query === "(prefers-color-scheme: dark)" && systemDark; },
       addEventListener: mediaEvents.addEventListener.bind(mediaEvents),
       removeEventListener: mediaEvents.removeEventListener.bind(mediaEvents),
     })));
@@ -40,6 +60,8 @@ describe("useTheme", () => {
 
   afterEach(() => {
     cleanup();
+    restoreNativeTransition?.();
+    restoreNativeTransition = undefined;
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -209,6 +231,51 @@ describe("useTheme", () => {
     act(() => vi.advanceTimersByTime(600));
     expect(document.documentElement).not.toHaveAttribute("data-theme-transition");
     expect(result.current.theme).toBe("light");
+  });
+
+  it("retains a same-palette System choice before a native capture commits", async () => {
+    systemDark = true;
+    localStorage.setItem("nanobot-webui.theme", "light");
+    const native = deferNativeCapture();
+    const { result } = renderHook(useTheme);
+
+    act(() => result.current.setTheme("dark"));
+    expect(native.start).toHaveBeenCalledOnce();
+    expect(localStorage.getItem("nanobot-webui.theme")).toBe("dark");
+    act(() => result.current.setTheme("light"));
+    expect(localStorage.getItem("nanobot-webui.theme")).toBe("dark");
+    act(() => result.current.setTheme("system"));
+    expect(localStorage.getItem("nanobot-webui.theme")).toBe("system");
+    act(() => native.capture());
+    expect(result.current.preference).toBe("system");
+    expect(result.current.theme).toBe("dark");
+
+    changeSystemTheme(false);
+    expect(result.current.theme).toBe("light");
+    expect(localStorage.getItem("nanobot-webui.theme")).toBe("system");
+    await act(async () => native.finish());
+    act(() => vi.advanceTimersByTime(600));
+    expect(document.documentElement).not.toHaveAttribute("data-theme-snapshot");
+    expect(document.documentElement).not.toHaveAttribute("data-theme-transition");
+  });
+
+  it("keeps another tab's newer preference when a native capture is pending", async () => {
+    localStorage.setItem("nanobot-webui.theme", "light");
+    const native = deferNativeCapture();
+    const { result } = renderHook(useTheme);
+    act(() => result.current.setTheme("dark"));
+    const write = vi.spyOn(Storage.prototype, "setItem");
+    localStorage.removeItem("nanobot-webui.theme");
+    notifyStorageChange();
+    act(() => native.capture());
+
+    expect(result.current.preference).toBe("system");
+    expect(result.current.theme).toBe("light");
+    expect(document.documentElement).not.toHaveClass("dark");
+    expect(write).not.toHaveBeenCalled();
+    await act(async () => native.finish());
+    act(() => vi.advanceTimersByTime(600));
+    expect(document.documentElement).not.toHaveAttribute("data-theme-snapshot");
   });
 
   it("ignores rapid reversals for 600ms without replaying them later", () => {
