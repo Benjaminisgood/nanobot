@@ -15,10 +15,10 @@ import type {
 } from "./types";
 import { createHostWebSocket } from "./runtime";
 import { ClientRunLedger } from "./client-run-ledger";
-import type { CanonicalRunSnapshot, RunEffect, RunObservation } from "./client-run-ledger";
+import type { CanonicalRunSnapshot, RunEffect, RunObservation, RunState } from "./client-run-ledger";
 import type { CommandWorkbenchNotice } from "./command-ops";
 
-export type { CanonicalRunSnapshot } from "./client-run-ledger";
+export type { CanonicalRunSnapshot, RunState } from "./client-run-ledger";
 
 /** WebSocket readyState constants, referenced by value to stay portable
  * across runtimes that don't expose a global ``WebSocket`` (tests, SSR). */
@@ -74,6 +74,10 @@ function summarizeInboundWsPayload(ev: InboundEvent): unknown {
 
 type Unsubscribe = () => void;
 type EventHandler = (ev: InboundEvent) => void;
+export interface TaskNotice {
+  event: Extract<InboundEvent, { event: "turn_end" | "recovery_state" }>;
+  temporary: boolean;
+}
 type StatusHandler = (status: ConnectionStatus) => void;
 type RunCompletionHandler = (chatId: string) => void;
 type RuntimeModelHandler = (modelName: string | null, modelPreset?: string | null) => void;
@@ -85,7 +89,8 @@ type SessionUpdateHandler = (
   workspaceScope?: WorkspaceScopePayload,
 ) => void;
 type SidebarStateUpdateHandler = (state: SidebarStatePayload) => void;
-type RunStatusHandler = (chatId: string, startedAt: number | null) => void;
+type PairingChangeHandler = () => void;
+type RunStatusHandler = (chatId: string, state: RunState) => void;
 
 /** Structured errors surfaced to the UI.
  *
@@ -179,6 +184,9 @@ function runObservation(event: InboundEvent): RunObservation | null {
     case "message_accepted":
     case "user_message": {
       const activeTurnId = event.active_turn_id ?? (event.starts_turn ? event.turn_id : undefined);
+      if (event.event === "user_message" && event.provenance?.session_message && !activeTurnId) {
+        return { ...base, kind: "activity" };
+      }
       return {
         ...base,
         kind: event.event === "message_accepted" ? "admission" : "input",
@@ -191,6 +199,22 @@ function runObservation(event: InboundEvent): RunObservation | null {
       return { ...base, kind: "completed" };
     case "error":
       return { ...base, kind: "rejection" };
+    case "delta":
+    case "reasoning_delta":
+      return { ...base, kind: event.text ? "activity" : "progress" };
+    case "stream_end":
+      return { ...base, kind: "activity" };
+    case "retry_status":
+      return { ...base, kind: event.state === "recovered" || event.state === "cleared" ? "progress" : "activity" };
+    case "recovery_state":
+      // Supersession resolves the old recovery, not the new user turn that caused it.
+      return event.status === "recovered" && event.reason === "superseded"
+        ? { ...base, kind: "progress" }
+        : { ...base, kind: "recovery", active: event.status === "resuming" };
+    case "attached":
+      return event.recovery_state && event.recovery_state.status !== "recovered"
+        ? { ...base, kind: "recovery", active: event.recovery_state.status === "resuming" }
+        : { ...base, kind: "progress" };
     case "message":
       return { ...base, kind: "message" };
     default:
@@ -217,9 +241,12 @@ export class NanobotClient {
   private runStatusHandlers = new Set<RunStatusHandler>();
   private runCompletionHandlers = new Set<RunCompletionHandler>();
   private errorHandlers = new Set<ErrorHandler>();
-  // chat_id -> handlers listening on it
+  private taskNoticeHandlers = new Set<(notice: TaskNotice) => void>();
+  private pairingChangeHandlers = new Set<PairingChangeHandler>();
+  private readyHandlers = new Set<() => void>();
   private chatHandlers = new Map<string, Set<EventHandler>>();
-  /** Inbound frames received while no subscriber is registered (e.g. user switched away). */
+  private transcriptHandlers = new Map<string, { handler: EventHandler }>();
+  /** Inbound frames received while the transcript owner is absent, regardless of observers. */
   private pendingInboundByChat = new Map<string, InboundEvent[]>();
   private static readonly PENDING_INBOUND_MAX = 2000;
   // chat_ids we've attached to since connect; re-attached after reconnects
@@ -303,6 +330,16 @@ export class NanobotClient {
     };
   }
 
+  onPairingChange(handler: PairingChangeHandler): Unsubscribe {
+    this.pairingChangeHandlers.add(handler);
+    return () => { this.pairingChangeHandlers.delete(handler); };
+  }
+
+  onReady(handler: () => void): Unsubscribe {
+    this.readyHandlers.add(handler);
+    return () => { this.readyHandlers.delete(handler); };
+  }
+
   onSidebarStateUpdate(handler: SidebarStateUpdateHandler): Unsubscribe {
     this.sidebarStateUpdateHandlers.add(handler);
     return () => {
@@ -312,12 +349,18 @@ export class NanobotClient {
 
   onRunStatus(handler: RunStatusHandler): Unsubscribe {
     this.runStatusHandlers.add(handler);
-    for (const { chatId, startedAt } of this.runs.activeClocks()) {
-      handler(chatId, startedAt);
+    for (const { chatId, state } of this.runs.states()) {
+      handler(chatId, state);
     }
     return () => {
       this.runStatusHandlers.delete(handler);
     };
+  }
+
+  /** Live lifecycle events, independent of mounted chats. Never replays history. */
+  onTaskNotice(handler: (notice: TaskNotice) => void): Unsubscribe {
+    this.taskNoticeHandlers.add(handler);
+    return () => { this.taskNoticeHandlers.delete(handler); };
   }
 
   /** Subscribe to transport-level faults (see :type:`StreamError`). */
@@ -326,6 +369,15 @@ export class NanobotClient {
     return () => {
       this.errorHandlers.delete(handler);
     };
+  }
+
+  getRunState(chatId: string): RunState {
+    return this.runs.view(chatId);
+  }
+
+  /** Restore pending history only within its original lifecycle generation. */
+  restorePendingRun(chatId: string, generation: number, turnId: string | null): void {
+    this.applyRunEffects(this.runs.transition({ kind: "restore-pending", chatId, generation, turnId }));
   }
 
   /** Last ``goal_status`` ``started_at`` (unix sec) for *chatId*, if the turn is running. */
@@ -427,7 +479,7 @@ export class NanobotClient {
     for (const effect of effects) {
       switch (effect.kind) {
         case "run-status":
-          this.emitRunStatus(effect.chatId, effect.startedAt);
+          this.emitRunStatus(effect.chatId, effect.state);
           break;
         case "completion":
           for (const handler of this.runCompletionHandlers) handler(effect.chatId);
@@ -470,7 +522,7 @@ export class NanobotClient {
     }
   }
 
-  /** Subscribe to events for a given chat_id. Auto-attaches on the next open. */
+  /** Observe live chat events without consuming transcript replay. Auto-attaches. */
   onChat(chatId: string, handler: EventHandler): Unsubscribe {
     let handlers = this.chatHandlers.get(chatId);
     if (!handlers) {
@@ -478,20 +530,30 @@ export class NanobotClient {
       this.chatHandlers.set(chatId, handlers);
     }
     handlers.add(handler);
-    const pending = this.pendingInboundByChat.get(chatId);
-    if (pending !== undefined && pending.length > 0) {
-      const flushed = pending.splice(0);
-      this.pendingInboundByChat.delete(chatId);
-      for (const ev of flushed) {
-        handler(ev);
-      }
-    }
     this.attach(chatId);
     return () => {
       const current = this.chatHandlers.get(chatId);
       if (!current) return;
       current.delete(handler);
       if (current.size === 0) this.chatHandlers.delete(chatId);
+    };
+  }
+
+  /** Own transcript delivery: consume the pending tail once, then receive live events. */
+  onTranscript(chatId: string, handler: EventHandler): Unsubscribe {
+    if (this.transcriptHandlers.has(chatId)) {
+      throw new Error(`Transcript already subscribed: ${chatId}`);
+    }
+    const subscription = { handler };
+    this.transcriptHandlers.set(chatId, subscription);
+    const pending = this.pendingInboundByChat.get(chatId);
+    this.pendingInboundByChat.delete(chatId);
+    for (const event of pending ?? []) handler(event);
+    this.attach(chatId);
+    return () => {
+      if (this.transcriptHandlers.get(chatId) === subscription) {
+        this.transcriptHandlers.delete(chatId);
+      }
     };
   }
 
@@ -692,6 +754,10 @@ export class NanobotClient {
     const turnId = options?.turnId ?? crypto.randomUUID();
     const stillConnected = () => this.socket === socket
       && socket?.readyState === WS_OPEN && this.upload === capability;
+    this.applyRunEffects(this.runs.transition({
+      kind: "submit", chatId, turnId,
+      role: options?.startsNewRun === false ? "supplement" : "candidate-owner",
+    }));
     try {
       const references = await uploadAttachments(media, capability,
         typeof window !== "undefined" ? window.location.href : this.currentUrl,
@@ -703,6 +769,7 @@ export class NanobotClient {
         }
       });
     } catch (error) {
+      this.applyRunEffects(this.runs.transition({ kind: "reject", chatId, turnId }));
       this.emitError({ kind: "turn_rejected", chatId, turnId, detail: "attachment_rejected",
         reason: error instanceof Error ? error.message : "Attachment send failed" });
       throw error;
@@ -945,6 +1012,9 @@ export class NanobotClient {
       this.upload = uploadCapability(parsed.upload);
       this.readyChatId = parsed.chat_id;
       this.knownChats.add(parsed.chat_id);
+      for (const handler of this.readyHandlers) {
+        try { handler(); } catch { /* One listener must not block another ready consumer. */ }
+      }
       return;
     }
 
@@ -963,6 +1033,13 @@ export class NanobotClient {
         this.pendingNewChat = null;
       }
       this.dispatch(parsed.chat_id, parsed);
+      return;
+    }
+
+    if (parsed.event === "pairing_changed") {
+      for (const handler of this.pairingChangeHandlers) {
+        try { handler(); } catch { /* One listener must not block another pairing refresh. */ }
+      }
       return;
     }
 
@@ -1015,6 +1092,14 @@ export class NanobotClient {
 
     if (correlatedChatId) {
       this.recordGoalStateSnapshot(correlatedChatId, parsed);
+      if ((parsed.event === "turn_end" || parsed.event === "recovery_state")
+        && (this.knownChats.has(correlatedChatId) || this.temporaryChatIds.has(correlatedChatId))) {
+        for (const handler of this.taskNoticeHandlers) {
+          // Optional browser features must not interrupt delivery or cleanup.
+          try { handler({ event: parsed, temporary: this.temporaryChatIds.has(correlatedChatId) }); }
+          catch { /* The notification owner reports its own delivery failure. */ }
+        }
+      }
       this.dispatch(correlatedChatId, parsed);
     }
   }
@@ -1047,34 +1132,30 @@ export class NanobotClient {
     }
   }
 
-  private emitRunStatus(chatId: string, startedAt: number | null): void {
+  private emitRunStatus(chatId: string, state: RunState): void {
     for (const handler of this.runStatusHandlers) {
-      handler(chatId, startedAt);
+      handler(chatId, state);
     }
   }
 
   private dispatch(chatId: string, ev: InboundEvent): void {
-    const handlers = this.chatHandlers.get(chatId);
-    if (handlers !== undefined && handlers.size > 0) {
-      for (const h of handlers) {
-        h(ev);
+    const transcript = this.transcriptHandlers.get(chatId);
+    if (transcript) {
+      transcript.handler(ev);
+    } else {
+      let pending = this.pendingInboundByChat.get(chatId);
+      if (!pending) {
+        pending = [];
+        this.pendingInboundByChat.set(chatId, pending);
       }
-      return;
+      pending.push(ev);
+      // Temporary chats have no canonical history to recover evicted events from.
+      if (!this.temporaryChatIds.has(chatId)) {
+        const over = pending.length - NanobotClient.PENDING_INBOUND_MAX;
+        if (over > 0) pending.splice(0, over);
+      }
     }
-    let q = this.pendingInboundByChat.get(chatId);
-    if (!q) {
-      q = [];
-      this.pendingInboundByChat.set(chatId, q);
-    }
-    q.push(ev);
-    // Temporary chats have no canonical history to recover evicted events from.
-    // Like their pinned message snapshots, retain them until resubscribe, close
-    // or disconnect. Disk-backed chats keep the bounded replay tail below.
-    if (this.temporaryChatIds.has(chatId)) return;
-    const over = q.length - NanobotClient.PENDING_INBOUND_MAX;
-    if (over > 0) {
-      q.splice(0, over);
-    }
+    for (const handler of this.chatHandlers.get(chatId) ?? []) handler(ev);
   }
 
   private handleClose(event?: { code?: number }): void {
@@ -1227,6 +1308,7 @@ export class NanobotClient {
     this.temporaryChatIds.delete(chatId);
     this.knownChats.delete(chatId);
     this.chatHandlers.delete(chatId);
+    this.transcriptHandlers.delete(chatId);
     this.pendingInboundByChat.delete(chatId);
     const effects = this.runs.transition({ kind: "forget", chatId });
     this.goalStateByChatId.delete(chatId);

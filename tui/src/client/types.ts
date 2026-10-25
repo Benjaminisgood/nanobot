@@ -71,10 +71,7 @@ export interface MediaAttachment {
   name?: string
 }
 
-export interface OutboundMedia {
-  data_url: string
-  name?: string
-}
+export type OutboundMedia = import("../../../packages/client-events/attachments").DraftAttachment
 
 export interface WorkspaceScopePayload {
   project_path: string
@@ -282,6 +279,7 @@ export interface SessionContextSnapshot {
 }
 
 interface SessionMention {
+  id?: string
   name: string
   session_key: string
   title?: string
@@ -327,7 +325,9 @@ export type SlashCommandLifecycle =
   | "agent_turn_with_args"
 
 export interface SessionSummary {
+  key: string
   chatId: string
+  handle?: { id: string; name: string }
   title: string
   preview: string
   createdAt: string | null
