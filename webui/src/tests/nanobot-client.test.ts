@@ -71,6 +71,45 @@ afterEach(() => {
 });
 
 describe("NanobotClient", () => {
+  it("notifies ready consumers after server ready frames, including reconnects", async () => {
+    const client = new NanobotClient({ url: "ws://test?token=fixture-token", socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    const ready = vi.fn();
+    const unsubscribe = client.onReady(ready);
+    client.connect();
+    lastSocket().fakeOpen();
+    expect(ready).not.toHaveBeenCalled();
+    lastSocket().fakeMessage({ event: "ready", chat_id: "first" });
+    expect(ready).toHaveBeenCalledTimes(1);
+    expect(client.defaultChatId).toBe("first");
+    lastSocket().close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    lastSocket().fakeOpen();
+    lastSocket().fakeMessage({ event: "ready", chat_id: "second" });
+    expect(ready).toHaveBeenCalledTimes(2);
+    expect(client.defaultChatId).toBe("second");
+    unsubscribe();
+    lastSocket().fakeMessage({ event: "ready", chat_id: "third" });
+    expect(client.defaultChatId).toBe("third");
+    expect(ready).toHaveBeenCalledTimes(2);
+    client.close();
+  });
+
+  it("delivers payload-free pairing changes, isolates listeners and unsubscribes", () => {
+    const client = new NanobotClient({ url: "ws://test", socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    const pairing = vi.fn();
+    client.onPairingChange(() => { throw new Error("view failed"); });
+    const unsubscribe = client.onPairingChange(pairing);
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeMessage({ event: "pairing_changed" });
+    expect(pairing).toHaveBeenCalledTimes(1);
+    expect(pairing).toHaveBeenCalledWith();
+    unsubscribe();
+    lastSocket().fakeMessage({ event: "pairing_changed" });
+    expect(pairing).toHaveBeenCalledTimes(1);
+    client.close();
+  });
+
   it("emits live task notices without mounted chats, not when the chat replays", () => {
     const client = new NanobotClient({ url: "ws://test", reconnect: false,
       socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });

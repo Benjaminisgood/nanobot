@@ -87,6 +87,7 @@ type SessionUpdateHandler = (
   workspaceScope?: WorkspaceScopePayload,
 ) => void;
 type SidebarStateUpdateHandler = (state: SidebarStatePayload) => void;
+type PairingChangeHandler = () => void;
 type RunStatusHandler = (chatId: string, state: RunState) => void;
 
 /** Structured errors surfaced to the UI.
@@ -238,6 +239,8 @@ export class NanobotClient {
   private runCompletionHandlers = new Set<RunCompletionHandler>();
   private errorHandlers = new Set<ErrorHandler>();
   private taskNoticeHandlers = new Set<(notice: TaskNotice) => void>();
+  private pairingChangeHandlers = new Set<PairingChangeHandler>();
+  private readyHandlers = new Set<() => void>();
   private chatHandlers = new Map<string, Set<EventHandler>>();
   private transcriptHandlers = new Map<string, { handler: EventHandler }>();
   /** Inbound frames received while the transcript owner is absent, regardless of observers. */
@@ -315,6 +318,16 @@ export class NanobotClient {
     return () => {
       this.sessionUpdateHandlers.delete(handler);
     };
+  }
+
+  onPairingChange(handler: PairingChangeHandler): Unsubscribe {
+    this.pairingChangeHandlers.add(handler);
+    return () => { this.pairingChangeHandlers.delete(handler); };
+  }
+
+  onReady(handler: () => void): Unsubscribe {
+    this.readyHandlers.add(handler);
+    return () => { this.readyHandlers.delete(handler); };
   }
 
   onSidebarStateUpdate(handler: SidebarStateUpdateHandler): Unsubscribe {
@@ -966,6 +979,9 @@ export class NanobotClient {
       this.upload = uploadCapability(parsed.upload);
       this.readyChatId = parsed.chat_id;
       this.knownChats.add(parsed.chat_id);
+      for (const handler of this.readyHandlers) {
+        try { handler(); } catch { /* One listener must not block another ready consumer. */ }
+      }
       return;
     }
 
@@ -984,6 +1000,13 @@ export class NanobotClient {
         this.pendingNewChat = null;
       }
       this.dispatch(parsed.chat_id, parsed);
+      return;
+    }
+
+    if (parsed.event === "pairing_changed") {
+      for (const handler of this.pairingChangeHandlers) {
+        try { handler(); } catch { /* One listener must not block another pairing refresh. */ }
+      }
       return;
     }
 

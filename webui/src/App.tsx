@@ -1281,6 +1281,7 @@ function Shell({
   const [pairingBusyCode, setPairingBusyCode] = useState<string | null>(null);
   const [pairingError, setPairingError] = useState<string | null>(null);
   const pairingRefreshRef = useRef<Promise<number> | null>(null);
+  const pairingRefreshPendingRef = useRef(false);
   const [snoozedPairingCodes, setSnoozedPairingCodes] = useState<Map<string, {
     until: number;
     deliveryStatus: PairingRequestInfo["delivery_status"];
@@ -1473,32 +1474,41 @@ function Shell({
   }, [updatedChatIds]);
 
   const refreshPairingRequests = useCallback((): Promise<number> => {
-    if (pairingRefreshRef.current) return pairingRefreshRef.current;
+    if (pairingRefreshRef.current) {
+      // An earlier snapshot may predate the notice or completed mutation.
+      pairingRefreshPendingRef.current = true;
+      return pairingRefreshRef.current;
+    }
 
     const request = (async () => {
-      try {
-        const payload = await fetchPairingRequests(getToken());
-        const requests = Array.isArray(payload.requests) ? payload.requests : [];
-        setPairingRequests(requests);
-        setSnoozedPairingCodes((current) => {
-          if (current.size === 0) return current;
-          const activeRequests = new Map(requests.map((request) => [request.code, request]));
-          const now = Date.now();
-          const next = new Map(
-            Array.from(current).filter(
-              ([code, snooze]) => activeRequests.has(code)
-                && snooze.until > now
-                && activeRequests.get(code)?.delivery_status === snooze.deliveryStatus,
-            ),
-          );
-          return next.size === current.size ? current : next;
-        });
-        return requests.length;
-      } catch {
-        // Pairing is an opportunistic WebUI affordance. The slash command path
-        // remains available if this polling request fails.
-        return 0;
-      }
+      let requestCount: number;
+      do {
+        pairingRefreshPendingRef.current = false;
+        try {
+          const payload = await fetchPairingRequests(getToken());
+          const requests = Array.isArray(payload.requests) ? payload.requests : [];
+          setPairingRequests(requests);
+          setSnoozedPairingCodes((current) => {
+            if (current.size === 0) return current;
+            const activeRequests = new Map(requests.map((request) => [request.code, request]));
+            const now = Date.now();
+            const next = new Map(
+              Array.from(current).filter(
+                ([code, snooze]) => activeRequests.has(code)
+                  && snooze.until > now
+                  && activeRequests.get(code)?.delivery_status === snooze.deliveryStatus,
+              ),
+            );
+            return next.size === current.size ? current : next;
+          });
+          requestCount = requests.length;
+        } catch {
+          // Pairing is an opportunistic WebUI affordance. The slash command path
+          // remains available if this polling request fails.
+          requestCount = 0;
+        }
+      } while (pairingRefreshPendingRef.current);
+      return requestCount;
     })();
     const clearRequest = () => {
       if (pairingRefreshRef.current === request) pairingRefreshRef.current = null;
@@ -1516,17 +1526,24 @@ function Shell({
     const poll = async () => {
       const requestCount = await refreshPairingRequests();
       if (disposed) return;
+      if (timer !== null) window.clearTimeout(timer);
       timer = window.setTimeout(
         () => void poll(),
         requestCount > 0 ? PAIRING_POLL_INTERVAL_MS : PAIRING_IDLE_POLL_INTERVAL_MS,
       );
     };
+    const requestRefresh = () => { void poll(); };
+    const unsubscribePairing = client.onPairingChange(requestRefresh);
+    const unsubscribeReady = client.onReady(requestRefresh);
     void poll();
     return () => {
       disposed = true;
+      pairingRefreshPendingRef.current = false;
       if (timer !== null) window.clearTimeout(timer);
+      unsubscribePairing();
+      unsubscribeReady();
     };
-  }, [pageVisible, refreshPairingRequests]);
+  }, [client, pageVisible, refreshPairingRequests]);
 
   const activeSession = useMemo<ChatSummary | null>(() => {
     if (!activeKey) return null;
@@ -2465,9 +2482,10 @@ function Shell({
         });
       } catch (e) {
         setPairingError((e as Error).message);
-        void refreshPairingRequests();
       } finally {
         setPairingBusyCode(null);
+        // A mutation reply can be older than an already-delivered notification.
+        void refreshPairingRequests();
       }
     },
     [client, refreshPairingRequests],

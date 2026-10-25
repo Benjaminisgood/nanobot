@@ -29,6 +29,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.websocket.binary_http import BinaryHTTPBridge
 from nanobot.config_base import Base
+from nanobot.pairing.events import PairingChanged
 from nanobot.runtime_admission import RuntimeMaintenanceError
 from nanobot.session.webui_turns import (
     clear_websocket_turn_if_current,
@@ -816,11 +817,13 @@ class WebSocketChannel(BaseChannel):
                     if self._server is server:
                         self._server = None
 
+        disconnect_pairing = self.bus.subscribe(self._queue_pairing_changed, PairingChanged)
         task = asyncio.create_task(runner())
         self._server_task = task
         try:
             await task
         finally:
+            disconnect_pairing()
             prune_task.cancel()
             await asyncio.gather(prune_task, return_exceptions=True)
             self._uploads.store.clear()
@@ -1551,6 +1554,14 @@ class WebSocketChannel(BaseChannel):
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" user_message ")
+
+    async def _queue_pairing_changed(self, event: PairingChanged) -> None:
+        await self.bus.publish_event(event, channel=self.name, chat_id="*")
+
+    async def send_pairing_changed(self) -> None:
+        """Project invalidation only to bootstrap-authenticated WebUI clients."""
+        for connection in tuple(self._webui_connections):
+            await self._send_event(connection, "pairing_changed")
 
     async def send_runtime_model_updated(
         self,

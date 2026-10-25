@@ -44,6 +44,8 @@ const sessionUpdateHandlers = new Set<(
   workspaceScope?: WorkspaceScopePayload,
 ) => void>();
 const sidebarStateUpdateHandlers = new Set<(state: SidebarStatePayload) => void>();
+const pairingChangeHandlers = new Set<() => void>();
+const readyHandlers = new Set<() => void>();
 let mockSessions: ChatSummary[] = [];
 const HERO_GREETING_PATTERN =
   /What should we work on\?|Where should we start\?|What are we building today\?|What should we tackle together\?/;
@@ -261,6 +263,14 @@ vi.mock("@/lib/nanobot-client", async (importOriginal) => {
       return () => statusHandlers.delete(handler);
     };
     onRuntimeModelUpdate = () => () => {};
+    onPairingChange = (handler: () => void) => {
+      pairingChangeHandlers.add(handler);
+      return () => pairingChangeHandlers.delete(handler);
+    };
+    onReady = (handler: () => void) => {
+      readyHandlers.add(handler);
+      return () => readyHandlers.delete(handler);
+    };
     onError = () => () => {};
     onChat = () => () => {};
     onTranscript = () => () => {};
@@ -348,6 +358,8 @@ describe("App layout", () => {
     runStatusHandlers.clear();
     sessionUpdateHandlers.clear();
     sidebarStateUpdateHandlers.clear();
+    pairingChangeHandlers.clear();
+    readyHandlers.clear();
     window.history.replaceState(null, "", "/");
     sessionStorage.removeItem("nanobot.remote-instance");
     Reflect.deleteProperty(window, "nanobotHost");
@@ -4435,6 +4447,141 @@ describe("App layout", () => {
     unmount();
   });
 
+  it("refreshes pairing immediately on notices and ready, only while visible", async () => {
+    vi.useFakeTimers();
+    let requests: Record<string, unknown>[] = [];
+    mockFetchRoutes({ "/api/settings/pairing": () => ({ requests }) });
+    const { unmount } = render(<App />);
+    await act(async () => {});
+    const pairingReads = () => vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === "/api/settings/pairing").length;
+    expect(pairingReads()).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    requests = [{ code: "ABCD-EFGH", channel: "feishu", sender_id: "alice", delivery_status: "sent" }];
+    await act(async () => { for (const handler of pairingChangeHandlers) handler(); });
+    expect(screen.getByRole("dialog", { name: "Pair account" })).toBeVisible();
+    expect(pairingReads()).toBe(2);
+    requests = [];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(pairingReads()).toBe(3);
+    expect(screen.queryByRole("dialog", { name: "Pair account" })).not.toBeInTheDocument();
+
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    const setVisibility = (state: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: state });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    try {
+      act(() => setVisibility("hidden"));
+      requests = [];
+      await act(async () => {
+        for (const handler of pairingChangeHandlers) handler();
+        for (const handler of readyHandlers) handler();
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(pairingReads()).toBe(3);
+      await act(async () => setVisibility("visible"));
+      expect(pairingReads()).toBe(4);
+      expect(screen.queryByRole("dialog", { name: "Pair account" })).not.toBeInTheDocument();
+
+      requests = [{ code: "IJKL-MNOP", channel: "feishu", sender_id: "bob", delivery_status: "sent" }];
+      await act(async () => { for (const handler of readyHandlers) handler(); });
+      expect(screen.getByRole("dialog", { name: "Pair account" })).toBeVisible();
+      expect(pairingReads()).toBe(5);
+      unmount();
+      await act(async () => {
+        for (const handler of pairingChangeHandlers) handler();
+        for (const handler of readyHandlers) handler();
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(pairingReads()).toBe(5);
+    } finally {
+      if (visibilityDescriptor) Object.defineProperty(document, "visibilityState", visibilityDescriptor);
+      else Reflect.deleteProperty(document, "visibilityState");
+    }
+  });
+
+  it("polls for cross-process pairing changes and expiry without a notice", async () => {
+    vi.useFakeTimers();
+    let requests: Record<string, unknown>[] = [];
+    mockFetchRoutes({ "/api/settings/pairing": () => ({ requests }) });
+    render(<App />);
+    await act(async () => {});
+    requests = [{ code: "ABCD-EFGH", channel: "feishu", sender_id: "alice", expires_in_seconds: 5 }];
+    await act(async () => { await vi.advanceTimersByTimeAsync(14_999); });
+    expect(screen.queryByRole("dialog", { name: "Pair account" })).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByRole("dialog", { name: "Pair account" })).toHaveTextContent("Code expires 5s.");
+    requests = [];
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_999); });
+    expect(screen.getByRole("dialog", { name: "Pair account" })).toBeVisible();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.queryByRole("dialog", { name: "Pair account" })).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])("coalesces notices during an older pairing read and pauses while hidden (%s)", async (hide) => {
+    let finishOldRead!: (value: unknown) => void;
+    const oldSnapshot = new Promise((resolve) => { finishOldRead = resolve; });
+    let reads = 0;
+    mockFetchRoutes({ "/api/settings/pairing": () => ++reads === 1 ? oldSnapshot : { requests: [{
+      code: "ABCD-EFGH", channel: "feishu", sender_id: "alice", delivery_status: "sent",
+    }] } });
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    const setVisibility = (state: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: state });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    const { unmount } = render(<App />);
+    try {
+      await waitFor(() => expect(reads).toBe(1));
+      act(() => {
+        for (let notice = 0; notice < 3; notice += 1) {
+          for (const handler of pairingChangeHandlers) handler();
+        }
+        if (hide) setVisibility("hidden");
+      });
+      expect(reads).toBe(1);
+      await act(async () => { finishOldRead({ requests: [] }); });
+      if (hide) {
+        expect(reads).toBe(1);
+        await act(async () => setVisibility("visible"));
+      }
+      expect(screen.getByRole("dialog", { name: "Pair account" })).toBeVisible();
+      expect(reads).toBe(2);
+    } finally {
+      unmount();
+      if (visibilityDescriptor) Object.defineProperty(document, "visibilityState", visibilityDescriptor);
+      else Reflect.deleteProperty(document, "visibilityState");
+    }
+  });
+
+  it.each(["success", "failure"])("reconciles a late pairing mutation after a notice shows a newer request (%s)", async (outcome) => {
+    let requests = [{
+      code: "ABCD-EFGH", channel: "feishu", sender_id: "alice", expires_in_seconds: 120,
+    }];
+    mockFetchRoutes({ "/api/settings/pairing": () => ({ requests }) });
+    let reply!: (payload: unknown) => void;
+    let fail!: (error: Error) => void;
+    requestMutationSpy.mockImplementationOnce(() => new Promise((resolve, reject) => { reply = resolve; fail = reject; }));
+    render(<App />);
+    const popup = await screen.findByRole("dialog", { name: "Pair account" });
+    fireEvent.change(within(popup).getByRole("textbox", { name: "Pairing code" }), {
+      target: { value: "ABCD-EFGH" },
+    });
+    expect(requestMutationSpy).toHaveBeenCalledWith("settings.pairing.approve", { code: "ABCD-EFGH" }, expect.any(Number));
+    requests = [{
+      code: "IJKL-MNOP", channel: "feishu.second", sender_id: "bob", expires_in_seconds: 240,
+    }];
+    await act(async () => { for (const handler of pairingChangeHandlers) handler(); });
+    expect(popup).toHaveTextContent("Code expires 4 min.");
+    await act(async () => {
+      if (outcome === "success") reply({ requests: [] });
+      else fail(new Error("Approval unavailable"));
+    });
+    expect(screen.getByRole("dialog", { name: "Pair account" })).toHaveTextContent("Code expires 4 min.");
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === "/api/settings/pairing")).toHaveLength(3);
+    expect(requestMutationSpy).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["sending", "failed"])("explains an undelivered pairing reply (%s) without empty code slots", async (delivery_status) => {
     mockFetchRoutes({ "/api/settings/pairing": { requests: [{
       code: "ABCD-EFGH", channel: "feishu", sender_id: "alice", delivery_status,
@@ -4511,16 +4658,18 @@ describe("App layout", () => {
     expect(screen.queryByRole("dialog", { name: "Pair account" })).not.toBeInTheDocument();
   });
 
-  it("reuses an in-flight pairing poll when the page becomes visible again", async () => {
+  it("reuses an in-flight pairing poll then reads current requests on visible return", async () => {
     let resolvePairing!: (response: Response) => void;
     const pendingPairing = new Promise<Response>((resolve) => {
       resolvePairing = resolve;
     });
-    const fetchMock = vi.fn((input: RequestInfo | URL) => (
-      String(input) === "/api/settings/pairing"
-        ? pendingPairing
-        : Promise.resolve({ ok: false, status: 404 } as Response)
-    ));
+    let reads = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) !== "/api/settings/pairing") return Promise.resolve({ ok: false, status: 404 } as Response);
+      return ++reads === 1 ? pendingPairing : Promise.resolve(jsonResponse({ requests: [{
+        code: "ABCD-EFGH", channel: "feishu", sender_id: "alice", delivery_status: "sent",
+      }] }));
+    });
     vi.stubGlobal("fetch", fetchMock);
     const visibilityDescriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
 
@@ -4550,6 +4699,8 @@ describe("App layout", () => {
         resolvePairing(jsonResponse({ requests: [] }));
         await pendingPairing;
       });
+      expect(screen.getByRole("dialog", { name: "Pair account" })).toBeVisible();
+      expect(reads).toBe(2);
     } finally {
       if (visibilityDescriptor) {
         Object.defineProperty(document, "visibilityState", visibilityDescriptor);
