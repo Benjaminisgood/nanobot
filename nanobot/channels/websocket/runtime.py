@@ -22,6 +22,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 
 from nanobot.bus.events import (
+    INBOUND_META_USER_SHELL,
     OUTBOUND_META_AGENT_UI,
     OutboundMessage,
 )
@@ -1235,12 +1236,15 @@ class WebSocketChannel(BaseChannel):
         """Serialize one ordinary outbound message selected by the projector."""
         conns = list(self._subs.get(msg.chat_id, ()))
         text = msg.content
-        wire_text = self._media.rewrite_local_markdown_images(text)
+        user_shell = msg.metadata.get(INBOUND_META_USER_SHELL) is True
+        wire_text = text if user_shell else self._media.rewrite_local_markdown_images(text)
         payload: dict[str, Any] = {
             "event": "message",
             "chat_id": msg.chat_id,
             "text": wire_text,
         }
+        if user_shell:
+            payload["render_as"] = "text"
         turn_id = msg.metadata.get(WEBUI_TURN_METADATA_KEY)
         if isinstance(turn_id, str) and turn_id:
             payload["turn_id"] = turn_id
