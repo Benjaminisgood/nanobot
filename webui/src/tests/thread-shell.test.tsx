@@ -19,6 +19,7 @@ import type {
   CliAppsPayload,
   ConnectionStatus,
   SettingsPayload,
+  SubagentTaskSnapshot,
   ThreadProjectionEvent,
   UIMessage,
   WebuiThreadPersistedPayload,
@@ -544,6 +545,42 @@ describe("ThreadShell", () => {
     expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
   });
 
+  it("keeps the dock and task events alive after the parent response finishes", async () => {
+    const client = makeClient();
+    const snapshot: SubagentTaskSnapshot = {
+      task_id: "background-task", revision: 1, label: "Background inspection", task_description: "Inspect settings",
+      origin_turn_id: "parent-turn", origin_message_id: null, created_at: 100, completed_at: null,
+      state: "running", phase: "awaiting_model", elapsed_seconds: 2, iteration: 1, tool_events: [],
+      usage: null, receipts: {}, result: null, partial: false, stop_reason: null, error: null,
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/subagents")) return httpJson({ tasks: [snapshot] });
+      if (String(input).includes("/webui-thread")) return httpJson(transcriptFromSimpleMessages([
+        { role: "user", content: "Delegate inspection", turnId: "parent-turn" },
+      ]));
+      return Response.json({}, { status: 404 });
+    }));
+    render(wrap(client, <ThreadShell session={session("background-work")} title="Background work" onToggleSidebar={() => {}} />,
+      null, "tok", ["webui.core.v1", "webui.subagents.v1", "webui.subagents.events.v1"]));
+    const trigger = await screen.findByTestId("subagent-task-dock-trigger");
+    act(() => client._emitChat("background-work", { event: "goal_status", chat_id: "background-work", turn_id: "parent-turn", status: "running", started_at: 100 }));
+    expect(screen.getByRole("button", { name: "Stop response" })).toBeVisible();
+    act(() => client._emitChat("background-work", { event: "turn_end", chat_id: "background-work", turn_id: "parent-turn" }));
+    expect(screen.queryByRole("button", { name: "Stop response" })).not.toBeInTheDocument();
+    expect(trigger).toHaveTextContent("Running: 1");
+    act(() => client._emitChat("background-work", { event: "user_message", chat_id: "background-work", turn_id: "next-turn", turn_seq: 1, starts_turn: true, text: "Continue with the next request" }));
+    expect(trigger).toHaveTextContent("Running: 1");
+    fireEvent.click(trigger);
+    const list = screen.getByTestId("subagent-task-tree");
+    expect(within(list).getByRole("button", { name: /Background inspection Running/ })).toBeVisible();
+    act(() => client._emitChat("background-work", { event: "subagent_task", chat_id: "background-work", task: {
+      ...snapshot, revision: 2, state: "done", completed_at: 103, result: "Inspection finished after the parent reply",
+    } }));
+    expect(trigger).toHaveTextContent("Completed: 1");
+    expect(await within(list).findByText("Inspection finished after the parent reply")).toBeVisible();
+    expect(list).toBeVisible();
+  });
+
   it("renders one persisted task entry at the initiating prompt through the full shell", async () => {
     const client = makeClient();
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -563,8 +600,9 @@ describe("ThreadShell", () => {
       onToggleSidebar={() => {}} />, null, "tok", ["webui.core.v1", "webui.subagents.v1"]);
     const view = render(shell());
     await screen.findByText("Delegate inspection");
-    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Finished: 1/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Completed: 1/ }));
     const task = await screen.findByRole("button", { name: /Inspect settings Completed/ });
+    expect(screen.queryByTestId("subagent-task-dock")).not.toBeInTheDocument();
     await screen.findByText("Delegate inspection");
     expect(screen.getAllByRole("button", { name: /Inspect settings/ })).toHaveLength(1);
     expect(screen.getByTestId("thread-message-region")).toContainElement(task);
@@ -572,8 +610,9 @@ describe("ThreadShell", () => {
     view.unmount();
     render(shell());
     await screen.findByText("Delegate inspection");
-    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Finished: 1/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Completed: 1/ }));
     await screen.findByRole("button", { name: /Inspect settings Completed/ });
+    expect(screen.queryByTestId("subagent-task-dock")).not.toBeInTheDocument();
     expect(client.sendMessage).not.toHaveBeenCalled();
   });
 

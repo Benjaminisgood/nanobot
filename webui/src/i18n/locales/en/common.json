@@ -2014,6 +2014,7 @@
       "progress": "{{completed}} of {{total}} completed",
       "running": "Running: {{count}}",
       "finished": "Finished: {{count}}",
+      "completed": "Completed: {{count}}",
       "needsReview": "Review needed: {{count}}",
       "messages": "Message status"
     },

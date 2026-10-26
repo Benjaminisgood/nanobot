@@ -1822,6 +1822,7 @@
       "progress": "{{completed}} de {{total}} concluídas",
       "running": "Em andamento: {{count}}",
       "finished": "Encerradas: {{count}}",
+      "completed": "Concluídas: {{count}}",
       "needsReview": "Revisar: {{count}}",
       "messages": "Status das mensagens"
     },
