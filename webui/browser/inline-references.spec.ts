@@ -177,7 +177,7 @@ for (const narrow of [false, true]) {
       const externalLink = page.getByRole("link", { name: "外部文档", exact: true });
       await expect(externalLink).toHaveAttribute("href", "https://example.com/reference");
       await expect(externalLink).toHaveAttribute("target", "_blank");
-      await expect(externalLink).toHaveCSS("color", theme === "light" ? "rgb(59, 130, 246)" : "rgb(147, 197, 253)");
+      await expect(externalLink).toHaveCSS("color", theme === "light" ? "rgb(3, 105, 161)" : "rgb(186, 230, 253)");
 
       const input = page.getByRole("textbox", { name: "Message input", exact: true });
       const overlay = page.locator(".thread-composer-input > div[aria-hidden]");
