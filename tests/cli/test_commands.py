@@ -138,7 +138,6 @@ class _EmptyGatewaySessionManager:
     def state(self):
         return SimpleNamespace(
             list_sessions=AsyncMock(return_value=[]),
-            migrate_history=AsyncMock(),
             record_delivery=AsyncMock(),
             aclose=AsyncMock(),
         )
@@ -941,7 +940,7 @@ def test_provider_login_openai_codex_uses_explicit_config_proxy(tmp_path, monkey
     proxy = "http://127.0.0.1:23458"
     config_path = tmp_path / "config.json"
     config_path.write_text(
-        json.dumps({"providers": {"openaiCodex": {"proxy": proxy}}}),
+        json.dumps({"network": {"proxy": proxy}, "providers": {"openaiCodex": {"useProxy": True}}}),
         encoding="utf-8",
     )
     active_path: dict[str, Path] = {}
@@ -1657,6 +1656,33 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
     mock_agent_runtime["print_response"].assert_called_once_with(
         "mock-response", render_markdown=True, metadata={},
     )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_one_shot_agent_renders_structured_tool_hints(mock_agent_runtime, enabled):
+    config = mock_agent_runtime["config"]
+    config.channels.send_tool_hints = enabled
+    config.channels.send_progress = False
+    config.agents.defaults.tool_hint_max_length = 20
+    mock_agent_runtime["agent_loop"].channels_config = config.channels
+    events = [{
+        "phase": "start", "call_id": "search-1", "name": "web_search",
+        "arguments": {"query": "abcdefghijklmnopqrstuvwxyz"},
+    }]
+
+    async def process_direct(*_args, on_progress, **_kwargs):
+        await on_progress("", tool_hint=True, tool_events=events)
+        return OutboundMessage(channel="cli", chat_id="direct", content="Done")
+
+    mock_agent_runtime["agent_loop"].process_direct.side_effect = process_direct
+    with patch("nanobot.cli.terminal._print_cli_progress_line") as print_progress:
+        result = runner.invoke(app, ["agent", "-m", "search"])
+
+    assert result.exit_code == 0, result.output
+    if enabled:
+        assert print_progress.call_args.args[0] == 'search "abcdefghijklmnopqrs…"'
+    else:
+        print_progress.assert_not_called()
 
 
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):
@@ -2416,10 +2442,7 @@ def test_webui_dev_starts_vite_sidecar_and_gateway(monkeypatch, tmp_path: Path) 
     def fake_dev_server(**kwargs):
         seen["dev_kwargs"] = kwargs
         seen["dev_running"] = True
-        dev_server = SimpleNamespace(
-            url=kwargs["browser_url"],
-            ensure_running=lambda: None,
-        )
+        dev_server = SimpleNamespace(ensure_running=lambda: None)
         seen["dev_server"] = dev_server
         try:
             yield dev_server
@@ -2464,11 +2487,9 @@ def test_webui_dev_starts_vite_sidecar_and_gateway(monkeypatch, tmp_path: Path) 
     dev_kwargs = seen["dev_kwargs"]
     assert isinstance(dev_kwargs, dict)
     assert dev_kwargs["target_url"] == "http://127.0.0.1:8899"
-    browser_url = dev_kwargs["browser_url"]
-    assert isinstance(browser_url, str)
     saved = json.loads(config_file.read_text(encoding="utf-8"))
     secret = saved["channels"]["websocket"]["tokenIssueSecret"]
-    assert browser_url == f"http://127.0.0.1:5173/#/?bootstrapSecret={secret}"
+    browser_url = f"http://127.0.0.1:5173/#/?bootstrapSecret={secret}"
     assert seen["start_options"].port == 18888
     assert seen["attached_while_dev_running"] is True
     assert seen["attach_kwargs"]["poll_hook"] == seen["dev_server"].ensure_running

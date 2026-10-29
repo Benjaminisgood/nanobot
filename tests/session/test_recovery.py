@@ -23,15 +23,6 @@ from nanobot.webui import history as history_module
 from nanobot.webui.recovery import RecoveryActionError, RecoveryCoordinator
 
 
-@pytest.fixture(autouse=True)
-def _isolate_webui_transcripts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Recovery scans must discover only test-owned transcripts, not active user chats."""
-    webui_dir = tmp_path / "isolated-webui"
-    webui_dir.mkdir()
-    monkeypatch.setattr(history_module, "get_webui_dir", lambda: webui_dir)
-    monkeypatch.setattr(history_module, "get_webui_dir", lambda: webui_dir)
-
-
 def _persist(manager: SessionManager, session: Session) -> None:
     session.metadata["webui"] = True
     manager.save(session)
@@ -128,25 +119,19 @@ async def test_materialized_interruption_can_continue_from_saved_context(
 @pytest.mark.asyncio
 async def test_transcript_only_interruption_is_discovered_without_materializing_completed_history(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    webui_dir = tmp_path / "webui"
-    webui_dir.mkdir()
-    monkeypatch.setattr(history_module, "get_webui_dir", lambda: webui_dir)
-    monkeypatch.setattr(history_module, "get_webui_dir", lambda: webui_dir)
     unfinished_key = "websocket:unfinished"
     completed_key = "websocket:completed"
-    (webui_dir / f"{SessionManager.safe_key(unfinished_key)}.jsonl").write_text(
-        '{"event":"user","chat_id":"unfinished","text":"keep going"}\n'
-        '{"event":"message","chat_id":"unfinished","kind":"progress","text":"Working"}\n',
-        encoding="utf-8",
-    )
-    (webui_dir / f"{SessionManager.safe_key(completed_key)}.jsonl").write_text(
-        '{"event":"user","chat_id":"completed","text":"done"}\n'
-        '{"event":"message","chat_id":"completed","text":"finished"}\n'
-        '{"event":"turn_end","chat_id":"completed"}\n',
-        encoding="utf-8",
-    )
+    stored = SessionManager(tmp_path / "workspace")
+    stored.append_history(unfinished_key, [history_module.fact_from_record(record) for record in (
+        {"event": "user", "text": "keep going"},
+        {"event": "message", "kind": "progress", "text": "Working"},
+    )])
+    stored.append_history(completed_key, [history_module.fact_from_record(record) for record in (
+        {"event": "user", "text": "done"},
+        {"event": "message", "text": "finished"},
+        {"event": "turn_end"},
+    )])
     coordinator, bus, sessions = _coordinator(tmp_path / "workspace")
 
     await coordinator.scan()
@@ -739,10 +724,15 @@ async def test_dismiss_does_not_queue_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_failure_waits_across_restart_and_rejects_duplicate_continue(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reply_preserved", [False, True])
+async def test_model_failure_waits_across_restart_and_rejects_duplicate_continue(
+    tmp_path: Path, reply_preserved: bool,
+) -> None:
     coordinator, bus, sessions = _coordinator(tmp_path)
     session = sessions.get_or_create("websocket:chat")
     session.messages = [{"role": "user", "content": "finish this"}]
+    if reply_preserved:
+        session.messages.append({"role": "assistant", "content": "saved reply", "_interrupted": True})
     _persist(sessions, session)
 
     await coordinator.turn_completed("websocket:chat", failure_kind="model", failure_error_kind="connection")
@@ -752,6 +742,11 @@ async def test_model_failure_waits_across_restart_and_rejects_duplicate_continue
     assert bus.inbound.empty()
     state = sessions.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
     assert state["failure_error_kind"] == "connection"
+    assert state.get("reply_preserved", False) is reply_preserved
+    from nanobot.session.recovery import recovery_state_from_metadata
+    public_state = recovery_state_from_metadata({RECOVERY_METADATA_KEY: state})
+    assert public_state is not None
+    assert public_state.get("reply_preserved", False) is reply_preserved
     assert state["status"] == "awaiting_user"
     payload = {"chat_id": "chat", "recovery_id": state["recovery_id"]}
     await coordinator.handle_action("continue", payload)

@@ -86,9 +86,6 @@ class RecoveryCoordinator:
 
     async def scan(self) -> None:
         """Recover every interrupted WebUI session once at gateway startup."""
-        from nanobot.webui.history import initialize_history
-
-        await initialize_history(self.sessions)
         for key in await self._recovery_candidates():
             metadata_payload = await self.sessions.state.read_metadata(key)
             raw_metadata = metadata_payload.get("metadata") if metadata_payload else None
@@ -118,7 +115,7 @@ class RecoveryCoordinator:
                 await self._publish(route[1], failed)
 
     async def _recovery_candidates(self) -> list[str]:
-        """Legacy display-only sessions have canonical headers after import."""
+        """Display-only sessions also have canonical headers in SQLite."""
         return [item["key"] for item in await self.sessions.state.list_sessions()]
 
     @staticmethod
@@ -187,6 +184,8 @@ class RecoveryCoordinator:
                 can_continue=any(message.get("role") == "user" for message in session.messages),
             )
             waiting["failure_error_kind"] = failure_error_kind or "unknown"
+            if session.messages and session.messages[-1].get("_interrupted") is True:
+                waiting["reply_preserved"] = True
             await self.sessions.state.restore_interruption(session)
             await self._publish(route[1], waiting)
             return
@@ -449,6 +448,7 @@ class RecoveryCoordinator:
                     attempts=cast(int, state.get("attempts", 0)),
                     can_continue=cast(bool | None, state.get("can_continue")),
                     failure_error_kind=cast(str | None, state.get("failure_error_kind")),
+                    reply_preserved=cast(bool | None, state.get("reply_preserved")),
                 ),
             )
         )

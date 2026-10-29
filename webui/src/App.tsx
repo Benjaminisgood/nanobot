@@ -20,7 +20,7 @@ import { LazyRemoteConnectionsPage } from "@/components/remote/LazyRemoteConnect
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { SidebarResizeHandle, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from "@/components/SidebarResizeHandle";
 import { matchSidebarShortcut } from "@/lib/sidebar-shortcuts";
-import type { SidebarDeleteItem } from "@/components/ChatList";
+import type { SidebarDeleteDecision, SidebarDeleteItem } from "@/components/ChatList";
 import type { SettingsSectionKey } from "@/components/settings/SettingsView";
 import { StartupShell } from "@/components/StartupShell";
 import { ComposerDraftStore, clearStoredComposerDrafts } from "@/lib/composer-draft";
@@ -1265,6 +1265,7 @@ function Shell({
   const [pendingDelete, setPendingDelete] = useState<{
     items: SidebarDeleteItem[];
     automations?: SessionAutomationJob[];
+    onDecision?: SidebarDeleteDecision;
   } | null>(null);
   const [pendingTabRename, setPendingTabRename] = useState<{
     key: string;
@@ -2070,24 +2071,23 @@ function Shell({
     [pendingProjectRename, updateSidebarState],
   );
 
-  const onToggleArchive = useCallback(
-    (key: string) => {
+  const onArchiveMany = useCallback(
+    (keys: string[], archive: boolean) => {
+      const selected = new Set(keys);
       void updateSidebarState((current) => {
         const archived = new Set(current.archived_keys);
-        const pinned = current.pinned_keys.filter((item) => item !== key);
-        if (archived.has(key)) {
-          archived.delete(key);
-        } else {
-          archived.add(key);
+        for (const key of selected) {
+          if (archive) archived.add(key);
+          else archived.delete(key);
         }
         return {
           ...current,
-          pinned_keys: pinned,
+          pinned_keys: current.pinned_keys.filter((key) => !selected.has(key)),
           archived_keys: Array.from(archived),
         };
       });
-      if (activeKey === key && !sidebarState.archived_keys.includes(key)) {
-        const archived = new Set([...sidebarState.archived_keys, key]);
+      if (archive && activeKey && selected.has(activeKey)) {
+        const archived = new Set([...sidebarState.archived_keys, ...selected]);
         const next = topicSessions.find((session) => !archived.has(session.key));
         navigate({
           view: "chat",
@@ -2098,6 +2098,10 @@ function Shell({
     },
     [activeKey, navigate, sidebarState.archived_keys, topicSessions, updateSidebarState],
   );
+
+  const onToggleArchive = useCallback((key: string) => {
+    onArchiveMany([key], !sidebarState.archived_keys.includes(key));
+  }, [onArchiveMany, sidebarState.archived_keys]);
 
   const onToggleArchived = useCallback(() => {
     void updateSidebarState((current) => ({
@@ -2388,6 +2392,7 @@ function Shell({
 
   const onConfirmDelete = useCallback(async () => {
     if (!pendingDelete) return;
+    pendingDelete.onDecision?.(true);
     const items = pendingDelete.items;
     const deletingKeys = new Set(items.map((item) => item.key));
     const hasAutomations = (pendingDelete.automations?.length ?? 0) > 0;
@@ -2441,7 +2446,7 @@ function Shell({
     }
   }, [pendingDelete, deleteChat, activeKey, activeTabState, navigate, topicSessions, filePreviewStore, draftStore]);
 
-  const onRequestDeleteMany = useCallback(async (items: SidebarDeleteItem[]) => {
+  const onRequestDeleteMany = useCallback(async (items: SidebarDeleteItem[], onDecision?: SidebarDeleteDecision) => {
     const uniqueItems = Array.from(new Map(items.map((item) => [item.key, item])).values());
     if (uniqueItems.length === 0) return;
     const automationResults = await Promise.allSettled(
@@ -2450,11 +2455,20 @@ function Shell({
     const automations = automationResults.flatMap((result) => (
       result.status === "fulfilled" ? result.value : []
     ));
-    setPendingDelete({ items: uniqueItems, automations });
+    let decision = onDecision;
+    setPendingDelete({
+      items: uniqueItems,
+      automations,
+      onDecision: (confirmed) => {
+        const notify = decision;
+        decision = undefined;
+        notify?.(confirmed);
+      },
+    });
   }, [getSessionAutomations]);
 
-  const onRequestDelete = useCallback((key: string, label: string) => {
-    void onRequestDeleteMany([{ key, label }]);
+  const onRequestDelete = useCallback((key: string, label: string, onDecision?: SidebarDeleteDecision) => {
+    void onRequestDeleteMany([{ key, label }], onDecision);
   }, [onRequestDeleteMany]);
 
   const visiblePairingRequests = useMemo(
@@ -2793,6 +2807,7 @@ function Shell({
     onTogglePin,
     onRequestRename,
     onToggleArchive,
+    onArchiveMany,
     onRequestRenameTab,
     paneGroups: sidebarPaneGroups,
     onSelectPane: onSelectSidebarPane,
@@ -3034,7 +3049,6 @@ function Shell({
                               !activeKey ? onTemporaryChatEnabledChange : undefined
                             }
                             onToggleSidebar={toggleSidebar}
-                            onNewChat={onNewChat}
                             onCreateChat={
                               temporaryChatEnabled ? onCreateTemporaryChat : onCreateChat
                             }
@@ -3080,7 +3094,6 @@ function Shell({
                           filePreviewStore={filePreviewStore}
                           draftStore={draftStore}
                           onToggleSidebar={toggleSidebar}
-                          onNewChat={onNewChat}
                           onCreateChat={onCreateChat}
                           pendingFirstMessage={pendingAutomationMessage}
                           onPendingFirstMessageConsumed={onPendingAutomationMessageConsumed}
@@ -3181,7 +3194,10 @@ function Shell({
               title={pendingDelete.items[0]?.label ?? ""}
               count={pendingDelete.items.length}
               automations={pendingDelete.automations}
-              onCancel={() => setPendingDelete(null)}
+              onCancel={() => {
+                pendingDelete.onDecision?.(false);
+                setPendingDelete(null);
+              }}
               onConfirm={onConfirmDelete}
             />
           </Suspense>

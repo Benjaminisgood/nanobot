@@ -485,7 +485,6 @@ class _QueuedTelegramUpdate:
 
     kind: Literal["command", "message"]
     update: Update
-    context: ContextTypes.DEFAULT_TYPE
     sort_key: tuple[int, int]
 
 
@@ -1136,6 +1135,11 @@ class TelegramChannel(BaseChannel):
         buf.text = tail
         buf.message_id = sent.message_id
         buf.draft_id = None
+
+    def should_retry_send_error(self, error: Exception) -> bool:
+        # Per-part API retries belong to this adapter. Whole-message replay is safe
+        # only before submission; otherwise it may duplicate a successful prefix.
+        return isinstance(error, ChannelNotReadyError)
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
@@ -1937,7 +1941,6 @@ class TelegramChannel(BaseChannel):
         *,
         kind: Literal["command", "message"],
         update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         """Stage a Telegram update behind a short per-session reorder window."""
         message = update.message
@@ -1948,7 +1951,6 @@ class TelegramChannel(BaseChannel):
             _QueuedTelegramUpdate(
                 kind=kind,
                 update=update,
-                context=context,
                 sort_key=self._sort_key_for_update(update),
             )
         )
@@ -1970,9 +1972,9 @@ class TelegramChannel(BaseChannel):
                 for item in batch:
                     try:
                         if item.kind == "command":
-                            await self._process_forward_command(item.update, item.context)
+                            await self._process_forward_command(item.update)
                         else:
-                            await self._process_message_update(item.update, item.context)
+                            await self._process_message_update(item.update)
                     except Exception as e:
                         self.logger.warning(
                             "Telegram queued update handling failed for {}: {}",
@@ -1994,11 +1996,11 @@ class TelegramChannel(BaseChannel):
         if not update.message or not update.effective_user:
             return
         if not self._running:
-            await self._process_forward_command(update, context)
+            await self._process_forward_command(update)
             return
-        self._enqueue_ordered_update(kind="command", update=update, context=context)
+        self._enqueue_ordered_update(kind="command", update=update)
 
-    async def _process_forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _process_forward_command(self, update: Update) -> None:
         """Process a queued slash command."""
         message = update.message
         user = update.effective_user
@@ -2031,11 +2033,11 @@ class TelegramChannel(BaseChannel):
         if not update.message or not update.effective_user:
             return
         if not self._running:
-            await self._process_message_update(update, context)
+            await self._process_message_update(update)
             return
-        self._enqueue_ordered_update(kind="message", update=update, context=context)
+        self._enqueue_ordered_update(kind="message", update=update)
 
-    async def _process_message_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _process_message_update(self, update: Update) -> None:
         """Process a queued Telegram message update."""
 
         message = update.message

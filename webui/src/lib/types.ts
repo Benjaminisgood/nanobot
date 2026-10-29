@@ -113,6 +113,8 @@ export interface UIMessage {
   id: string;
   role: Role;
   content: string;
+  /** Literal output bypasses Markdown and content-based reply recognition. */
+  renderAs?: "text";
   /** Invocation-time snapshots, never resolved from today's model presets. */
   responseSources?: ResponseSource[];
   kind?: MessageKind;
@@ -455,7 +457,7 @@ export interface ChatSummary {
   /** Durable recovery state that needs attention after an interrupted turn. */
   recoveryState?: RecoveryState | null;
   workspaceScope?: WorkspaceScopePayload | null;
-  /** Server-owned project binding after the first accepted user message. */
+  /** Persisted sessions keep their project; only unpersisted drafts can change it. */
   projectLocked?: boolean;
   /** Stable, server-owned @handle for this session. */
   handle?: SessionHandle | null;
@@ -1514,6 +1516,7 @@ export type InboundEvent =
       event: "message";
       chat_id: string;
       text: string;
+      render_as?: "text";
       reply_to?: string;
       media?: string[];
       media_urls?: Array<{ url: string; name?: string; kind?: UIMediaKind }>;
@@ -1816,6 +1819,7 @@ export type Outbound =
       session_mentions?: SessionMention[];
       quoted_context?: string;
       intent?: "create_automation";
+      user_shell?: true;
       workspace_scope?: WorkspaceScopePayload;
       turn_id?: string;
       /** Marks messages sent by the embedded WebUI, without changing the

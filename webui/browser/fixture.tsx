@@ -24,8 +24,8 @@ import { NewChatSkeletonFixture } from "./new-chat-skeleton-fixture";
 import "../src/globals.css";
 import { DiagramFixture } from "./diagram-fixture";
 import { TypographyFixture } from "./typography-fixture";
+import { CodeWrappingFixture } from "./code-wrapping-fixture";
 import { InlineReferencesFixture } from "./inline-references-fixture";
-import { MarkdownEmphasisFixture } from "./markdown-emphasis-fixture";
 import { HistoryBoundaryFixture } from "./history-boundary-fixture";
 import { ChatFailureFixture } from "./chat-failure-fixture";
 import { ThreadLoadingFixture } from "./thread-loading-fixture";
@@ -44,6 +44,7 @@ import { DisplayMathFixture } from "./display-math-fixture";
 import { AttachmentLayoutFixture } from "./attachment-layout-fixture";
 import { LoadedSessionSearchFixture } from "./loaded-session-search-fixture";
 import { AppearanceFixture } from "./appearance-fixture";
+import { installSubagentDockApi, SubagentDockFixture } from "./subagent-dock-fixture";
 
 const history: UIMessage[] = [
   { id: "question", role: "user", content: "Earlier question", createdAt: 1_700_000_000_000 },
@@ -215,6 +216,7 @@ function AppsFixture() {
 }
 if (parameters.get("case") === "skeleton-additions") installSkeletonPreviewApi();
 if (parameters.get("case") === "idle-compaction") installIdleCompactionApi();
+if (parameters.get("case") === "subagent-dock") installSubagentDockApi();
 await initializeI18n();
 if (parameters.get("case") === "appearance" && parameters.has("lang")) {
   await setAppLanguage(normalizeLocale(parameters.get("lang")));
@@ -224,6 +226,8 @@ createRoot(document.getElementById("root")!).render(<TooltipProvider>
     ? <AppearanceFixture />
     : parameters.get("case") === "loaded-session-search"
     ? <LoadedSessionSearchFixture />
+    : parameters.get("case") === "subagent-dock"
+    ? <SubagentDockFixture parameters={parameters} />
     : parameters.get("case") === "attachments"
     ? <AttachmentLayoutFixture />
     : parameters.get("case") === "theme-toggle"
@@ -248,8 +252,8 @@ createRoot(document.getElementById("root")!).render(<TooltipProvider>
     ? <ChatFailureFixture parameters={parameters} />
     : parameters.get("case") === "display-math"
     ? <DisplayMathFixture />
-    : parameters.get("case") === "markdown-emphasis"
-    ? <MarkdownEmphasisFixture />
+    : parameters.get("case") === "code-wrapping"
+    ? <CodeWrappingFixture />
     : parameters.get("case") === "typography"
     ? <ClientProvider client={railClient} token="fixture"><TypographyFixture /></ClientProvider>
     : parameters.get("case") === "inline-references"

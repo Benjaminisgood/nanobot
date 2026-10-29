@@ -38,6 +38,7 @@ _PORT = 29900
 @pytest.fixture(autouse=True)
 def _isolate_runtime_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", tmp_path / "config.json")
 
 
 class _MatrixChannel(BaseChannel):
@@ -2411,6 +2412,7 @@ async def test_sessions_list_only_returns_websocket_sessions_by_default(
             project.resolve()
         )
         assert rows["websocket:beta"]["workspace_scope"]["access_mode"] == "restricted"
+        assert all(row["project_locked"] is True for row in sessions)
         assert all(not any(key.startswith("_") for key in row) for row in sessions)
     finally:
         await channel.stop()

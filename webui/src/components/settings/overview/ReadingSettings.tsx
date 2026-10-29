@@ -3,6 +3,7 @@ import { ArrowUp } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { MarkdownText } from "@/components/MarkdownText";
+import { SettingsHint } from "@/components/settings/shared/SettingsHint";
 import { Input } from "@/components/ui/input";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -51,7 +52,9 @@ export function ReadingSettings({ preferences, onChange }: {
   return <div className="appearance-reading-card">
     <div className="appearance-reading-controls">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <span className="text-control-label" id={`${id}-label`}>{t("settings.rows.readingTextSize")}</span>
+        <span className="text-control-label" id={`${id}-label`}>
+          <SettingsHint description={t("settings.appearance.readingHelp")}>{t("settings.rows.readingTextSize")}</SettingsHint>
+        </span>
         <div className="appearance-size-options">
           <SegmentedControl<ReadingTextSize>
             mode="radio"
@@ -124,17 +127,13 @@ export function ReadingSettings({ preferences, onChange }: {
           </TooltipProvider>
         </div>
       </div>
-      <p className="mt-2 text-caption text-muted-foreground">{t("settings.appearance.readingHelp")}</p>
       <span className="sr-only" id={`${id}-range`} aria-live="polite">{hint}</span>
     </div>
     <div className="reading-typography appearance-reading-preview"
       data-reading-text-size={preferences.readingTextSize}
       style={{ "--custom-reading-size": `${preferences.customReadingTextSize}px` } as CSSProperties}>
-      <div className="mb-4 flex items-center justify-between gap-3 text-caption text-muted-foreground">
-        <span className="inline-flex items-center gap-2 font-medium text-foreground">
-          <img src="/brand/nanobot_mark.svg" className="h-5 w-5" alt="" />nanobot
-        </span>
-        <span className="inline-flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-emerald-600/70 dark:bg-emerald-400/70" />{t("settings.appearance.preview")}</span>
+      <div className="mb-4 flex items-center gap-2 text-caption font-medium text-foreground">
+        <img src="/brand/nanobot_mark.svg" className="h-5 w-5" alt="" />nanobot
       </div>
       <div data-reading-preview-content>
         <MarkdownText>{t("settings.appearance.previewText")}</MarkdownText>

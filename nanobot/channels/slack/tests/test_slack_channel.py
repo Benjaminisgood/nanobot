@@ -15,7 +15,9 @@ except ImportError:
     pytest.skip("Slack dependencies not installed (slack-sdk)", allow_module_level=True)
 
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import ProgressEvent, outbound_message_for_event
 from nanobot.bus.queue import MessageBus
+from nanobot.channels.manager import ChannelManager
 from nanobot.channels.slack.runtime import SLACK_MAX_MESSAGE_LEN, SlackChannel, SlackConfig
 from nanobot.config.network import NetworkConfig
 
@@ -139,6 +141,33 @@ async def test_send_uses_thread_for_channel_messages() -> None:
     assert fake_web.chat_post_calls[0]["thread_ts"] == "1700000000.000100"
     assert len(fake_web.file_upload_calls) == 1
     assert fake_web.file_upload_calls[0]["thread_ts"] == "1700000000.000100"
+
+
+@pytest.mark.asyncio
+async def test_structured_tool_start_sends_text_in_thread() -> None:
+    channel = SlackChannel(SlackConfig(enabled=True), MessageBus())
+    fake_web = _FakeAsyncWebClient()
+    channel._web_client = fake_web
+    channel.tool_hint_max_length = 20
+    msg = outbound_message_for_event(
+        channel="slack",
+        chat_id="C123",
+        event=ProgressEvent(tool_hint=True, tool_events=[{
+            "phase": "start", "call_id": "call-1", "name": "web_search",
+            "arguments": {"query": "abcdefghijklmnopqrstuvwxyz"},
+        }]),
+        metadata={"slack": {"thread_ts": "1700000000.000100", "channel_type": "channel"}},
+    )
+
+    await ChannelManager._send_once(channel, channel.prepare_tool_events(msg))
+
+    assert fake_web.chat_post_calls == [{
+        "channel": "C123",
+        "text": 'search "abcdefghijklmnopqrs…"',
+        "thread_ts": "1700000000.000100",
+    }]
+    assert msg.content == ""
+    assert msg.event.content == ""
 
 
 @pytest.mark.asyncio
@@ -464,7 +493,6 @@ async def test_with_thread_context_fetches_root_once() -> None:
     content = await channel._with_thread_context(
         "what did you see?",
         chat_id="C123",
-        channel_type="channel",
         thread_ts="111.000",
         raw_thread_ts="111.000",
         current_ts="113.000",
@@ -483,7 +511,6 @@ async def test_with_thread_context_fetches_root_once() -> None:
     second = await channel._with_thread_context(
         "again",
         chat_id="C123",
-        channel_type="channel",
         thread_ts="111.000",
         raw_thread_ts="111.000",
         current_ts="114.000",
@@ -509,7 +536,6 @@ async def test_with_thread_context_fetches_replies_in_dm_thread() -> None:
     content = await channel._with_thread_context(
         "what did you see?",
         chat_id="D123",
-        channel_type="im",
         thread_ts="211.000",
         raw_thread_ts="211.000",
         current_ts="213.000",

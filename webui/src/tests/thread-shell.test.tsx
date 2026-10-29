@@ -19,6 +19,7 @@ import type {
   CliAppsPayload,
   ConnectionStatus,
   SettingsPayload,
+  SubagentTaskSnapshot,
   ThreadProjectionEvent,
   UIMessage,
   WebuiThreadPersistedPayload,
@@ -544,6 +545,42 @@ describe("ThreadShell", () => {
     expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
   });
 
+  it("keeps the dock and task events alive after the parent response finishes", async () => {
+    const client = makeClient();
+    const snapshot: SubagentTaskSnapshot = {
+      task_id: "background-task", revision: 1, label: "Background inspection", task_description: "Inspect settings",
+      origin_turn_id: "parent-turn", origin_message_id: null, created_at: 100, completed_at: null,
+      state: "running", phase: "awaiting_model", elapsed_seconds: 2, iteration: 1, tool_events: [],
+      usage: null, receipts: {}, result: null, partial: false, stop_reason: null, error: null,
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/subagents")) return httpJson({ tasks: [snapshot] });
+      if (String(input).includes("/webui-thread")) return httpJson(transcriptFromSimpleMessages([
+        { role: "user", content: "Delegate inspection", turnId: "parent-turn" },
+      ]));
+      return Response.json({}, { status: 404 });
+    }));
+    render(wrap(client, <ThreadShell session={session("background-work")} title="Background work" onToggleSidebar={() => {}} />,
+      null, "tok", ["webui.core.v1", "webui.subagents.v1", "webui.subagents.events.v1"]));
+    const trigger = await screen.findByTestId("subagent-task-dock-trigger");
+    act(() => client._emitChat("background-work", { event: "goal_status", chat_id: "background-work", turn_id: "parent-turn", status: "running", started_at: 100 }));
+    expect(screen.getByRole("button", { name: "Stop response" })).toBeVisible();
+    act(() => client._emitChat("background-work", { event: "turn_end", chat_id: "background-work", turn_id: "parent-turn" }));
+    expect(screen.queryByRole("button", { name: "Stop response" })).not.toBeInTheDocument();
+    expect(trigger).toHaveTextContent("Running: 1");
+    act(() => client._emitChat("background-work", { event: "user_message", chat_id: "background-work", turn_id: "next-turn", turn_seq: 1, starts_turn: true, text: "Continue with the next request" }));
+    expect(trigger).toHaveTextContent("Running: 1");
+    fireEvent.click(trigger);
+    const list = screen.getByTestId("subagent-task-tree");
+    expect(within(list).getByRole("button", { name: /Background inspection Running/ })).toBeVisible();
+    act(() => client._emitChat("background-work", { event: "subagent_task", chat_id: "background-work", task: {
+      ...snapshot, revision: 2, state: "done", completed_at: 103, result: "Inspection finished after the parent reply",
+    } }));
+    expect(trigger).toHaveTextContent("Completed: 1");
+    expect(await within(list).findByText("Inspection finished after the parent reply")).toBeVisible();
+    expect(list).toBeVisible();
+  });
+
   it("renders one persisted task entry at the initiating prompt through the full shell", async () => {
     const client = makeClient();
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -563,8 +600,9 @@ describe("ThreadShell", () => {
       onToggleSidebar={() => {}} />, null, "tok", ["webui.core.v1", "webui.subagents.v1"]);
     const view = render(shell());
     await screen.findByText("Delegate inspection");
-    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Finished: 1/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Completed: 1/ }));
     const task = await screen.findByRole("button", { name: /Inspect settings Completed/ });
+    expect(screen.queryByTestId("subagent-task-dock")).not.toBeInTheDocument();
     await screen.findByText("Delegate inspection");
     expect(screen.getAllByRole("button", { name: /Inspect settings/ })).toHaveLength(1);
     expect(screen.getByTestId("thread-message-region")).toContainElement(task);
@@ -572,8 +610,9 @@ describe("ThreadShell", () => {
     view.unmount();
     render(shell());
     await screen.findByText("Delegate inspection");
-    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Finished: 1/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Subtasks Completed: 1/ }));
     await screen.findByRole("button", { name: /Inspect settings Completed/ });
+    expect(screen.queryByTestId("subagent-task-dock")).not.toBeInTheDocument();
     expect(client.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -1073,7 +1112,10 @@ describe("ThreadShell", () => {
     portal.remove();
   });
 
-  it("keeps inferred file paths non-interactive when the availability probe fails", async () => {
+  it.each([
+    { kind: "inferred", content: "Unreadable file: `prompts/dream.md`", path: "prompts/dream.md" },
+    { kind: "explicit", content: "[Python code](／home/example/workspace/model_check.py)", path: "／home/example/workspace/model_check.py" },
+  ])("keeps $kind file references non-interactive when the availability probe fails", async ({ content, path }) => {
     await preloadMarkdownText();
     const client = makeClient();
     let resolveProbe!: (value: Response) => void;
@@ -1084,7 +1126,7 @@ describe("ThreadShell", () => {
       const url = String(input);
       if (url.includes("websocket%3Apreview-error/webui-thread")) {
         return Promise.resolve(httpJson(transcriptFromSimpleMessages([
-          { role: "assistant", content: "Unreadable file: `prompts/dream.md`" },
+          { role: "assistant", content },
         ])));
       }
       if (url.includes("websocket%3Apreview-error/file-preview?")) return probe;
@@ -1107,7 +1149,7 @@ describe("ThreadShell", () => {
 
     const reference = await screen.findByTestId("inline-file-path");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("file-preview?path=prompts%2Fdream.md&probe=1"),
+      expect.stringContaining(`file-preview?path=${encodeURIComponent(path)}&probe=1`),
       expect.anything(),
     ));
     await act(async () => {
@@ -1182,22 +1224,19 @@ describe("ThreadShell", () => {
 
   it("does not navigate away when clicking the chat title", async () => {
     const client = makeClient();
-    const onGoHome = vi.fn();
     render(wrap(
       client,
       <ThreadShell
         session={session("chat-title")}
         title="Important conversation"
         onToggleSidebar={() => {}}
-        onGoHome={onGoHome}
-        onNewChat={() => {}}
       />,
     ));
 
     await waitFor(() => expect(screen.getByText("Important conversation")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Important conversation"));
 
-    expect(onGoHome).not.toHaveBeenCalled();
+    expect(screen.getByText("Important conversation")).toBeVisible();
   });
 
   it.each([true, false])("waits for parent settings and retries only on failure (success: %s)", async (success) => {
@@ -1729,7 +1768,6 @@ describe("ThreadShell", () => {
 
   it("restores in-memory messages when switching away and back to a session", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     const { rerender } = render(
       wrap(
@@ -1738,8 +1776,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -1762,8 +1798,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -1777,8 +1811,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -1949,7 +1981,6 @@ describe("ThreadShell", () => {
 
   it("clears the old thread when the active session is removed", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     const { rerender } = render(
       wrap(
@@ -1958,8 +1989,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -1982,8 +2011,6 @@ describe("ThreadShell", () => {
             session={null}
             title="nanobot"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -1997,7 +2024,6 @@ describe("ThreadShell", () => {
 
   it("creates a chat only when the blank landing sends a first message", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn();
     const onCreateChat = vi.fn().mockResolvedValue("chat-new");
 
     render(
@@ -2007,8 +2033,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
           onCreateChat={onCreateChat}
         />,
       ),
@@ -2021,7 +2045,6 @@ describe("ThreadShell", () => {
 
     await waitFor(() => expect(onCreateChat).toHaveBeenCalledTimes(1));
     expect(onCreateChat).toHaveBeenCalledWith(null, "start for real", null);
-    expect(onNewChat).not.toHaveBeenCalled();
   });
 
   it("applies the selected landing preset before sending the first prompt", async () => {
@@ -2338,8 +2361,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2355,7 +2376,6 @@ describe("ThreadShell", () => {
 
   it("does not leak the previous thread when opening a brand-new chat", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-new");
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -2383,8 +2403,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -2399,8 +2417,6 @@ describe("ThreadShell", () => {
             session={session("chat-new")}
             title="Chat chat-new"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2468,7 +2484,6 @@ describe("ThreadShell", () => {
 
   it("does not cache optimistic messages under the next chat during a session switch", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-b");
 
     const { rerender } = render(
       wrap(
@@ -2477,8 +2492,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -2501,8 +2514,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2520,8 +2531,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2537,8 +2546,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -2573,7 +2580,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2596,7 +2602,6 @@ describe("ThreadShell", () => {
             session={null}
             title="nanobot"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -2613,7 +2618,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -2630,7 +2634,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("chat-a"));
@@ -2692,7 +2695,6 @@ describe("ThreadShell", () => {
           session={session("chat-fork")}
           title="Chat chat-fork"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2769,7 +2771,6 @@ describe("ThreadShell", () => {
           session={session("resume-chat")}
           title="Resume chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -2822,7 +2823,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Cached completion"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("question");
     act(() => {
@@ -2874,7 +2875,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Published completion"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("question");
     act(() => {
@@ -2950,7 +2951,6 @@ describe("ThreadShell", () => {
           session={session("mount-during-reconnect")}
           title="Mount during reconnect"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3016,7 +3016,6 @@ describe("ThreadShell", () => {
           session={session("window-reset-chat")}
           title="Window reset"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3080,7 +3079,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("lineage-chat-a"));
@@ -3136,7 +3134,6 @@ describe("ThreadShell", () => {
           session={session("reset-tail-race")}
           title="Reset tail race"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3198,7 +3195,6 @@ describe("ThreadShell", () => {
           session={session("empty-reset-chat")}
           title="Empty reset"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3277,7 +3273,6 @@ describe("ThreadShell", () => {
             session={session("strict-canonical")}
             title="Strict canonical"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />
         </StrictMode>,
       ),
@@ -3344,7 +3339,7 @@ describe("ThreadShell", () => {
       return Promise.resolve(httpJson(completedBody(true)));
     }));
     render(wrap(client, <ThreadShell session={session(chatId)} title="Layout recheck"
-      onToggleSidebar={() => {}} onNewChat={() => {}} />));
+      onToggleSidebar={() => {}} />));
     await screen.findByText("layout question");
     act(() => {
       client._emitChat(chatId, {
@@ -3434,7 +3429,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("chat-version-a"));
@@ -3520,7 +3514,6 @@ describe("ThreadShell", () => {
           session={session("run-generation-chat")}
           title="Run generation chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3584,7 +3577,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Guided turn"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("guided question");
     act(() => {
@@ -3713,7 +3706,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Completed latest window" messageCache={messageCache}
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     const completed = await screen.findByText("completed reply");
     const older = screen.getByText("older paginated answer");
@@ -3778,7 +3771,7 @@ describe("ThreadShell", () => {
     }));
     render(wrap(client, <ThreadShell
       session={session(chatId)} title="Completed paged guidance" messageCache={messageCache}
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("completed last");
     const messages = [
@@ -3820,7 +3813,6 @@ describe("ThreadShell", () => {
       session={session("initial-completion")}
       title="Initial completion"
       onToggleSidebar={() => {}}
-      onNewChat={() => {}}
     />));
     await screen.findByText("previous question");
     act(() => client._emitChat("initial-completion", {
@@ -3873,7 +3865,6 @@ describe("ThreadShell", () => {
           session={session("late-frame-chat")}
           title="Late frame chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -3964,7 +3955,6 @@ describe("ThreadShell", () => {
         session={session(chatId)}
         title={`Chat ${chatId}`}
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
     );
     const { rerender } = render(view("visibility-complete-a"));
@@ -4024,7 +4014,6 @@ describe("ThreadShell", () => {
           session={session("empty-answer")}
           title="Empty answer"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4084,7 +4073,7 @@ describe("ThreadShell", () => {
 
       render(wrap(client, <ThreadShell
         session={session(chatId)} title="Running history"
-        onToggleSidebar={() => {}} onNewChat={() => {}}
+        onToggleSidebar={() => {}}
       />));
 
       await screen.findByText("previous answer");
@@ -4238,7 +4227,7 @@ describe("ThreadShell", () => {
     }));
     const { container } = render(wrap(client, <ThreadShell
       session={session(chatId)} title="Running paged history"
-      onToggleSidebar={() => {}} onNewChat={() => {}}
+      onToggleSidebar={() => {}}
     />));
     await screen.findByText("current question");
     act(() => client._emitChat(chatId, {
@@ -4306,8 +4295,6 @@ describe("ThreadShell", () => {
           session={session("before-delta-chat")}
           title="Before delta chat"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4406,7 +4393,6 @@ describe("ThreadShell", () => {
           session={session("active-resume-chat")}
           title="Active resume chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4493,7 +4479,6 @@ describe("ThreadShell", () => {
           session={session("timing-chat")}
           title="Timing chat"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4579,7 +4564,6 @@ describe("ThreadShell", () => {
             session={session("visible-chat")}
             title="Visible chat"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -4643,7 +4627,6 @@ describe("ThreadShell", () => {
             session={session("idle-visible-chat")}
             title="Idle visible chat"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -4700,7 +4683,6 @@ describe("ThreadShell", () => {
             session={session("retry-visible-chat")}
             title="Retry visible chat"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -4756,7 +4738,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4816,7 +4797,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -4867,7 +4847,6 @@ describe("ThreadShell", () => {
         session={session("token-media")}
         title="Token media"
         onToggleSidebar={() => {}}
-        onNewChat={() => {}}
       />,
       null,
       token,
@@ -4921,7 +4900,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -4984,7 +4962,6 @@ describe("ThreadShell", () => {
             session={session("chat-follow")}
             title="Chat follow"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -5080,7 +5057,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5103,7 +5079,6 @@ describe("ThreadShell", () => {
             session={session("chat-a")}
             title="Chat chat-a"
             onToggleSidebar={() => {}}
-            onNewChat={() => {}}
           />,
         ),
       );
@@ -5149,7 +5124,6 @@ describe("ThreadShell", () => {
           session={null}
           title="nanobot"
           onToggleSidebar={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5171,7 +5145,6 @@ describe("ThreadShell", () => {
 
   it("surfaces a dismissible banner for an uncorrelated message_too_big error", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     render(
       wrap(
@@ -5180,8 +5153,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -5217,8 +5188,6 @@ describe("ThreadShell", () => {
           session={session("chat-model-failure")}
           title="Chat model failure"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5238,7 +5207,7 @@ describe("ThreadShell", () => {
     });
 
     const banner = await screen.findByRole("alert");
-    expect(banner).toHaveTextContent("无法连接模型提供商");
+    expect(banner).toHaveTextContent("模型连接异常");
     expect(banner).toHaveTextContent(
       "已尝试 4 次，仍未成功。可稍后继续或切换模型。",
     );
@@ -5255,7 +5224,7 @@ describe("ThreadShell", () => {
         });
       });
       expect(screen.getAllByRole("alert")).toHaveLength(1);
-      expect(screen.getByRole("alert")).toHaveTextContent("无法连接模型提供商");
+      expect(screen.getByRole("alert")).toHaveTextContent("模型连接异常");
       expect(screen.getByRole("button", { name: "继续" })).toBeEnabled();
     }
 
@@ -5308,8 +5277,6 @@ describe("ThreadShell", () => {
           session={session("chat-inline-error")}
           title="Chat inline error"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={() => {}}
         />,
       ),
     );
@@ -5346,7 +5313,6 @@ describe("ThreadShell", () => {
 
   it("clears the stream error banner when the user switches to another chat", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-a");
 
     const { rerender } = render(
       wrap(
@@ -5355,8 +5321,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -5377,8 +5341,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -5391,7 +5353,6 @@ describe("ThreadShell", () => {
 
   it("clears the previous thread immediately while the next session loads", async () => {
     const client = makeClient();
-    const onNewChat = vi.fn().mockResolvedValue("chat-b");
     let resolveChatB:
       | ((value: { ok: boolean; status: number; json: () => Promise<unknown> }) => void)
       | null = null;
@@ -5426,8 +5387,6 @@ describe("ThreadShell", () => {
           session={session("chat-a")}
           title="Chat chat-a"
           onToggleSidebar={() => {}}
-          onGoHome={() => {}}
-          onNewChat={onNewChat}
         />,
       ),
     );
@@ -5442,8 +5401,6 @@ describe("ThreadShell", () => {
             session={session("chat-b")}
             title="Chat chat-b"
             onToggleSidebar={() => {}}
-            onGoHome={() => {}}
-            onNewChat={onNewChat}
           />,
         ),
       );
@@ -5517,8 +5474,6 @@ describe("ThreadShell", () => {
       session={session("lazy-mentions")}
       title="Lazy mentions"
       onToggleSidebar={() => {}}
-      onGoHome={() => {}}
-      onNewChat={() => {}}
     />));
     const input = await screen.findByLabelText("Message input");
     const catalogCalls = () => vi.mocked(fetch).mock.calls.filter(([url]) =>
@@ -5541,8 +5496,6 @@ describe("ThreadShell", () => {
       session={session("retry-mentions")}
       title="Retry mentions"
       onToggleSidebar={() => {}}
-      onGoHome={() => {}}
-      onNewChat={() => {}}
     />));
     const input = await screen.findByLabelText("Message input");
     const catalogCalls = () => vi.mocked(fetch).mock.calls.filter(([url]) =>
@@ -5566,8 +5519,6 @@ describe("ThreadShell", () => {
         session={session("chat-cli-apps")}
         title="Chat chat-cli-apps"
         onToggleSidebar={() => {}}
-        onGoHome={() => {}}
-        onNewChat={() => {}}
       />,
     ));
 
@@ -5626,8 +5577,6 @@ describe("ThreadShell", () => {
         session={session("chat-cli-race")}
         title="Chat chat-cli-race"
         onToggleSidebar={() => {}}
-        onGoHome={() => {}}
-        onNewChat={() => {}}
       />,
     ));
 
@@ -5706,8 +5655,6 @@ describe("ThreadShell", () => {
         session={session("chat-cli-refresh")}
         title="Chat chat-cli-refresh"
         onToggleSidebar={() => {}}
-        onGoHome={() => {}}
-        onNewChat={() => {}}
       />,
     ));
 
@@ -5777,7 +5724,7 @@ describe("ThreadShell", () => {
     expect(screen.getByRole("option", { name: /Other project/i })).toBeInTheDocument();
   });
 
-  it("allows project selection before first input and locks it after acceptance without duplicating the sidebar label", async () => {
+  it.each([true, undefined])("locks saved topics with projectLocked=%s independently of displayed history", async (projectLocked) => {
     const client = makeClient();
     const scope = { project_path: "/srv/alpha", project_name: "alpha", access_mode: "restricted" as const };
     const props = {
@@ -5789,7 +5736,7 @@ describe("ThreadShell", () => {
     expect(await screen.findByRole("button", { name: "Switch directory" })).toBeEnabled();
     expect(screen.getByTestId("thread-header")).not.toHaveTextContent("alpha");
 
-    rerender(wrap(client, <ThreadShell {...props} session={{ ...session("project-chat"), projectLocked: true }} />));
+    rerender(wrap(client, <ThreadShell {...props} session={{ ...session("project-chat"), projectLocked }} />));
     expect(screen.queryByRole("button", { name: "Switch directory" })).not.toBeInTheDocument();
     expect(screen.getByTestId("thread-header")).not.toHaveTextContent("alpha");
     expect(screen.getByRole("button", { name: "Workspace access mode: Default Permission" })).toBeEnabled();
