@@ -1,3 +1,4 @@
+import { PortalAccessError } from "@/lib/portal-context";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -436,6 +437,32 @@ describe("App layout", () => {
     const reads = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith("/subagents"));
     expect(reads).toHaveLength(supported ? 1 : 0);
     expect(requestMutationSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 409])("returns portal-managed HTTP %s failures to portal login", async (status) => {
+    const tags = Object.entries({
+      "portal-instance-id": "nanobot:user-a",
+      "portal-url": "http://localhost:8760/",
+      "portal-app": "nanobot",
+    }).map(([name, content]) => {
+      const tag = document.createElement("meta");
+      tag.name = name;
+      tag.content = content;
+      document.head.append(tag);
+      return tag;
+    });
+    try {
+      vi.mocked(fetchBootstrap).mockRejectedValueOnce(
+        status === 401 ? new Error("bootstrap failed: HTTP 401") : new PortalAccessError("instance"),
+      );
+      render(<App />);
+      expect(await screen.findByRole("heading", { name: "Return to portal" })).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "Open portal" })).toHaveAttribute("href", "http://localhost:8760/");
+      expect(screen.queryByLabelText("WebUI password")).not.toBeInTheDocument();
+      expect(fetchBootstrap).toHaveBeenCalledWith("", "");
+    } finally {
+      tags.forEach((tag) => tag.remove());
+    }
   });
 
   it("shows the auth form without an invalid-password error on first load", async () => {

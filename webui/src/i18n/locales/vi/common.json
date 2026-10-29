@@ -369,6 +369,11 @@
     "saveError": "Có thể đã xảy ra sự cố mạng. Lời nhắc này có thể xuất hiện lại."
   },
   "app": {
+    "portal": {
+      "title": "Quay lại cổng thông tin",
+      "description": "Đăng nhập vào cổng thông tin, rồi mở lại ứng dụng này.",
+      "open": "Mở cổng thông tin"
+    },
     "brand": "nanobot",
     "loading": {
       "connecting": "Đang kết nối tới nanobot…",

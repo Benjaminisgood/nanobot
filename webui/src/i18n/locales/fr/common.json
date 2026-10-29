@@ -369,6 +369,11 @@
     "saveError": "Il y a peut-être un problème de connexion. Ce rappel pourrait réapparaître."
   },
   "app": {
+    "portal": {
+      "title": "Retour au portail",
+      "description": "Connectez-vous au portail, puis rouvrez cette application.",
+      "open": "Ouvrir le portail"
+    },
     "brand": "nanobot",
     "loading": {
       "connecting": "Connexion à nanobot…",

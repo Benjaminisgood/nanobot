@@ -1,3 +1,4 @@
+import { portalWebSocketUrl, readPortalContext } from "./portal-context";
 import type { BootstrapResponse } from "./types";
 import { fetchWithTimeout } from "./http";
 
@@ -13,7 +14,7 @@ export class BootstrapAuthRequiredError extends Error {
 
 /** Read a previously saved bootstrap secret from localStorage. */
 export function loadSavedSecret(): string {
-  if (typeof window === "undefined") return "";
+  if (typeof window === "undefined" || readPortalContext()) return "";
   try {
     return window.localStorage.getItem(SECRET_STORAGE_KEY) ?? "";
   } catch {
@@ -23,6 +24,7 @@ export function loadSavedSecret(): string {
 
 /** Persist the bootstrap secret so page reloads don't re-prompt. */
 export function saveSecret(secret: string): void {
+  if (readPortalContext()) return;
   try {
     window.localStorage.setItem(SECRET_STORAGE_KEY, secret);
   } catch {
@@ -59,7 +61,7 @@ export function consumeUrlBootstrapSecret(): string {
     "",
     `${window.location.pathname}${window.location.search}${nextHash}`,
   );
-  return secret;
+  return readPortalContext() ? "" : secret;
 }
 
 /**
@@ -72,7 +74,7 @@ export async function fetchBootstrap(
   timeoutMs?: number,
 ): Promise<BootstrapResponse> {
   const headers: Record<string, string> = {};
-  if (secret) {
+  if (secret && !readPortalContext()) {
     headers["X-Nanobot-Auth"] = secret;
   }
   const res = await fetchWithTimeout(`${baseUrl}/webui/bootstrap`, {
@@ -105,6 +107,8 @@ export function deriveWsUrl(
   token: string | null | undefined,
   wsUrl?: string | null,
 ): string {
+  const portalUrl = portalWebSocketUrl(wsPath, token, wsUrl);
+  if (portalUrl) return portalUrl;
   const query = token ? `?token=${encodeURIComponent(token)}` : "";
   const path = wsPath && wsPath.startsWith("/") ? wsPath : `/${wsPath || ""}`;
   if (typeof window !== "undefined" && window.location.port === "5173") {

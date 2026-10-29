@@ -369,6 +369,11 @@
     "saveError": "網路可能出了點問題，之後可能還會跳出此提醒。"
   },
   "app": {
+    "portal": {
+      "title": "返回入口",
+      "description": "請在入口登入後重新開啟此應用程式。",
+      "open": "開啟入口"
+    },
     "brand": "nanobot",
     "loading": {
       "connecting": "正在連線到 nanobot…",

@@ -1,3 +1,5 @@
+import { PortalAuthPrompt } from "@/components/PortalAuthPrompt";
+import { PORTAL_AUTH_REQUIRED_EVENT, PortalAccessError, readPortalContext } from "@/lib/portal-context";
 import {
   lazy,
   Suspense,
@@ -581,7 +583,7 @@ function normalizeWorkspaceScope(scope: WorkspaceScopePayload): WorkspaceScopePa
 }
 
 function isBootstrapAuthRequired(error: unknown): boolean {
-  if (error instanceof BootstrapAuthRequiredError) return true;
+  if (error instanceof BootstrapAuthRequiredError || error instanceof PortalAccessError) return true;
   const msg = error instanceof Error ? error.message : String(error);
   return msg.includes("HTTP 401") || msg.includes("HTTP 403");
 }
@@ -955,6 +957,18 @@ export default function App() {
   const [state, setState] = useState<BootState>({ status: "loading" });
   const bootstrapSecretRef = useRef("");
 
+  useEffect(() => {
+    const requirePortalLogin = () => {
+      if (state.status === "ready") state.client.close();
+      clearReloadCache();
+      clearStoredComposerDrafts();
+      webuiThreadCache.clear();
+      setState({ status: "auth" });
+    };
+    window.addEventListener(PORTAL_AUTH_REQUIRED_EVENT, requirePortalLogin);
+    return () => window.removeEventListener(PORTAL_AUTH_REQUIRED_EVENT, requirePortalLogin);
+  }, [state]);
+
   const refreshReadyClient = useCallback(
     async (client: NanobotClient, fallbackSurface: RuntimeSurface) => {
       const boot = await fetchBootstrap("", bootstrapSecretRef.current);
@@ -1070,14 +1084,21 @@ export default function App() {
   }, [refreshReadyClient, state]);
 
   useEffect(() => {
-    const saved = consumeUrlBootstrapSecret() || loadSavedSecret();
-    return bootstrapWithSecret(saved);
+    try {
+      const supplied = consumeUrlBootstrapSecret();
+      const saved = readPortalContext() ? "" : supplied || loadSavedSecret();
+      return bootstrapWithSecret(saved);
+    } catch (error) {
+      setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
+    }
   }, [bootstrapWithSecret]);
 
   if (state.status === "loading") {
     return <StartupShell />;
   }
   if (state.status === "auth") {
+    const portal = readPortalContext();
+    if (portal) return <PortalAuthPrompt portal={portal} />;
     return (
       <AuthForm
         failed={!!state.failed}
@@ -1113,6 +1134,11 @@ export default function App() {
     clearReloadCache();
     clearStoredComposerDrafts();
     webuiThreadCache.clear();
+    const portal = readPortalContext();
+    if (portal) {
+      window.location.assign(portal.portalUrl);
+      return;
+    }
     setState({ status: "auth" });
   };
 

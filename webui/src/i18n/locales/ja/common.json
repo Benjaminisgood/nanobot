@@ -369,6 +369,11 @@
     "saveError": "ネットワークに問題が発生した可能性があります。この案内が再び表示されることがあります。"
   },
   "app": {
+    "portal": {
+      "title": "ポータルに戻る",
+      "description": "ポータルにログインしてから、このアプリを開き直してください。",
+      "open": "ポータルを開く"
+    },
     "brand": "nanobot",
     "loading": {
       "connecting": "nanobot に接続中…",

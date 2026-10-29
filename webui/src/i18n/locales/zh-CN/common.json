@@ -369,6 +369,11 @@
     "saveError": "网络可能出了点问题，之后可能还会弹出此提醒。"
   },
   "app": {
+    "portal": {
+      "title": "返回门户",
+      "description": "请在门户登录后重新打开此应用。",
+      "open": "打开门户"
+    },
     "brand": "nanobot",
     "loading": {
       "connecting": "正在连接 nanobot…",

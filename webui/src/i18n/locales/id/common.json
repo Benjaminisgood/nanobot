@@ -369,6 +369,11 @@
     "saveError": "Mungkin ada masalah jaringan. Pengingat ini mungkin muncul lagi."
   },
   "app": {
+    "portal": {
+      "title": "Kembali ke portal",
+      "description": "Masuk ke portal, lalu buka kembali aplikasi ini.",
+      "open": "Buka portal"
+    },
     "brand": "nanobot",
     "loading": {
       "connecting": "Menghubungkan ke nanobot…",

@@ -369,6 +369,11 @@
     "saveError": "There may be a network issue. This reminder may appear again."
   },
   "app": {
+    "portal": {
+      "title": "Return to portal",
+      "description": "Sign in at the portal, then reopen this app.",
+      "open": "Open portal"
+    },
     "brand": "nanobot",
     "loading": {
       "connecting": "Connecting to nanobot…",
