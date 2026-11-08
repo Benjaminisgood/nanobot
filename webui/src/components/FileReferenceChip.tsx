@@ -160,11 +160,18 @@ function StartTruncatedText({ children, className, ...props }: HTMLAttributes<HT
   const content = useRef<HTMLSpanElement>(null);
   const [clipped, setClipped] = useState(false);
   useLayoutEffect(() => {
-    const update = () => setClipped(content.current!.getBoundingClientRect().width > container.current!.getBoundingClientRect().width);
-    const observer = new ResizeObserver(update);
-    observer.observe(container.current!);
-    observer.observe(content.current!);
-    update();
+    let availableWidth = 0;
+    let contentWidth = 0;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const width = entry.borderBoxSize[0].inlineSize;
+        if (entry.target === container.current) availableWidth = width;
+        else contentWidth = width;
+      }
+      setClipped(contentWidth > availableWidth);
+    });
+    observer.observe(container.current!, { box: "border-box" });
+    observer.observe(content.current!, { box: "border-box" });
     return () => observer.disconnect();
   }, []);
   return <span ref={container} className={cn("inline-flex items-baseline overflow-hidden whitespace-nowrap", className)}>
@@ -333,7 +340,6 @@ export function fileIconForPath(path: string): LucideIcon {
   return FILE_ICONS[fileKindForPath(path)];
 }
 
-/** The same file silhouette and stroke in replies, tabs, and attachment tiles. */
 export function FileReferenceIcon({ kind, className }: { kind: FileReferenceKind; className?: string }) {
   const Icon = FILE_ICONS[kind];
   return <Icon aria-hidden strokeWidth={1.75} className={cn("h-[1em] w-[1em] shrink-0", className)} />;

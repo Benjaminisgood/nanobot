@@ -26,7 +26,7 @@ from nanobot.agent.command_op.models import (
 from nanobot.agent.command_op.runtime import CommandOpRuntime
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.loop import AgentLoop
-from nanobot.agent.tools.execution import execute_tool_calls
+from nanobot.agent.tools.execution import ToolCallResult, execute_tool_calls
 from nanobot.bus.notification_delivery import notification_is_deliverable
 from nanobot.bus.outbound_events import outbound_message_for_event
 from nanobot.bus.queue import MessageBus
@@ -380,7 +380,12 @@ async def test_agent_loop_suspends_propose_and_runs_after_approval(tmp_path: Pat
     bus.subscribe(record, CommandOpEvent)
     try:
         assert {"propose_op", "get_op", "patch_op_params"} <= set(loop.tools.tool_names)
-        results, events = await execute_tool_calls(
+        settled: list[ToolCallResult] = []
+
+        async def capture(items: list[ToolCallResult]) -> None:
+            settled.extend(items)
+
+        await execute_tool_calls(
             loop.tools,
             [ToolCallRequest(
                 id="call-1",
@@ -397,7 +402,10 @@ async def test_agent_loop_suspends_propose_and_runs_after_approval(tmp_path: Pat
             workspace_violation_counts={},
             hook=AgentHook(),
             context=AgentHookContext(iteration=0, messages=[]),
+            on_settled=capture,
         )
+        results = [item.result for item in settled]
+        events = [item.event for item in settled]
         assert events[0]["status"] == "need_approval"
         assert events[0]["status"] not in {"ok", "error"}
         observation = json.loads(results[0])

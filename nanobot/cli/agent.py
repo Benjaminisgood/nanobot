@@ -1,5 +1,3 @@
-"""Direct and interactive agent CLI command."""
-
 import asyncio
 import importlib
 import signal
@@ -131,7 +129,6 @@ def agent(
 
 def _run_classic(runtime_config: Config, *, message: str | None, session_id: str | None,
                  markdown: bool, logs: bool) -> None:
-    """Keep the data lease through writer initialization, execution and cleanup."""
     from nanobot.agent.hooks import create_file_edit_activity_hook
     from nanobot.agent.tools.image_generation import register_image_generation_tool
     from nanobot.agent.tools.mcp import MCPProvider
@@ -175,7 +172,6 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
     if is_default_workspace(runtime_config.workspace_path):
         _migrate_cron_store(runtime_config)
 
-    # Create cron service with workspace-scoped store
     cron_store_path = runtime_config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
     tools = ToolRegistry()
@@ -183,6 +179,7 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
     mcp_provider = MCPProvider.from_config(runtime_config, tools)
 
     _set_nanobot_logs(logs)
+    from nanobot.goal.assembly import install_goal
 
     try:
         agent_loop = agent_loop_class.from_config(
@@ -192,6 +189,7 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
             cron_service=cron,
             hook_factories=[create_file_edit_activity_hook],
             tool_registry=tools,
+            builtin_assembly=install_goal,
         )
     except ValueError as exc:
         _print_agent_start_error(exc)
@@ -209,7 +207,6 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
         finally:
             await mcp_provider.aclose()
 
-    # Shared reference for progress callbacks
     _thinking: ThinkingSpinner | None = None
 
     def _make_progress(
@@ -255,7 +252,6 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
         return _cli_progress
 
     if message is not None:
-        # Single message mode — direct call, no bus needed
         async def run_once() -> None:
             try:
                 await mcp_provider.connect()
@@ -287,7 +283,6 @@ def _run_classic(runtime_config: Config, *, message: str | None, session_id: str
 
         asyncio.run(run_once())
     else:
-        # Interactive mode — route through bus like other channels
         from nanobot.bus.events import InboundMessage
 
         cli_terminal._init_prompt_session()

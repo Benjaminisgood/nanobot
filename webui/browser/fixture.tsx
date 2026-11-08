@@ -19,6 +19,7 @@ import { initializeI18n, setAppLanguage } from "@/i18n";
 import { normalizeLocale } from "@/i18n/config";
 import type { McpPresetInfo, UIMessage } from "@/lib/types";
 import { SkeletonFixture } from "./skeleton-fixture";
+import { installToolsCatalogPreviewApi, ToolsCatalogFixture } from "./tools-catalog-fixture";
 import { installSkeletonPreviewApi, SkeletonAdditionsFixture } from "./skeleton-additions-fixture";
 import { NewChatSkeletonFixture } from "./new-chat-skeleton-fixture";
 import "../src/globals.css";
@@ -35,6 +36,8 @@ import { ActivityLogosFixture } from "./activity-logos-fixture";
 import { HistoryHydrationFixture } from "./history-hydration-fixture";
 import { IdleCompactionFixture, installIdleCompactionApi } from "./idle-compaction-fixture";
 import { FileEditPathFixture } from "./file-edit-path-fixture";
+import { FileDiffFixture } from "./file-diff-fixture";
+import { CodeHighlightingFixture } from "./code-highlighting-fixture";
 import { QueuedGuidanceFixture } from "./queued-guidance-fixture";
 import { WorkspaceAlignmentFixture } from "./workspace-alignment-fixture";
 import { ComposerActionFixture } from "./composer-action-fixture";
@@ -44,6 +47,7 @@ import { DisplayMathFixture } from "./display-math-fixture";
 import { AttachmentLayoutFixture } from "./attachment-layout-fixture";
 import { LoadedSessionSearchFixture } from "./loaded-session-search-fixture";
 import { AppearanceFixture } from "./appearance-fixture";
+import { ContinuityFixture } from "./continuity-fixture";
 import { installSubagentDockApi, SubagentDockFixture } from "./subagent-dock-fixture";
 
 const history: UIMessage[] = [
@@ -147,7 +151,7 @@ function RailFixture() {
       panes={[{ key: "rail", title: "Rail conversation" }]} activePaneKey="rail" layout="columns" showLayoutControl={false}
       onActivatePane={() => {}} onAddPane={() => {}} onLayoutChange={() => {}} onPaneOrderChange={() => {}}
       renderPane={(_pane, context) => <>
-        {viewport(true, context.navigationFrame)}
+        {viewport(context.composerPortalTarget !== undefined, context.navigationFrame)}
         {context.composerPortalTarget && createPortal(composer, context.composerPortalTarget)}
       </>}
     /> : viewport(false)}
@@ -215,6 +219,7 @@ function AppsFixture() {
   />{managing && <output data-testid="mcp-actions">{JSON.stringify(actions)}</output>}</main>;
 }
 if (parameters.get("case") === "skeleton-additions") installSkeletonPreviewApi();
+if (parameters.get("case") === "tools-catalog") installToolsCatalogPreviewApi();
 if (parameters.get("case") === "idle-compaction") installIdleCompactionApi();
 if (parameters.get("case") === "subagent-dock") installSubagentDockApi();
 await initializeI18n();
@@ -222,7 +227,9 @@ if (parameters.get("case") === "appearance" && parameters.has("lang")) {
   await setAppLanguage(normalizeLocale(parameters.get("lang")));
 }
 createRoot(document.getElementById("root")!).render(<TooltipProvider>
-  {parameters.get("case") === "appearance"
+  {parameters.get("case") === "continuity"
+    ? <ContinuityFixture />
+    : parameters.get("case") === "appearance"
     ? <AppearanceFixture />
     : parameters.get("case") === "loaded-session-search"
     ? <LoadedSessionSearchFixture />
@@ -240,6 +247,10 @@ createRoot(document.getElementById("root")!).render(<TooltipProvider>
     ? <WorkspaceAlignmentFixture parameters={parameters} />
     : parameters.get("case") === "queued-guidance"
     ? <QueuedGuidanceFixture />
+    : parameters.get("case") === "code-highlighting"
+    ? <CodeHighlightingFixture />
+    : parameters.get("case") === "file-diff"
+    ? <FileDiffFixture />
     : parameters.get("case") === "file-edit-path"
     ? <FileEditPathFixture />
     : parameters.get("case") === "answer-order"
@@ -274,6 +285,8 @@ createRoot(document.getElementById("root")!).render(<TooltipProvider>
     ? <ClientProvider client={railClient} token="fixture"><SkeletonAdditionsFixture /></ClientProvider>
     : parameters.get("case") === "skeleton"
     ? <ClientProvider client={railClient} token="fixture"><SkeletonFixture surface={parameters.get("surface") ?? "skills"} loading={parameters.has("loading")} /></ClientProvider>
+    : parameters.get("case") === "tools-catalog"
+    ? <ClientProvider client={railClient} token="fixture"><ToolsCatalogFixture /></ClientProvider>
     : parameters.get("case") === "apps"
     ? <ClientProvider client={railClient} token="fixture"><AppsFixture /></ClientProvider>
     : parameters.get("case") === "rail"

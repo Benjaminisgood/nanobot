@@ -1,5 +1,3 @@
-"""Base LLM provider interface."""
-
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -29,6 +27,12 @@ from nanobot.events import (
     RetryWaitEvent,
 )
 from nanobot.llm_usage.types import LLMUsage as LLMUsage
+from nanobot.providers.compaction import (
+    NativeCompaction,
+    ProviderCompactionEvents,
+    ProviderStateCommitError,
+    provider_compaction_scope,
+)
 from nanobot.providers.generation import GenerationSettings as GenerationSettings
 from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.helpers import sanitize_surrogates_deep
@@ -280,6 +284,29 @@ class ProviderCallContext:
     response_is_fallback: bool = False
     # A pre-request compactor must fit this budget before sending the pending input.
     compaction_input_budget: int | None = None
+    # Owned by one retry chain, shared only by its provider attempts.
+    compaction: ProviderCompactionEvents | None = field(default=None, repr=False, compare=False)
+    on_native_compaction: Callable[[ProviderConversationState], Awaitable[None]] | None = field(
+        default=None, repr=False, compare=False,
+    )
+
+    @property
+    def accepted_compaction(self) -> NativeCompaction | None:
+        initial = self.conversation_state
+        accepted = self.compaction.accepted if self.compaction is not None else None
+        if initial is None or accepted is None:
+            return None
+        current = accepted.state
+        if (initial.kind, initial.provider, initial.model, initial.version) != (
+            current.kind, current.provider, current.model, current.version,
+        ):
+            return None
+        return accepted
+
+    @property
+    def current_conversation_state(self) -> ProviderConversationState | None:
+        accepted = self.accepted_compaction
+        return accepted.state if accepted is not None else self.conversation_state
 
 
 @dataclass
@@ -296,8 +323,8 @@ class LLMResponse:
     generation_ms: int | None = None
     ttft_ms: int | None = None
     retry_after: float | None = None  # Provider supplied retry wait in seconds.
-    reasoning_content: str | None = None  # Kimi, DeepSeek-R1, MiMo etc.
-    thinking_blocks: list[dict[str, Any]] | None = None  # Anthropic extended thinking
+    reasoning_content: str | None = None
+    thinking_blocks: list[dict[str, Any]] | None = None
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     # True only when this response installed a new provider-native compaction
     # boundary. Replaying an older compaction item does not set this flag.
@@ -1048,7 +1075,6 @@ class LLMProvider(ABC):
         return found
 
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
-        """Call chat() and convert unexpected exceptions to error responses."""
         started_at_ms = time.time_ns() // 1_000_000
         started_at_ns = time.monotonic_ns()
         try:
@@ -1072,6 +1098,8 @@ class LLMProvider(ABC):
                 started_at_ns=started_at_ns,
                 stream=False,
             )
+            raise
+        except ProviderStateCommitError:
             raise
         except Exception as exc:
             response = self._error_response_from_exception(exc)
@@ -1146,7 +1174,6 @@ class LLMProvider(ABC):
         return await self.chat_stream(**kwargs)
 
     async def _safe_chat_stream(self, **kwargs: Any) -> LLMResponse:
-        """Call chat_stream() and convert unexpected exceptions to error responses."""
         started_at_ms = time.time_ns() // 1_000_000
         started_at_ns = time.monotonic_ns()
         first_output_at_ns: int | None = None
@@ -1217,6 +1244,8 @@ class LLMProvider(ABC):
                 started_at_ns=started_at_ns,
                 stream=True,
             )
+            raise
+        except ProviderStateCommitError:
             raise
         except Exception as exc:
             response = self._error_response_from_exception(exc)
@@ -1385,7 +1414,6 @@ class LLMProvider(ABC):
         should_retry_guard: Callable[[], bool] | None = None,
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        """Run one chat entry point through this provider's retry policy."""
         call = self._safe_chat_stream if stream else self._safe_chat
 
         async def attributed_call(**kwargs: Any) -> LLMResponse:
@@ -1426,17 +1454,24 @@ class LLMProvider(ABC):
             ))
             return response
 
-        return await self._run_with_retry(
-            attributed_call,
-            kw,
-            original_messages,
-            retry_mode=retry_mode,
-            on_retry_wait=on_retry_wait,
-            on_retry_exhausted=on_retry_exhausted,
-            on_retry_status=on_retry_status,
-            should_retry_guard=should_retry_guard,
-            on_stream_recover=on_stream_recover,
-        )
+        context = kw.get("provider_context")
+        events = context.events if isinstance(context, ProviderCallContext) else NO_EVENTS
+        async with provider_compaction_scope(
+            events, context.compaction if isinstance(context, ProviderCallContext) else None,
+        ) as compaction:
+            if isinstance(context, ProviderCallContext):
+                kw["provider_context"] = replace(context, compaction=compaction)
+            return await self._run_with_retry(
+                attributed_call,
+                kw,
+                original_messages,
+                retry_mode=retry_mode,
+                on_retry_wait=on_retry_wait,
+                on_retry_exhausted=on_retry_exhausted,
+                on_retry_status=on_retry_status,
+                should_retry_guard=should_retry_guard,
+                on_stream_recover=on_stream_recover,
+            )
 
     @classmethod
     def _extract_retry_after(cls, content: str | None) -> float | None:
@@ -1719,7 +1754,6 @@ class LLMProvider(ABC):
         original_messages: list[dict[str, Any]],
         response: LLMResponse,
     ) -> LLMResponse:
-        """Try image compatibility repair once, outside transient retries."""
         # Removing the user's images cannot repair account access.
         if (
             (response.error_kind or "").lower() in {"authentication", "oauth_auth_required"}
@@ -1727,8 +1761,14 @@ class LLMProvider(ABC):
             or self.is_arrearage_response(response)
         ):
             return response
-        stripped = self._strip_image_content(kw["messages"])
         provider_context = kw.get("provider_context")
+        if (
+            isinstance(provider_context, ProviderCallContext)
+            and provider_context.compaction_input_budget is not None
+        ):
+            # Stateless image repair cannot satisfy required native compaction.
+            return response
+        stripped = self._strip_image_content(kw["messages"])
         stripped_context: ProviderCallContext | None = None
         if isinstance(provider_context, ProviderCallContext):
             state = provider_context.conversation_state
@@ -1738,13 +1778,7 @@ class LLMProvider(ABC):
                 or self._contains_image_content(state.payload)
             ):
                 # Native payloads may retain images: rebuild from the public transcript.
-                stripped_context = ProviderCallContext(
-                    context_window_tokens=provider_context.context_window_tokens,
-                    session_id=provider_context.session_id,
-                    events=provider_context.events,
-                    response_preset=provider_context.response_preset,
-                    response_is_fallback=provider_context.response_is_fallback,
-                )
+                stripped_context = replace(provider_context, conversation_state=None)
         if stripped is None and stripped_context is None:
             return response
         logger.warning("Non-transient LLM error with image content, retrying without images")
