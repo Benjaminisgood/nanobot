@@ -142,6 +142,8 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
         if command_op:
             payload["disposition"] = status
         if phase == "error":
+            if event.get("error_code"):
+                payload["error_code"] = event["error_code"]
             if isinstance(result, str) and result.strip():
                 payload["error"] = result.strip()
             else:

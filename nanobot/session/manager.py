@@ -303,6 +303,12 @@ class Session:
                 if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
+            if include_runtime_context and "input_id" in message and not is_hidden_history_message(message):
+                entry["_meta"] = {"input_id": message["input_id"]}
+            marker = message.get(HIDDEN_HISTORY_META)
+            if include_runtime_context and isinstance(marker, dict) and cast(dict[str, Any], marker).get("kind") == "internal_continuation":
+                # Attribution must distinguish persisted continuations from no-ID automation inputs.
+                entry[HIDDEN_HISTORY_META] = {"kind": "internal_continuation"}
             for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
                 if key in message:
                     entry[key] = message[key]
@@ -479,13 +485,8 @@ class SessionManager:
         return SessionLocation.safe_key(key)
 
     @staticmethod
-    def _storage_key(key: str) -> str:
-        """Collision-resistant encoding for internal session storage filenames."""
-        return SessionLocation.storage_key(key)
-
-    @staticmethod
     def _decode_storage_key(stem: str) -> str | None:
-        """Reverse _storage_key(): decode a base64url (no-padding) stem back to the original key."""
+        """Decode a base64url (no-padding) stem back to the original key."""
         return SessionLocation.decode_storage_key(stem)
 
     @staticmethod

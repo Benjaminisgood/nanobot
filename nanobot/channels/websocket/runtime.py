@@ -374,9 +374,6 @@ class WebSocketChannel(BaseChannel):
             session_projection=gateway.session_projection,
         )
         self._commands = WebUICommandRouter(self, gateway, outbound=self._outbound)
-        self._webui_request_tasks = self._commands.request_tasks
-        self._webui_request_operations = self._commands.request_operations
-        self._webui_request_locks = self._commands.request_locks
         self._command_event_unsub: Callable[[], None] | None = None
         self._template_event_unsub: Callable[[], None] | None = None
         self._command_broadcasts: set[asyncio.Task[None]] = set()
@@ -432,7 +429,6 @@ class WebSocketChannel(BaseChannel):
         media: list[str] | None,
         metadata: dict[str, Any],
         is_dm: bool,
-        session_key: str | None,
         require_existing_session: bool,
         session_generation: str | None,
     ) -> None:
@@ -443,7 +439,6 @@ class WebSocketChannel(BaseChannel):
             media=media,
             metadata=metadata,
             is_dm=is_dm,
-            session_key=session_key,
             require_existing_session=require_existing_session,
             session_generation=session_generation,
         )

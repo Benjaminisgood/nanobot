@@ -1,7 +1,6 @@
 import { isContextGraph, isContextInspection } from "@/lib/context-graph";
 import { isCompactionPhase, isCompactionReason } from "../../../packages/client-events/notifications";
 import type {
-  ApiServicePayload,
   AutomationChatsPayload,
   AutomationChatUpdate,
   AutomationsPayload,
@@ -286,6 +285,9 @@ function hasValidProjectionMetadata(value: Record<string, unknown>): boolean {
       "user", "reasoning", "activity", "answer", "complete",
     ].includes(String(value.turn_phase)))
     && (value.turn_seq === undefined || typeof value.turn_seq === "number")
+    && (value.input_id === undefined || typeof value.input_id === "string")
+    && (value.response_input_ids === undefined || (Array.isArray(value.response_input_ids)
+      && value.response_input_ids.every((id: unknown) => typeof id === "string")))
     && (
       value.response_sources === undefined
       || (isRecordArray(value.response_sources) && value.response_sources.every((source) => (
@@ -384,8 +386,13 @@ function parseThreadProjectionEvent(value: unknown, validatedGraphs: ReadonlySet
     case "stream_end":
     case "reasoning_end":
       if (value.text !== undefined && typeof value.text !== "string") break;
+      if (value.text_from_seq !== undefined && (
+        !Number.isSafeInteger(value.text_from_seq) || Number(value.text_from_seq) < 0
+        || !Number.isSafeInteger(value.turn_seq) || Number(value.text_from_seq) > Number(value.turn_seq)
+      )) break;
       return value as unknown as ThreadProjectionEvent;
     case "context_compaction":
+      if (value.context_graph !== undefined && !validatedGraphs.has(value.context_graph) && !isContextGraph(value.context_graph)) break;
       if (value.context_snapshot !== undefined && !isContextInspection(value.context_snapshot, (graph): graph is ContextGraph => validatedGraphs.has(graph) || isContextGraph(graph))) break;
       if (typeof value.compaction_id !== "string" || !value.compaction_id
         || !isCompactionPhase(value.phase)
@@ -418,6 +425,21 @@ export function parseWebuiThreadPayload(value: unknown): WebuiThreadPersistedPay
   }
   if (value.projection !== "events" || !Array.isArray(value.events)) {
     throw new Error("Invalid WebUI thread events");
+  }
+  if (isRecord(value.page) && value.page.history_generation != null
+    && (typeof value.page.history_generation !== "string" || !value.page.history_generation)) {
+    throw new Error("Invalid WebUI thread history generation");
+  }
+  if (isRecord(value.page) && value.page.record_range !== undefined) {
+    const range = value.page.record_range;
+    if (!isRecord(range) || !Number.isSafeInteger(range.turn) || Number(range.turn) < 0
+      || !Number.isSafeInteger(range.start) || Number(range.start) < 0
+      || !Number.isSafeInteger(range.end) || Number(range.end) <= Number(range.start)) {
+      throw new Error("Invalid WebUI thread record range");
+    }
+  }
+  if (isRecord(value.page) && value.page.recovered_answers !== undefined && typeof value.page.recovered_answers !== "boolean") {
+    throw new Error("Invalid WebUI thread answer recovery");
   }
   const graphs = new Map<string, ContextGraph>();
   if (value.context_graphs !== undefined) {
@@ -537,10 +559,11 @@ export async function fetchPromptIndex(token: string, key: string, signal: Abort
   const prompts = body.prompts.map((item: unknown) => {
     if (!isRecord(item) || typeof item.id !== "string" || typeof item.preview !== "string"
       || typeof item.answerPreview !== "string" || typeof item.cursor !== "string" || typeof item.turnId !== "string"
+      || (item.inputId !== undefined && typeof item.inputId !== "string")
       || typeof item.createdAt !== "number" || !Number.isFinite(item.createdAt)) {
       throw new Error("Invalid prompt summary");
     }
-    return { id: item.id, preview: item.preview, answerPreview: item.answerPreview,
+    return { id: item.id, inputId: item.inputId, preview: item.preview, answerPreview: item.answerPreview,
       cursor: item.cursor, createdAt: item.createdAt, turnId: item.turnId };
   });
   return { prompts: [...(cached?.prompts.slice(0, replaceFrom) ?? []), ...prompts],
@@ -820,28 +843,40 @@ export async function deleteSession(
   );
 }
 
-export async function fetchSettings(
+const settingsReads = new WeakMap<WebUIMutationTransport, Map<string, Promise<SettingsPayload>>>();
+
+export function fetchSettings(
   token: string,
   base: string = "",
+  scope?: WebUIMutationTransport,
 ): Promise<SettingsPayload> {
-  return request<SettingsPayload>(
-    `${base}/api/settings`,
-    token,
-    undefined,
-    API_READ_TIMEOUT_MS,
-  );
+  const load = () => request<SettingsPayload>(`${base}/api/settings`, token, undefined, API_READ_TIMEOUT_MS);
+  if (!scope) return load();
+  let reads = settingsReads.get(scope);
+  if (!reads) {
+    reads = new Map();
+    settingsReads.set(scope, reads);
+  }
+  const key = JSON.stringify([base, token]);
+  const pending = reads.get(key);
+  if (pending) return pending;
+  const read = load().finally(() => reads.delete(key));
+  reads.set(key, read);
+  return read;
 }
 
 export async function fetchSettingsUsage(
   token: string,
-  base: string = "",
+  options: { details?: boolean; cached?: NonNullable<SettingsPayload["usage"]>; signal?: AbortSignal } = {},
 ): Promise<NonNullable<SettingsPayload["usage"]>> {
-  return request<NonNullable<SettingsPayload["usage"]>>(
-    `${base}/api/settings/usage`,
-    token,
-    undefined,
-    API_READ_TIMEOUT_MS,
-  );
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+  if (options.cached?.revision) headers["If-None-Match"] = `W/"${options.cached.revision}"`;
+  const response = await fetchWithTimeout(`/api/settings/usage${options.details ? "?details=true" : ""}`, {
+    headers, credentials: "same-origin", cache: "no-store", signal: options.signal,
+  }, API_READ_TIMEOUT_MS);
+  if (response.status === 304 && options.cached) return options.cached;
+  if (!response.ok) throw new ApiError(response.status, `HTTP ${response.status}`);
+  return await response.json() as NonNullable<SettingsPayload["usage"]>;
 }
 
 export type UpdateChannel = "stable" | "preview";
@@ -1009,33 +1044,6 @@ export async function fetchNanobotFeatures(
     undefined,
     API_READ_TIMEOUT_MS,
   );
-}
-
-export async function fetchApiService(token: string, base: string = ""): Promise<ApiServicePayload> {
-  return request<ApiServicePayload>(`${base}/api/settings/api-service`, token);
-}
-
-export async function startApiService(
-  transport: WebUIMutationTransport,
-  values: { host: string; port: number; timeout: number; apiKey?: string },
-): Promise<ApiServicePayload> {
-  return mutation<ApiServicePayload>(
-    transport,
-    "settings.api_service.start",
-    {
-      host: values.host,
-      port: values.port,
-      timeout: values.timeout,
-      ...(values.apiKey !== undefined ? { api_key: values.apiKey } : {}),
-    },
-    PACKAGE_MUTATION_TIMEOUT_MS,
-  );
-}
-
-export async function stopApiService(
-  transport: WebUIMutationTransport,
-): Promise<ApiServicePayload> {
-  return mutation<ApiServicePayload>(transport, "settings.api_service.stop");
 }
 
 export async function enableNanobotFeature(
@@ -1402,14 +1410,16 @@ function modelGenerationSettingsPayload(
 export async function createModelConfiguration(
   transport: WebUIMutationTransport,
   configuration: ModelConfigurationCreate,
-): Promise<SettingsPayload> {
-  return mutation<SettingsPayload>(
+  optimized = false,
+): Promise<Omit<SettingsPayload, "usage"> & Partial<Pick<SettingsPayload, "usage">>> {
+  return mutation<Omit<SettingsPayload, "usage">>(
     transport,
     "settings.model_configuration.create",
     {
       name: configuration.name,
       provider: configuration.provider,
       model: configuration.model,
+      ...(optimized ? { append_to_order: true, include_usage: false } : {}),
       ...modelGenerationSettingsPayload(configuration),
     },
   );
@@ -1418,12 +1428,14 @@ export async function createModelConfiguration(
 export async function updateModelConfiguration(
   transport: WebUIMutationTransport,
   configuration: ModelConfigurationUpdate,
-): Promise<SettingsPayload> {
-  return mutation<SettingsPayload>(
+  optimized = false,
+): Promise<Omit<SettingsPayload, "usage"> & Partial<Pick<SettingsPayload, "usage">>> {
+  return mutation<Omit<SettingsPayload, "usage">>(
     transport,
     "settings.model_configuration.update",
     {
       name: configuration.name,
+      ...(optimized ? { include_usage: false } : {}),
       ...(configuration.newName !== undefined ? { new_name: configuration.newName } : {}),
       ...(configuration.provider !== undefined ? { provider: configuration.provider } : {}),
       ...(configuration.model !== undefined ? { model: configuration.model } : {}),
@@ -1610,6 +1622,12 @@ export async function mutateCommandOp(
   const result = await mutation<unknown>(transport, `command_op.${action}`, payload);
   if (!isCommandOpsSnapshot(result)) throw new Error("Invalid command ops response");
   return result;
+}
+
+export async function checkSandboxSettings(
+  transport: WebUIMutationTransport,
+): Promise<{ sandbox: import("@/lib/types").SandboxCheck }> {
+  return mutation(transport, "settings.sandbox.check", {});
 }
 
 export function starPromptAction(

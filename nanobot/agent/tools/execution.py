@@ -11,6 +11,7 @@ from loguru import logger
 
 from nanobot.agent.command_op.events import COMMAND_OP_TOOL_STATUSES
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import tool_log_content_allowed
 from nanobot.agent.tools.file_state import file_read_context
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result, with_tool_error_hint
@@ -223,6 +224,8 @@ async def _execute_tool_call_inner(
             "status": "error",
             "detail": result.replace("\n", " ").strip()[:120],
         }
+        if isinstance(result, ToolResult) and result.error_code:
+            event["error_code"] = result.error_code
         handled = _classify_violation(
             raw_text=result,
             soft_payload=payload,

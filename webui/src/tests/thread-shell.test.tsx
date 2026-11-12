@@ -88,7 +88,6 @@ function makeClient() {
     },
     getRunState: lifecycle.getRunState.bind(lifecycle),
     restorePendingRun: lifecycle.restorePendingRun.bind(lifecycle),
-    getRunStartedAt: lifecycle.getRunStartedAt.bind(lifecycle),
     getRunTurnId: lifecycle.getRunTurnId.bind(lifecycle),
     isRunCompleted: lifecycle.isRunCompleted.bind(lifecycle),
     finishRunLocally: vi.fn(lifecycle.finishRunLocally.bind(lifecycle)),
@@ -96,6 +95,7 @@ function makeClient() {
     getRunGeneration: lifecycle.getRunGeneration.bind(lifecycle),
     canReconcileCanonicalCompletion,
     reconcileCanonicalCompletion,
+    settleFragmentRunLifecycle: vi.fn(lifecycle.settleFragmentRunLifecycle.bind(lifecycle)),
     fenceCanonicalCompletedTurns: lifecycle.fenceCanonicalCompletedTurns.bind(lifecycle),
     getGoalState: lifecycle.getGoalState.bind(lifecycle),
     onTranscript: lifecycle.onTranscript.bind(lifecycle),
@@ -245,7 +245,7 @@ function streamedThreadPayload(
         projection_id: `answer:${row.turnId}:${row.streamId}:${endSeq}`,
         turn_id: row.turnId, turn_phase: "answer", turn_seq: endSeq,
         stream_id: row.streamId, text: row.content,
-        projection_receipts: [{ turn_id: row.turnId, ranges: [[textSeq, endSeq]] }],
+        text_from_seq: textSeq,
         ...(row.mergeNext ? { resuming: true, merge_next: true } : {}),
       });
     }
@@ -438,7 +438,6 @@ function modelSettings(model: string, provider: string): SettingsPayload {
       dream: {
         schedule: "every 2h",
       },
-      unified_session: false,
     },
     advanced: {
       restrict_to_workspace: false,
@@ -1703,6 +1702,44 @@ describe("ThreadShell", () => {
     expect(screen.getByText("Default")).toBeInTheDocument();
     await openMessageActions("Reply from the actual provider");
     expect(await screen.findByText("backup")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["bwrap", "MacIntel", "Bubblewrap (bwrap)", "Configure bwrap path"],
+    ["seatbelt", "Linux x86_64", "macOS Seatbelt (sandbox-exec)", "Configure sandbox-exec path"],
+  ] as const)("uses the gateway's %s launcher and links to its path editor", async (backend, browserPlatform, launcher, action) => {
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue(browserPlatform);
+    try {
+      const client = makeClient();
+      const openSettings = vi.fn();
+      const settings = modelSettings("test-model", "deepseek");
+      settings.advanced.exec_sandbox_status = {
+        state: "unavailable", reason: "launcher_missing", launcher: null,
+        revision: "gateway-launcher", supported_backend: backend,
+      };
+      render(wrap(client, <ThreadShell session={session("sandbox-notice")} title="Sandbox notice"
+        onToggleSidebar={() => {}} settingsSnapshot={settings} onOpenSandboxSettings={openSettings}
+      />, undefined, "tok", ["webui.sandbox-settings.v1"]));
+      const input = await screen.findByRole("textbox");
+      fireEvent.change(input, { target: { value: "Keep my draft" } });
+      input.focus();
+      act(() => {
+        client._emitChat("sandbox-notice", { event: "user_message", chat_id: "sandbox-notice",
+          turn_id: "sandbox-turn", starts_turn: true, text: "Run a command" });
+        client._emitChat("sandbox-notice", { event: "message", chat_id: "sandbox-notice", text: "",
+          turn_id: "sandbox-turn", kind: "progress", tool_events: [{
+            name: "exec", phase: "error", error_code: "sandbox_launcher_missing", call_id: "sandbox-command",
+          }] });
+      });
+      const banner = (await screen.findByRole("button", { name: action })).closest<HTMLElement>('[role="status"]')!;
+      expect(banner).toHaveTextContent(launcher);
+      expect(input).toHaveFocus();
+      fireEvent.click(within(banner).getByRole("button", { name: action }));
+      expect(openSettings).toHaveBeenCalledWith("sandbox-launcher");
+      expect(input).toHaveValue("Keep my draft");
+    } finally {
+      platform.mockRestore();
+    }
   });
 
   it("shows a dismissible, session-scoped fallback notice without changing the composer preset", async () => {
@@ -3226,7 +3263,7 @@ describe("ThreadShell", () => {
     );
   });
 
-  it("recovers an uncommitted reset lineage on the next canonical hydrate", async () => {
+  it("adopts a disjoint latest window immediately when returning to a cached session", async () => {
     const client = makeClient();
     let chatACalls = 0;
     vi.stubGlobal(
@@ -3272,8 +3309,8 @@ describe("ThreadShell", () => {
     rerender(view("lineage-chat-a"));
     await waitFor(() => expect(chatACalls).toBe(2));
 
-    expect(screen.getByText("committed old lineage")).toBeInTheDocument();
-    expect(screen.queryByText("disjoint new lineage")).not.toBeInTheDocument();
+    expect(await screen.findByText("disjoint new lineage")).toBeInTheDocument();
+    expect(screen.queryByText("committed old lineage")).not.toBeInTheDocument();
 
     act(() => client._emitSessionUpdate("lineage-chat-a", "thread"));
 
@@ -4157,7 +4194,7 @@ describe("ThreadShell", () => {
     act(() => client._emitSessionUpdate("visibility-complete-a", "thread"));
     await waitFor(() => expect(screen.getByText("completed while hidden")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Stop response" })).not.toBeInTheDocument();
-    expect(client.getRunStartedAt("visibility-complete-a")).toBeNull();
+    expect(client.getRunState("visibility-complete-a").startedAt).toBeNull();
 
     rerender(view("visibility-complete-b"));
     await waitFor(() => expect(screen.getByText("other thread")).toBeInTheDocument());
@@ -4264,7 +4301,7 @@ describe("ThreadShell", () => {
       expect(screen.getByText("saved answer prefix")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
       expect(client.reconcileCanonicalCompletion).not.toHaveBeenCalled();
-      expect(client.getRunStartedAt(chatId)).toBe(1_700);
+      expect(client.getRunState(chatId).startedAt).toBe(1_700);
 
       const input = screen.getByRole("textbox", { name: "Message input" });
       fireEvent.change(input, { target: { value: "queued guidance" } });
@@ -4531,7 +4568,7 @@ describe("ThreadShell", () => {
     ));
   });
 
-  it("keeps the live answer cursor when a resumed turn is still running", async () => {
+  it("catches up the active answer and keeps its cursor when a resumed turn is still running", async () => {
     const client = makeClient();
     let historyCalls = 0;
     const turnId = "turn-active-resume";
@@ -4607,6 +4644,7 @@ describe("ThreadShell", () => {
     expect(client.sendMessage).not.toHaveBeenCalled();
     act(() => client._emitStatus("open"));
     await waitFor(() => expect(historyCalls).toBe(2));
+    await screen.findByText("partial answer missed");
     expect(client.sendMessage).not.toHaveBeenCalled();
 
     act(() => {
@@ -4618,7 +4656,7 @@ describe("ThreadShell", () => {
       });
     });
 
-    await waitFor(() => expect(screen.getByText("partial answer resumed")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("partial answer missed resumed")).toBeInTheDocument());
     expect(screen.queryByText(" resumed")).not.toBeInTheDocument();
     expect(client.sendMessage).not.toHaveBeenCalled();
 

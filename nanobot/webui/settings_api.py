@@ -161,6 +161,7 @@ def settings_payload(
     restart_required_sections: list[str] | None = None,
     apply_state: dict[str, Any] | None = None,
     config_path: Path | None = None,
+    include_usage: bool = False,
 ) -> dict[str, Any]:
     config = _load_settings_config(config_path)
     payload: dict[str, Any] = {
@@ -176,6 +177,7 @@ def settings_payload(
             config,
             config_path=_settings_config_path(config_path),
             version=__version__,
+            include_usage=include_usage,
         ),
         "requires_restart": requires_restart,
     }
@@ -188,8 +190,10 @@ def settings_payload(
     )
 
 
-def settings_usage_payload(*, config_path: Path | None = None) -> dict[str, Any]:
-    return system.settings_usage_payload(_load_settings_config(config_path))
+def settings_usage_payload(
+    *, config_path: Path | None = None, details: bool = False,
+) -> dict[str, Any]:
+    return system.settings_usage_payload(_load_settings_config(config_path), details=details)
 
 
 def update_agent_settings(
@@ -223,8 +227,12 @@ def create_model_configuration(
         query,
         oauth_status=_oauth_provider_status,
     )
+    if _query_first(query, "append_to_order") == "true":
+        models.append_model_call_order(config, name, oauth_status=_oauth_provider_status)
     _save_settings_config(config, config_path)
-    payload = settings_payload(config_path=config_path)
+    payload = settings_payload(
+        config_path=config_path, include_usage=_query_first(query, "include_usage") != "false",
+    )
     payload["created_model_preset"] = name
     return payload
 
@@ -259,7 +267,9 @@ def update_model_configuration(
                 raise
         else:
             _save_settings_config(config, config_path)
-    return settings_payload(config_path=config_path)
+    return settings_payload(
+        config_path=config_path, include_usage=_query_first(query, "include_usage") != "false",
+    )
 
 
 def update_model_call_order(
@@ -427,17 +437,6 @@ def update_web_search_settings(
         requires_restart=restart_required,
         config_path=config_path,
     )
-
-
-def update_api_settings(
-    query: QueryParams,
-    *,
-    config_path: Path | None = None,
-) -> dict[str, Any]:
-    config = _load_settings_config(config_path)
-    capabilities.update_api_settings(config, query)
-    _save_settings_config(config, config_path)
-    return settings_payload(config_path=config_path)
 
 
 def update_image_generation_settings(
