@@ -369,11 +369,6 @@
     "saveError": "Puede que haya un problema de conexión. Este recordatorio podría volver a aparecer."
   },
   "app": {
-    "portal": {
-      "title": "Volver al portal",
-      "description": "Inicia sesión en el portal y vuelve a abrir esta aplicación.",
-      "open": "Abrir portal"
-    },
     "brand": "nanobot",
     "loading": {
       "connecting": "Conectando con nanobot…",
@@ -2563,31 +2558,5 @@
       "cancel": "Cancelar",
       "switchDirectory": "Cambiar directorio"
     }
-  },
-  "commandWorkbench": {
-    "title": "Comandos",
-    "open": "Comandos",
-    "loading": "Cargando comandos",
-    "live": "Catálogo de taptap --describe-json",
-    "unavailable": "taptap --describe-json no está disponible. Estos comandos siguen pendientes.",
-    "invalid": "No se pudo leer taptap --describe-json. Estos comandos siguen pendientes.",
-    "unchecked": "Catálogo sin comprobar.",
-    "progress": "{{done}} de {{total}}",
-    "current": "Paso actual",
-    "fill": "Guardar",
-    "approve": "Aprobar",
-    "cancel": "Cancelar",
-    "approveHint": "Aprueba este comando exacto.",
-    "needsInput": "Falta información",
-    "needsApproval": "Pendiente de aprobación",
-    "startQuantitative": "Iniciar cuantitativo",
-    "startKinetics": "Iniciar cinética",
-    "exitCode": "Código de salida",
-    "noOps": "No hay ningún comando en espera.",
-    "pending": "Esperando un catálogo",
-    "acceptance": "Una ejecución terminada aún necesita aceptación científica.",
-    "log": "Registro",
-    "error": "No se pudo actualizar el comando.",
-    "required": "Obligatorio"
   }
 }

@@ -20,11 +20,6 @@ from loguru import logger
 from nanobot.agent import context as agent_context
 from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
-from nanobot.agent.command_op.events import CommandOpEvent
-from nanobot.agent.command_op.models import CommandOp
-from nanobot.agent.command_op.runtime import CommandOpRuntime
-from nanobot.agent.command_op.template_run import TemplateRun
-from nanobot.agent.command_op.workbench import CommandWorkbench
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver, TranscriptInput
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.execution_policy import ExecutionControlError, ExecutionPolicy, ExecutionScope
@@ -669,75 +664,8 @@ class AgentLoop:
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
-        registered.extend(self._register_command_ops())
 
         logger.info("Registered {} tools: {}", len(registered), registered)
-
-    def _register_command_ops(self) -> list[str]:
-        """Register the CommandOp kernel (draft section 5).
-
-        TapTool and TapRunManager are not in this tree. ``propose_op`` suspends
-        a CLI invocation as a CommandOp. ``op.approved`` schedules execution on
-        a background task so the turn is not blocked and no chat message is
-        synthesized for pending fill, approval, run, or completion.
-
-        A live ``taptap --describe-json`` catalog is registered when the CLI
-        answers with the describe schema. ``NANOBOT_TAPTAP`` selects that
-        executable, including the in-repo Linux stub. A missing or unreadable
-        CLI leaves boss-flow commands pending and does not invent flags.
-        """
-        from nanobot.agent.command_op.describe import (
-            CatalogDiscovery,
-            discover_taptap_catalog,
-            install_live_catalog,
-        )
-        from nanobot.agent.command_op.models import CommandOpError
-        from nanobot.agent.command_op.tap_adapter import TapAdapter
-        from nanobot.agent.tools.command_op import register_command_op_tools
-
-        self.command_ops = CommandOpRuntime(workspace=self.workspace, bus=self.bus)
-        self.command_ops.load_builtin_catalog()
-        self.tap_adapter = TapAdapter(self.command_ops)
-        discovery = discover_taptap_catalog()
-        if discovery.status == "live":
-            try:
-                install_live_catalog(self.tap_adapter, self.workspace, discovery)
-            except CommandOpError as exc:
-                discovery = CatalogDiscovery(status="invalid", detail=exc.message)
-        self.command_ops.note_catalog_discovery(discovery.status, discovery.detail)
-        names = register_command_op_tools(self.tools, self.command_ops)
-        self.bus.subscribe(self._on_command_op_approved, CommandOpEvent)
-        return names
-
-    async def _on_command_op_approved(self, event: CommandOpEvent) -> None:
-        if event.name != "op.approved":
-            return
-        self.schedule_background(self.command_ops.execute(event.op_id))
-
-    async def approve_command_op(self, op_id: str, *, sha: str, by: str) -> CommandOp:
-        """Bind a user approval to the frozen argv sha and wake the executor."""
-        return await self.command_workbench().approve(op_id, sha=sha, by=by)
-
-    async def fill_command_op(self, op_id: str, params: object) -> CommandOp:
-        """Replace authoritative params from the workbench and publish CommandOp events."""
-        return await self.command_workbench().fill(op_id, params)
-
-    async def cancel_command_op(self, op_id: str) -> CommandOp:
-        """Cancel an op from the workbench. Publishes ``op.cancelled``."""
-        return await self.command_workbench().cancel(op_id)
-
-    async def start_template_run(
-        self,
-        template: str,
-        *,
-        run_id: str | None = None,
-    ) -> TemplateRun:
-        """Open a parent quantitative or kinetics run for the boss progress bar."""
-        return await self.command_ops.start_template_run(template, run_id=run_id)
-
-    def command_workbench(self) -> CommandWorkbench:
-        """Fill, approve, and cancel hooks for a UI sharing this loop's bus."""
-        return CommandWorkbench(self.command_ops, self.bus)
 
     def register_runtime_context_provider(
         self,

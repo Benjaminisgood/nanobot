@@ -121,7 +121,6 @@ dev = [
 [project.scripts]
 nanobot = "nanobot.cli.entry:main"
 nanobot-desktop-tui = "nanobot.cli.desktop_tui:main"
-taptap-describe-stub = "nanobot.agent.command_op.taptap_stub:main"
 
 [build-system]
 requires = ["hatchling", "filelock>=3.25.2"]

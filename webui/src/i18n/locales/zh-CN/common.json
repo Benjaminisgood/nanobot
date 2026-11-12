@@ -369,11 +369,6 @@
     "saveError": "网络可能出了点问题，之后可能还会弹出此提醒。"
   },
   "app": {
-    "portal": {
-      "title": "返回门户",
-      "description": "请在门户登录后重新打开此应用。",
-      "open": "打开门户"
-    },
     "brand": "nanobot",
     "loading": {
       "connecting": "正在连接 nanobot…",
@@ -2745,31 +2740,5 @@
       "cancel": "取消",
       "switchDirectory": "切换目录"
     }
-  },
-  "commandWorkbench": {
-    "title": "命令",
-    "open": "命令",
-    "loading": "正在加载命令",
-    "live": "目录来自 taptap --describe-json",
-    "unavailable": "没有 taptap --describe-json。这些命令继续等待。",
-    "invalid": "无法读取 taptap --describe-json。这些命令继续等待。",
-    "unchecked": "尚未检查目录。",
-    "progress": "{{done}} / {{total}}",
-    "current": "当前步骤",
-    "fill": "保存",
-    "approve": "批准",
-    "cancel": "取消",
-    "approveHint": "只批准这一条命令。",
-    "needsInput": "待填写",
-    "needsApproval": "待批准",
-    "startQuantitative": "开始定量",
-    "startKinetics": "开始动力学",
-    "exitCode": "退出码",
-    "noOps": "没有等待中的命令。",
-    "pending": "等待目录",
-    "acceptance": "跑完仍需科学验收。",
-    "log": "日志",
-    "error": "没能更新这条命令。",
-    "required": "必填"
   }
 }

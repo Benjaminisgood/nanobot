@@ -16,7 +16,6 @@ import type {
 import { createHostWebSocket } from "./runtime";
 import { ClientRunLedger } from "./client-run-ledger";
 import type { CanonicalRunSnapshot, RunEffect, RunObservation, RunState } from "./client-run-ledger";
-import type { CommandWorkbenchNotice } from "./command-ops";
 
 export type { CanonicalRunSnapshot, RunState } from "./client-run-ledger";
 
@@ -81,7 +80,6 @@ type StatusHandler = (status: ConnectionStatus) => void;
 type RunCompletionHandler = (chatId: string) => void;
 type RuntimeModelHandler = (modelName: string | null, modelPreset?: string | null) => void;
 type SessionUpdateScope = "metadata" | "thread" | string;
-type CommandWorkbenchHandler = (event: CommandWorkbenchNotice) => void;
 type SessionUpdateHandler = (
   chatId: string,
   scope?: SessionUpdateScope,
@@ -236,7 +234,6 @@ export class NanobotClient {
   private statusHandlers = new Set<StatusHandler>();
   private runtimeModelHandlers = new Set<RuntimeModelHandler>();
   private sessionUpdateHandlers = new Set<SessionUpdateHandler>();
-  private commandWorkbenchHandlers = new Set<CommandWorkbenchHandler>();
   private sidebarStateUpdateHandlers = new Set<SidebarStateUpdateHandler>();
   private runStatusHandlers = new Set<RunStatusHandler>();
   private runCompletionHandlers = new Set<RunCompletionHandler>();
@@ -311,13 +308,6 @@ export class NanobotClient {
     this.runtimeModelHandlers.add(handler);
     return () => {
       this.runtimeModelHandlers.delete(handler);
-    };
-  }
-
-  onCommandWorkbench(handler: CommandWorkbenchHandler): Unsubscribe {
-    this.commandWorkbenchHandlers.add(handler);
-    return () => {
-      this.commandWorkbenchHandlers.delete(handler);
     };
   }
 
@@ -930,29 +920,6 @@ export class NanobotClient {
       console.log("[nanobot ws inbound]", summarizeInboundWsPayload(parsed));
     }
 
-    if (parsed.event === "command_op") {
-      this.emitCommandWorkbench({
-        event: "command_op",
-        name: parsed.name,
-        op_id: parsed.op_id,
-        status: parsed.status,
-        argv_sha256: parsed.argv_sha256,
-      });
-      return;
-    }
-
-    if (parsed.event === "template_run") {
-      this.emitCommandWorkbench({
-        event: "template_run",
-        run_id: parsed.run_id,
-        done: parsed.done,
-        total: parsed.total,
-        current_step: parsed.current_step,
-        status: parsed.status,
-      });
-      return;
-    }
-
     if (parsed.event === "webui_response") {
       const pending = this.pendingWebUIRequests.get(parsed.request_id);
       if (!pending) return;
@@ -1137,12 +1104,6 @@ export class NanobotClient {
   private emitRuntimeModelUpdate(modelName: string | null, modelPreset?: string | null): void {
     for (const handler of this.runtimeModelHandlers) {
       handler(modelName, modelPreset);
-    }
-  }
-
-  private emitCommandWorkbench(event: CommandWorkbenchNotice): void {
-    for (const handler of this.commandWorkbenchHandlers) {
-      handler(event);
     }
   }
 

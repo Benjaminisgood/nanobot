@@ -1,5 +1,3 @@
-import { PortalAuthPrompt } from "@/components/PortalAuthPrompt";
-import { PORTAL_AUTH_REQUIRED_EVENT, PortalAccessError, readPortalContext } from "@/lib/portal-context";
 import {
   lazy,
   Suspense,
@@ -31,7 +29,6 @@ import { activateReloadCache, clearReloadCache } from "@/lib/reload-cache";
 import { webuiThreadCache } from "@/lib/webui-thread-cache";
 import { ThreadVisibilityContext } from "@/hooks/useThreadVisibility";
 import type { SettingsExitGuard, SettingsFocusTarget } from "@/components/settings/contracts";
-import { CommandWorkbenchHost } from "@/components/command-workbench/CommandWorkbench";
 import { PaneWorkbench } from "@/components/workbench/PaneWorkbench";
 import {
   MAX_WORKBENCH_PANES,
@@ -576,7 +573,7 @@ function normalizeWorkspaceScope(scope: WorkspaceScopePayload): WorkspaceScopePa
 }
 
 function isBootstrapAuthRequired(error: unknown): boolean {
-  if (error instanceof BootstrapAuthRequiredError || error instanceof PortalAccessError) return true;
+  if (error instanceof BootstrapAuthRequiredError) return true;
   const msg = error instanceof Error ? error.message : String(error);
   return msg.includes("HTTP 401") || msg.includes("HTTP 403");
 }
@@ -612,18 +609,6 @@ export default function App() {
   const { t } = useTranslation();
   const [state, setState] = useState<BootState>({ status: "loading" });
   const bootstrapSecretRef = useRef("");
-
-  useEffect(() => {
-    const requirePortalLogin = () => {
-      if (state.status === "ready") state.client.close();
-      clearReloadCache();
-      clearStoredComposerDrafts();
-      webuiThreadCache.clear();
-      setState({ status: "auth" });
-    };
-    window.addEventListener(PORTAL_AUTH_REQUIRED_EVENT, requirePortalLogin);
-    return () => window.removeEventListener(PORTAL_AUTH_REQUIRED_EVENT, requirePortalLogin);
-  }, [state]);
 
   const refreshReadyClient = useCallback(
     async (client: NanobotClient, fallbackSurface: RuntimeSurface, signal?: AbortSignal) => {
@@ -741,21 +726,14 @@ export default function App() {
   }, [refreshReadyClient, state]);
 
   useEffect(() => {
-    try {
-      const supplied = consumeUrlBootstrapSecret();
-      const saved = readPortalContext() ? "" : supplied || loadSavedSecret();
-      return bootstrapWithSecret(saved);
-    } catch (error) {
-      setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
-    }
+    const saved = consumeUrlBootstrapSecret() || loadSavedSecret();
+    return bootstrapWithSecret(saved);
   }, [bootstrapWithSecret]);
 
   if (state.status === "loading") {
     return <StartupShell />;
   }
   if (state.status === "auth") {
-    const portal = readPortalContext();
-    if (portal) return <PortalAuthPrompt portal={portal} />;
     return (
       <AuthForm
         failed={!!state.failed}
@@ -791,11 +769,6 @@ export default function App() {
     clearReloadCache();
     clearStoredComposerDrafts();
     webuiThreadCache.clear();
-    const portal = readPortalContext();
-    if (portal) {
-      window.location.assign(portal.portalUrl);
-      return;
-    }
     setState({ status: "auth" });
   };
 
@@ -2821,7 +2794,6 @@ function Shell({
             </div>
           </div>
         ) : null}
-        <CommandWorkbenchHost />
         <ChannelPairing />
       </div>
     </ThemeProvider>

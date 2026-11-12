@@ -1,5 +1,3 @@
-import { preparePortalRequest, validatePortalResponse } from "./portal-context";
-
 const DEFAULT_HTTP_TIMEOUT_MS = 20_000;
 
 export async function fetchWithTimeout(
@@ -7,10 +5,8 @@ export async function fetchWithTimeout(
   init: RequestInit = {},
   timeoutMs: number = DEFAULT_HTTP_TIMEOUT_MS,
 ): Promise<Response> {
-  const prepared = preparePortalRequest(input, init);
-  init = prepared.init;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    return validatePortalResponse(await fetch(input, init), prepared.portal, prepared.bootstrap);
+    return fetch(input, init);
   }
 
   const controller = typeof AbortController !== "undefined"
@@ -39,7 +35,7 @@ export async function fetchWithTimeout(
         controller?.abort();
       }, timeoutMs);
     });
-    return validatePortalResponse(await Promise.race([request, timeout]), prepared.portal, prepared.bootstrap);
+    return await Promise.race([request, timeout]);
   } finally {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
     externalSignal?.removeEventListener("abort", abortFromExternal);

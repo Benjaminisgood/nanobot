@@ -209,46 +209,6 @@ async def start_listener():
 
 
 @pytest.mark.asyncio
-async def test_command_workbench_events_follow_listener_lifecycle(start_listener) -> None:
-    from nanobot.agent.command_op.events import CommandOpEvent, TemplateRunEvent
-    from nanobot.webui.command_ops_api import command_op_wire, template_run_wire
-
-    bus = MessageBus()
-    channel = _ch(bus)
-    subscribers_before_start = len(bus._handlers)
-    port, start_task = await start_listener(channel)
-    op = CommandOpEvent(
-        name="op.need_approval",
-        op_id="op-sync",
-        status="awaiting_approval",
-        blocked_reason="need_approval",
-        contract_ref="command_op_demo/write_note",
-        argv_sha256="approved-argv",
-    )
-    run = TemplateRunEvent(
-        name="run.progress",
-        run_id="run-sync",
-        template="quantitative",
-        done=1,
-        total=2,
-        current_step="calibrate",
-        status="running",
-        accepted=False,
-    )
-    async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as client:
-        assert json.loads(await client.recv())["event"] == "ready"
-        await bus.publish(op)
-        assert json.loads(await asyncio.wait_for(client.recv(), timeout=2)) == command_op_wire(op)
-        await bus.publish(run)
-        assert json.loads(await asyncio.wait_for(client.recv(), timeout=2)) == template_run_wire(run)
-        await channel.stop()
-        await asyncio.wait_for(start_task, timeout=2)
-        await asyncio.wait_for(client.wait_closed(), timeout=2)
-
-    assert len(bus._handlers) == subscribers_before_start
-
-
-@pytest.mark.asyncio
 async def test_shutdown_closes_undecided_connections_before_waiting_for_server(
     bus, start_listener, monkeypatch,
 ) -> None:
